@@ -140,7 +140,8 @@ async fn main() -> Result<()> {
                                 ts_us,
                                 width:  f.width  as u16, height: f.height as u16,
                                 stride: f.stride as u32, format: f.format,
-                                compression: 1, pixels: f.pixels.clone(),
+                                compression: gutted_proto::compression::ZSTD_DELTA,
+                                pixels: f.pixels.clone(),
                             }))
                         } else {
                             let prev = last.as_ref().unwrap();
@@ -157,18 +158,41 @@ async fn main() -> Result<()> {
                                         ts_us,
                                         width:  f.width  as u16, height: f.height as u16,
                                         stride: f.stride as u32, format: f.format,
-                                        compression: 1, pixels: f.pixels.clone(),
+                                        compression: gutted_proto::compression::ZSTD_DELTA,
+                                        pixels: f.pixels.clone(),
                                     }))
                                 } else {
                                     // Publish each region separately.
                                     for (x, y, w, h) in &regions {
                                         let sub = extract_subrect(&f.pixels, f.stride, *x, *y, *w, *h);
-                                        let m = Arc::new(Message::Subframe {
-                                            ts_us, x: *x, y: *y, w: *w, h: *h,
-                                            stride: (*w as u32) * 4, format: f.format,
-                                            compression: 1, pixels: sub,
-                                        });
-                                        bus_for_wpe.publish(m).await;
+                                        // If region is a solid color, emit a 16-byte FillRect command instead of pixels
+                                        if let Some(bgra) = is_solid_color(&sub) {
+                                            let b = (bgra & 0xFF) as u8;
+                                            let g = ((bgra >> 8) & 0xFF) as u8;
+                                            let r = ((bgra >> 16) & 0xFF) as u8;
+                                            let a = ((bgra >> 24) & 0xFF) as u8;
+                                            let rgba = ((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | (a as u32);
+                                            let m = Arc::new(Message::DrawCommands {
+                                                ts_us,
+                                                layer_id: 0,
+                                                commands: vec![gutted_proto::DrawCommand::FillRect {
+                                                    x: *x as i32,
+                                                    y: *y as i32,
+                                                    w: *w as u32,
+                                                    h: *h as u32,
+                                                    rgba,
+                                                }],
+                                            });
+                                            bus_for_wpe.publish(m).await;
+                                        } else {
+                                            let m = Arc::new(Message::Subframe {
+                                                ts_us, x: *x, y: *y, w: *w, h: *h,
+                                                stride: (*w as u32) * 4, format: f.format,
+                                                compression: gutted_proto::compression::ZSTD_DELTA,
+                                                pixels: sub,
+                                            });
+                                            bus_for_wpe.publish(m).await;
+                                        }
                                     }
                                     if n <= 5 || n % 30 == 0 {
                                         info!(frame = n, regions = regions.len(), "WPE frame → bus (SUB×N)");
@@ -261,6 +285,17 @@ async fn handle_connection(
 ) -> Result<()> {
     let peer = conn.remote_address();
     info!(%peer, "client connected");
+
+    // Datagram receiver for low-latency pointer motion
+    let dgram_conn = conn.clone();
+    tokio::spawn(async move {
+        while let Ok(data) = dgram_conn.read_datagram().await {
+            let mut cur = &data[..];
+            if let Ok(Some(Message::InputPointer { x, y, modifiers, .. })) = Message::decode(&mut cur) {
+                wpe::inject_pointer_motion(x, y, modifiers);
+            }
+        }
+    });
 
     loop {
         tokio::select! {
@@ -601,8 +636,11 @@ fn make_self_signed_config() -> Result<(ServerConfig, Vec<u8>)> {
         .max_concurrent_bidi_streams(64u32.into())
         .max_concurrent_uni_streams(64u32.into())
         .keep_alive_interval(Some(std::time::Duration::from_secs(5)))
-        .datagram_receive_buffer_size(Some(128 * 1024))
-        .datagram_send_buffer_size(128 * 1024);
+        .datagram_receive_buffer_size(Some(1024 * 1024))
+        .datagram_send_buffer_size(1024 * 1024)
+        .stream_receive_window((1024 * 1024u32).into())
+        .receive_window((2 * 1024 * 1024u32).into())
+        .send_window(2 * 1024 * 1024);
     server_cfg.transport_config(Arc::new(transport));
 
     Ok((server_cfg, cert_der))
@@ -611,6 +649,17 @@ fn make_self_signed_config() -> Result<(ServerConfig, Vec<u8>)> {
 fn hex_sha256(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(bytes))
+}
+
+fn is_solid_color(pixels: &[u8]) -> Option<u32> {
+    if pixels.len() < 16 || pixels.len() % 4 != 0 { return None; }
+    let first = u32::from_ne_bytes(pixels[0..4].try_into().unwrap());
+    for chunk in pixels.chunks_exact(4) {
+        if u32::from_ne_bytes(chunk.try_into().unwrap()) != first {
+            return None;
+        }
+    }
+    Some(first)
 }
 
 /// Split a frame diff into up to N tight sub-rects by grouping changed

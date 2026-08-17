@@ -142,6 +142,7 @@ pub async fn run(
         }
     });
 
+    let conn_for_input = conn.clone();
     let ctrl_writer = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
             match msg {
@@ -200,6 +201,11 @@ pub async fn run(
                     };
                     let mut b = Vec::with_capacity(48);
                     m.encode(&mut b);
+                    if matches!(other, OutMsg::PointerMotion { .. }) {
+                        if conn_for_input.send_datagram(bytes::Bytes::copy_from_slice(&b)).is_ok() {
+                            continue;
+                        }
+                    }
                     let _ = input_open_tx.send(b);
                 }
             }
@@ -323,8 +329,11 @@ fn make_client_config(cert_pin_sha256: Option<Vec<u8>>) -> Result<ClientConfig> 
     let mut cfg = ClientConfig::new(Arc::new(quic_crypto));
     let mut t = quinn::TransportConfig::default();
     t.keep_alive_interval(Some(Duration::from_secs(5)));
-    t.datagram_receive_buffer_size(Some(128 * 1024));
-    t.datagram_send_buffer_size(128 * 1024);
+    t.datagram_receive_buffer_size(Some(1024 * 1024));
+    t.datagram_send_buffer_size(1024 * 1024);
+    t.stream_receive_window((1024 * 1024u32).into());
+    t.receive_window((2 * 1024 * 1024u32).into());
+    t.send_window(2 * 1024 * 1024);
     cfg.transport_config(Arc::new(t));
     Ok(cfg)
 }

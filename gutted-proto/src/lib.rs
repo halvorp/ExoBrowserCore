@@ -932,11 +932,21 @@ fn read_draw_cmd(p: &mut &[u8]) -> Result<DrawCommand> {
 
 // ─── Pixel payload encode/decode (shared by RawFrame + Subframe) ─────────
 
+pub mod compression {
+    pub const RAW: u8 = 0;
+    pub const ZSTD: u8 = 1;
+    pub const ZSTD_DELTA: u8 = 2;
+}
+
 #[cfg(feature = "std")]
 fn write_payload(out: &mut Vec<u8>, compression: u8, pixels: &[u8]) {
     match compression {
         0 => out.extend_from_slice(pixels),
         1 => out.extend_from_slice(&zstd_encode(pixels)),
+        2 => {
+            let filtered = spatial_filter_sub(pixels);
+            out.extend_from_slice(&zstd_encode(&filtered));
+        }
         other => panic!("gutted-proto: unknown compression {other} on encode"),
     }
 }
@@ -955,10 +965,51 @@ fn read_payload(p: &mut &[u8], compression: u8, expected_len: usize) -> Result<V
         0 => wire,
         #[cfg(feature = "std")]
         1 => zstd_decode(&wire, expected_len)?,
+        #[cfg(feature = "std")]
+        2 => {
+            let filtered = zstd_decode(&wire, expected_len)?;
+            spatial_unfilter_sub(&filtered)
+        }
         _ => return Err(Error::InvalidValue),
     };
     if pixels.len() != expected_len { return Err(Error::InvalidValue); }
     Ok(pixels)
+}
+
+fn spatial_filter_sub(pixels: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; pixels.len()];
+    let n = pixels.len() / 4;
+    if n == 0 { return out; }
+    out[0..4].copy_from_slice(&pixels[0..4]);
+    for i in 1..n {
+        let prev = &pixels[(i - 1) * 4 .. (i - 1) * 4 + 4];
+        let curr = &pixels[i * 4 .. i * 4 + 4];
+        out[i * 4]     = curr[0].wrapping_sub(prev[0]);
+        out[i * 4 + 1] = curr[1].wrapping_sub(prev[1]);
+        out[i * 4 + 2] = curr[2].wrapping_sub(prev[2]);
+        out[i * 4 + 3] = curr[3].wrapping_sub(prev[3]);
+    }
+    out
+}
+
+fn spatial_unfilter_sub(filtered: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; filtered.len()];
+    let n = filtered.len() / 4;
+    if n == 0 { return out; }
+    out[0..4].copy_from_slice(&filtered[0..4]);
+    for i in 1..n {
+        let prev0 = out[(i - 1) * 4];
+        let prev1 = out[(i - 1) * 4 + 1];
+        let prev2 = out[(i - 1) * 4 + 2];
+        let prev3 = out[(i - 1) * 4 + 3];
+
+        let curr = &filtered[i * 4 .. i * 4 + 4];
+        out[i * 4]     = curr[0].wrapping_add(prev0);
+        out[i * 4 + 1] = curr[1].wrapping_add(prev1);
+        out[i * 4 + 2] = curr[2].wrapping_add(prev2);
+        out[i * 4 + 3] = curr[3].wrapping_add(prev3);
+    }
+    out
 }
 
 // ─── zstd helpers (std-only) ─────────────────────────────────────────────
@@ -1276,8 +1327,37 @@ mod tests {
         }
         roundtrip(Message::Subframe {
             ts_us: 42, x: 100, y: 200, w, h, stride, format: 0,
-            compression: 1, pixels: px,
+            compression: 1, pixels: px.clone(),
         });
+        roundtrip(Message::Subframe {
+            ts_us: 42, x: 100, y: 200, w, h, stride, format: 0,
+            compression: 2, pixels: px,
+        });
+    }
+
+    #[test]
+    fn spatial_delta_compresses_ui_better() {
+        let (w, h) = (128u16, 64u16);
+        let stride = (w as u32) * 4;
+        // Simulate text / UI pattern: runs of identical background with occasional content
+        let mut px = vec![0xFFu8; (stride as usize) * (h as usize)];
+        for row in 10..20 {
+            for col in 20..40 {
+                let idx = row * (stride as usize) + col * 4;
+                px[idx..idx+4].copy_from_slice(&[0x10, 0x20, 0x30, 0xFF]);
+            }
+        }
+        let m1 = Message::Subframe {
+            ts_us: 1, x: 0, y: 0, w, h, stride, format: 0,
+            compression: 1, pixels: px.clone(),
+        };
+        let m2 = Message::Subframe {
+            ts_us: 1, x: 0, y: 0, w, h, stride, format: 0,
+            compression: 2, pixels: px,
+        };
+        let mut b1 = Vec::new(); m1.encode(&mut b1);
+        let mut b2 = Vec::new(); m2.encode(&mut b2);
+        assert!(b2.len() < b1.len(), "ZSTD_DELTA ({} B) should be smaller than standard ZSTD ({} B)", b2.len(), b1.len());
     }
 
     #[test]

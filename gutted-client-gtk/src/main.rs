@@ -231,6 +231,7 @@ fn build_ui(app: &Application) {
         let out_tx = out_tx.clone();
         let cursor_pos = cursor_pos.clone();
         let picture = picture.clone();
+        let last_sent = std::rc::Rc::new(std::cell::Cell::new(std::time::Instant::now()));
         motion.connect_motion(move |_, x, y| {
             let (ox, oy) = picture_origin(&picture);
             let ix = (x - ox) as i32;
@@ -238,7 +239,11 @@ fn build_ui(app: &Application) {
             if ix < 0 || iy < 0 { return; }
             if cursor_pos.get() == (ix, iy) { return; }
             cursor_pos.set((ix, iy));
-            let _ = out_tx.send(net::OutMsg::PointerMotion { x: ix, y: iy, mods: 0 });
+            let now = std::time::Instant::now();
+            if now.duration_since(last_sent.get()).as_millis() >= 8 {
+                last_sent.set(now);
+                let _ = out_tx.send(net::OutMsg::PointerMotion { x: ix, y: iy, mods: 0 });
+            }
         });
     }
 
@@ -562,56 +567,78 @@ fn build_ui(app: &Application) {
                 }
                 net::GtkFrame::DrawCommands { _layer_id: _, commands } => {
                     if let Some(c) = cell.as_mut() {
-                        let surface = unsafe {
-                            cairo::ImageSurface::create_for_data_unsafe(
-                                c.pixels.as_mut_ptr(),
-                                cairo::Format::ARgb32,
-                                c.w as i32,
-                                c.h as i32,
-                                c.stride as i32,
-                            ).ok()
-                        };
-                        if let Some(surf) = surface {
-                            if let Ok(cr) = cairo::Context::new(&surf) {
-                                for cmd in commands {
-                                    match cmd {
-                                        gutted_proto::DrawCommand::FillRect { x, y, w, h, rgba } => {
-                                            let r = ((rgba >> 24) & 0xFF) as f64 / 255.0;
-                                            let g = ((rgba >> 16) & 0xFF) as f64 / 255.0;
-                                            let b = ((rgba >> 8) & 0xFF) as f64 / 255.0;
-                                            let a = (rgba & 0xFF) as f64 / 255.0;
-                                            cr.set_source_rgba(r, g, b, a);
-                                            cr.rectangle(x as f64, y as f64, w as f64, h as f64);
-                                            let _ = cr.fill();
+                        let all_fill_rect = commands.iter().all(|cmd| matches!(cmd, gutted_proto::DrawCommand::FillRect { .. }));
+                        if all_fill_rect {
+                            for cmd in commands {
+                                if let gutted_proto::DrawCommand::FillRect { x, y, w, h, rgba } = cmd {
+                                    let r = ((rgba >> 24) & 0xFF) as u8;
+                                    let g = ((rgba >> 16) & 0xFF) as u8;
+                                    let b = ((rgba >> 8) & 0xFF) as u8;
+                                    let a = (rgba & 0xFF) as u8;
+                                    let a_val = if a == 0 { 0xFF } else { a };
+                                    for row in 0..h as usize {
+                                        let dst_y = y.max(0) as usize + row;
+                                        if dst_y >= c.h as usize { break; }
+                                        let dst_off = dst_y * c.stride as usize + (x.max(0) as usize) * 4;
+                                        let fill_w = (w as usize).min(c.w as usize - x.max(0) as usize);
+                                        for px in c.pixels[dst_off .. dst_off + fill_w * 4].chunks_exact_mut(4) {
+                                            px[0] = b; px[1] = g; px[2] = r; px[3] = a_val;
                                         }
-                                        gutted_proto::DrawCommand::StrokeRect { x, y, w, h, rgba, line_width } => {
-                                            let r = ((rgba >> 24) & 0xFF) as f64 / 255.0;
-                                            let g = ((rgba >> 16) & 0xFF) as f64 / 255.0;
-                                            let b = ((rgba >> 8) & 0xFF) as f64 / 255.0;
-                                            let a = (rgba & 0xFF) as f64 / 255.0;
-                                            cr.set_source_rgba(r, g, b, a);
-                                            cr.set_line_width(line_width as f64);
-                                            cr.rectangle(x as f64, y as f64, w as f64, h as f64);
-                                            let _ = cr.stroke();
+                                    }
+                                }
+                            }
+                        } else {
+                            let surface = unsafe {
+                                cairo::ImageSurface::create_for_data_unsafe(
+                                    c.pixels.as_mut_ptr(),
+                                    cairo::Format::ARgb32,
+                                    c.w as i32,
+                                    c.h as i32,
+                                    c.stride as i32,
+                                ).ok()
+                            };
+                            if let Some(surf) = surface {
+                                if let Ok(cr) = cairo::Context::new(&surf) {
+                                    for cmd in commands {
+                                        match cmd {
+                                            gutted_proto::DrawCommand::FillRect { x, y, w, h, rgba } => {
+                                                let r = ((rgba >> 24) & 0xFF) as f64 / 255.0;
+                                                let g = ((rgba >> 16) & 0xFF) as f64 / 255.0;
+                                                let b = ((rgba >> 8) & 0xFF) as f64 / 255.0;
+                                                let a = (rgba & 0xFF) as f64 / 255.0;
+                                                cr.set_source_rgba(r, g, b, a);
+                                                cr.rectangle(x as f64, y as f64, w as f64, h as f64);
+                                                let _ = cr.fill();
+                                            }
+                                            gutted_proto::DrawCommand::StrokeRect { x, y, w, h, rgba, line_width } => {
+                                                let r = ((rgba >> 24) & 0xFF) as f64 / 255.0;
+                                                let g = ((rgba >> 16) & 0xFF) as f64 / 255.0;
+                                                let b = ((rgba >> 8) & 0xFF) as f64 / 255.0;
+                                                let a = (rgba & 0xFF) as f64 / 255.0;
+                                                cr.set_source_rgba(r, g, b, a);
+                                                cr.set_line_width(line_width as f64);
+                                                cr.rectangle(x as f64, y as f64, w as f64, h as f64);
+                                                let _ = cr.stroke();
+                                            }
+                                            gutted_proto::DrawCommand::DrawText { x, y, font_size, rgba, text } => {
+                                                let r = ((rgba >> 24) & 0xFF) as f64 / 255.0;
+                                                let g = ((rgba >> 16) & 0xFF) as f64 / 255.0;
+                                                let b = ((rgba >> 8) & 0xFF) as f64 / 255.0;
+                                                let a = (rgba & 0xFF) as f64 / 255.0;
+                                                cr.set_source_rgba(r, g, b, a);
+                                                cr.set_font_size(font_size as f64);
+                                                cr.move_to(x as f64, y as f64);
+                                                let _ = cr.show_text(&text);
+                                            }
+                                            gutted_proto::DrawCommand::SetClip { x, y, w, h } => {
+                                                cr.rectangle(x as f64, y as f64, w as f64, h as f64);
+                                                cr.clip();
+                                            }
+                                            gutted_proto::DrawCommand::ClearClip => {
+                                                cr.reset_clip();
+                                            }
+                                            _ => {}
                                         }
-                                        gutted_proto::DrawCommand::DrawText { x, y, font_size, rgba, text } => {
-                                            let r = ((rgba >> 24) & 0xFF) as f64 / 255.0;
-                                            let g = ((rgba >> 16) & 0xFF) as f64 / 255.0;
-                                            let b = ((rgba >> 8) & 0xFF) as f64 / 255.0;
-                                            let a = (rgba & 0xFF) as f64 / 255.0;
-                                            cr.set_source_rgba(r, g, b, a);
-                                            cr.set_font_size(font_size as f64);
-                                            cr.move_to(x as f64, y as f64);
-                                            let _ = cr.show_text(&text);
-                                        }
-                                        gutted_proto::DrawCommand::SetClip { x, y, w, h } => {
-                                            cr.rectangle(x as f64, y as f64, w as f64, h as f64);
-                                            cr.clip();
-                                        }
-                                        gutted_proto::DrawCommand::ClearClip => {
-                                            cr.reset_clip();
-                                        }
-                                        _ => {}
                                     }
                                 }
                             }
