@@ -1,0 +1,16 @@
+[package]
+name = "gutted-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hand-rolled LEB128-tagged wire codec for the gutted browser. no_std + alloc."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = ["dep:zstd"]
+
+[dependencies]
+zstd = { workspace = true, optional = true }

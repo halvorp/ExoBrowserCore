@@ -1,0 +1,22 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Host C build artifacts
+host/*.o
+host/*.a
+host/gutted-host
+host/run*.log
+
+# Test / demo leftovers
+/0
+/*.ppm
+/*.png
+/*.log
+/cog.log
+
+# Harness / editor state
+.claude/
+.idea/
+.vscode/
+*.swp

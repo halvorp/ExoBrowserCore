@@ -1,0 +1,25 @@
+[package]
+name = "gutted-client-gtk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GTK4-based Linux client for gutted-browser. Simpler than the wgpu client; used for fast Linux proof-of-concept while the wgpu path targets the microkernel."
+
+[[bin]]
+name = "gutted-client-gtk"
+path = "src/main.rs"
+
+[dependencies]
+# Debian bookworm ships GTK 4.8.3; gtk4-rs 0.6 supports GTK ≥ 4.8.
+gtk4         = { version = "0.6", package = "gtk4", features = ["v4_8"] }
+glib         = "0.17"
+tokio.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+bytes.workspace = true
+hex.workspace = true
+sha2.workspace = true
+gutted-proto = { path = "../gutted-proto" }

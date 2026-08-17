@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "gutted-proto",
+    "gutted-host-rs",
+    "gutted-client",
+    "gutted-client-gtk",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.0.1"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+tokio      = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "time", "sync"] }
+quinn      = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls     = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen      = "0.13"
+anyhow     = "1"
+tracing    = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes      = "1"
+sha2       = "0.10"
+hex        = "0.4"
+zstd       = { version = "0.13", default-features = false }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
