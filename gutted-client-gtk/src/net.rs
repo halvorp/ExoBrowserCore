@@ -64,6 +64,30 @@ pub async fn run(
         .context("QUIC connect")?;
     tracing::info!(rtt = ?conn.rtt(), "connected");
 
+    // Datagram receiver for SUBFRAME (GTK)
+    let dgram_frames_tx = frames_tx.clone();
+    let dgram_conn = conn.clone();
+    tokio::spawn(async move {
+        loop {
+            match dgram_conn.read_datagram().await {
+                Ok(data) => {
+                    let mut raw = &data[..];
+                    match Message::decode(&mut raw) {
+                        Ok(Some(Message::Subframe { x, y, w, h, stride, pixels, .. })) => {
+                            let _ = dgram_frames_tx.send(GtkFrame::Sub {
+                                x: x as u32, y: y as u32,
+                                w: w as u32, h: h as u32,
+                                stride, pixels,
+                            });
+                        }
+                        _ => {} // ignore other types or corrupted datagrams
+                    }
+                }
+                Err(_) => break, // connection closed or datagrams disabled
+            }
+        }
+    });
+
     let (mut send, mut recv) = conn.open_bi().await.context("open ctrl bi stream")?;
 
     // HELLO
@@ -263,6 +287,7 @@ fn make_client_config(cert_pin_sha256: Option<Vec<u8>>) -> Result<ClientConfig> 
     let mut cfg = ClientConfig::new(Arc::new(quic_crypto));
     let mut t = quinn::TransportConfig::default();
     t.keep_alive_interval(Some(Duration::from_secs(5)));
+    t.max_datagram_frame_size(Some(65535));
     cfg.transport_config(Arc::new(t));
     Ok(cfg)
 }

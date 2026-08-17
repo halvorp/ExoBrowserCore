@@ -380,7 +380,7 @@ async fn handle_ctrl_stream(
             Ok(s) => s,
             Err(e) => { warn!(error = %e, "open_uni video stream"); return; }
         };
-        vs.set_priority(1i32.into()); // lower priority
+        vs.set_priority((-1i32).into());   // lower than default (0)
         info!("video uni-stream open");
 
         async fn write_frame(vs: &mut quinn::SendStream, msg: &Message) -> (Result<()>, usize) {
@@ -420,18 +420,14 @@ async fn handle_ctrl_stream(
                     Ok(m) => {
                         // SUBFRAME → try QUIC datagram (faster, no HoL blocking)
                         // Fallback to stream if message too large.
-                        if matches!(&*m, Message::Subframe { .. }) {
+                        if let Message::Subframe { .. } = &*m {
                             let mut buf = Vec::with_capacity(1024);
                             m.encode(&mut buf);
-                            if let Some(max_dgram) = video_conn.max_datagram_size() {
-                                if buf.len() <= max_dgram {
-                                    let _ = video_conn.send_datagram(buf.into());
-                                    // Skip stream write for this message.
-                                    continue;
-                                }
-                            }
+                            // Send via datagram; with max_datagram_frame_size = 65535 it always fits.
+                            let _ = video_conn.send_datagram(buf.into());
+                            continue;
                         }
-                        // Fallback: write to stream for everything else.
+                        // Everything else goes to the reliable stream.
                         let (res, n) = write_frame(&mut vs, &m).await;
                         if let Err(e) = res { warn!(error = %e, "video write"); break; }
                         published += 1;

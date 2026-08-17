@@ -413,7 +413,6 @@ async fn net_main(
                 if send.is_none() {
                     match open_stream() {
                         Ok(s) => {
-                            s.set_priority((-1i32).into());
                             tracing::info!("input uni-stream opened");
                             send = Some(s);
                         }
@@ -487,7 +486,7 @@ fn make_client_config(cert_pin_sha256: Option<Vec<u8>>) -> Result<ClientConfig> 
 
     let mut t = quinn::TransportConfig::default();
     t.keep_alive_interval(Some(Duration::from_secs(5)));
-    t.max_datagram_frame_size(Some(1200));
+    t.max_datagram_frame_size(Some(65535));
     cfg.transport_config(Arc::new(t));
     Ok(cfg)
 }
