@@ -29,6 +29,7 @@ cargo build --release --quiet
 # "Address already in use" on :$PORT. pkill returns 1 if nothing matched;
 # we don't care.
 pkill -9 -f "target/release/gutted-host" 2>/dev/null || true
+pkill -9 -f "target/release/gutted-client-gtk" 2>/dev/null || true
 pkill -9 -f "target/release/gutted-client" 2>/dev/null || true
 sleep 0.3
 
@@ -69,11 +70,11 @@ CLIENT_ENV=(
 [ -n "${SCROLL:-}"     ] && CLIENT_ENV+=("GBROWSER_SYNTH_SCROLL=$SCROLL")
 [ -n "${SHAPE:-}"      ] && CLIENT_ENV+=("GBROWSER_SYNTH_SHAPE=$SHAPE")
 
-CLIENT_BIN=./target/release/gutted-client
-case "${CLIENT:-wgpu}" in
+CLIENT_BIN=./target/release/gutted-client-gtk
+case "${CLIENT:-gtk}" in
     gtk)  CLIENT_BIN=./target/release/gutted-client-gtk ;;
     wgpu) CLIENT_BIN=./target/release/gutted-client ;;
-    *)    echo "[demo] unknown CLIENT='$CLIENT' (expected wgpu|gtk)" >&2; exit 2 ;;
+    *)    echo "[demo] unknown CLIENT='$CLIENT' (expected gtk|wgpu)" >&2; exit 2 ;;
 esac
 echo "[demo] client=$CLIENT_BIN" >&2
 

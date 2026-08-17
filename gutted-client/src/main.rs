@@ -312,7 +312,7 @@ async fn net_main(
     };
 
     // ── Datagram receiver: SUBFRAME arrives via QUIC datagrams ────────────
-    let video_dgram_task = {
+    let _video_dgram_task = {
         let conn = conn.clone();
         let frames_tx = frames_tx.clone();
         tokio::spawn(async move {
@@ -334,15 +334,7 @@ async fn net_main(
                             _ => {}  // corrupt, drop silently
                         }
                     }
-                    Err(quinn::ReadDatagramError::ConnectionClosed(_)) => break,
-                    Err(quinn::ReadDatagramError::TooBig) => {
-                        // shouldn't happen with our size limit
-                        tracing::warn!("oversize datagram received");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "datagram read error");
-                        break;
-                    }
+                    Err(_) => break,
                 }
             }
         })
@@ -486,7 +478,8 @@ fn make_client_config(cert_pin_sha256: Option<Vec<u8>>) -> Result<ClientConfig> 
 
     let mut t = quinn::TransportConfig::default();
     t.keep_alive_interval(Some(Duration::from_secs(5)));
-    t.max_datagram_frame_size(Some(65535));
+    t.datagram_receive_buffer_size(Some(128 * 1024));
+    t.datagram_send_buffer_size(128 * 1024);
     cfg.transport_config(Arc::new(t));
     Ok(cfg)
 }

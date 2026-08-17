@@ -44,6 +44,7 @@ extern "C" {
     fn gutted_wpe_go_back(h: *mut c_void);
     fn gutted_wpe_go_forward(h: *mut c_void);
     fn gutted_wpe_reload(h: *mut c_void);
+    fn gutted_wpe_stop_loading(h: *mut c_void);
 }
 
 /// A frame from WPE: BGRA (ARGB8888 in wl_shm terms).
@@ -348,3 +349,4 @@ pub fn set_zoom(level: f64) {
 pub fn go_back()    { with_current(|h| unsafe { gutted_wpe_go_back(h as *mut c_void) }); }
 pub fn go_forward() { with_current(|h| unsafe { gutted_wpe_go_forward(h as *mut c_void) }); }
 pub fn reload()     { with_current(|h| unsafe { gutted_wpe_reload(h as *mut c_void) }); }
+pub fn stop_loading() { with_current(|h| unsafe { gutted_wpe_stop_loading(h as *mut c_void) }); }

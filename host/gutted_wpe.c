@@ -29,6 +29,8 @@ typedef struct {
     gutted_wpe_callbacks                    cb;
     void                                   *userdata;
     unsigned                                frame_count;
+    uint32_t                                cur_w;
+    uint32_t                                cur_h;
 } instance_t;
 
 static void on_shm_buffer(void *data, struct wpe_fdo_shm_exported_buffer *exported)
@@ -89,20 +91,11 @@ static void on_load_changed(WebKitWebView *v, WebKitLoadEvent e, gpointer user_d
 {
     (void)v;
     instance_t *inst = user_data;
-    // Optional "nudger" — on load-finished, inject a small JS that toggles
-    // a body-level transform on every requestAnimationFrame. That makes
-    // WebKit's compositor mark a paint each frame, so WPE-in-SHM emits
-    // continuous frames instead of only-on-damage. Off by default. Useful
-    // for stress-testing the pipeline; harmful for real bandwidth work.
     if (e == WEBKIT_LOAD_FINISHED) {
         const char *nudge_ms = g_getenv("GBROWSER_NUDGE_MS");
         if (nudge_ms && nudge_ms[0]) {
             int ms = atoi(nudge_ms);
             if (ms < 1) ms = 16;
-            // Add a fixed-position 6px square in the corner that flips
-            // colour every tick. Small enough to be visually unobtrusive,
-            // guaranteed to force a compositor paint (visible pixel change
-            // is stronger repaint signal than transform-only).
             char *js = g_strdup_printf(
                 "(function(){"
                 "  if (window.__gt_nudge) clearInterval(window.__gt_nudge);"
@@ -157,17 +150,11 @@ int gutted_wpe_run(
     if (!cb || !cb->on_frame) return -1;
     if (!wpe_process_init())  return -2;
 
-    // Reality check: WPE-FDO has global state (the shared wpe_bridge
-    // socket) that only works with the process default GMainContext.
-    // Pushing a per-instance thread-default context causes
-    // "Failed to bind wpe_bridge" in WPEWebProcess. So we use the
-    // default context for now — which means TRUE multi-instance needs
-    // more research into WPE-FDO's threading model. The handle-based
-    // API is still ready for that; the C library serialises through
-    // the single default main loop.
     instance_t *inst = g_new0(instance_t, 1);
     inst->cb        = *cb;
     inst->userdata  = userdata;
+    inst->cur_w     = viewport_w;
+    inst->cur_h     = viewport_h;
     inst->ctx       = g_main_context_default();
     inst->loop      = g_main_loop_new(inst->ctx, FALSE);
 
@@ -184,14 +171,45 @@ int gutted_wpe_run(
         return -3;
     }
 
+    WebKitWebContext *web_ctx = webkit_web_context_get_default();
+    webkit_web_context_set_cache_model(web_ctx, WEBKIT_CACHE_MODEL_WEB_BROWSER);
+    WebKitCookieManager *cm = webkit_web_context_get_cookie_manager(web_ctx);
+    webkit_cookie_manager_set_accept_policy(cm, WEBKIT_COOKIE_POLICY_ACCEPT_ALWAYS);
+
+    WebKitSettings *settings = webkit_settings_new();
+    webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
+    webkit_settings_set_enable_javascript(settings, TRUE);
+    webkit_settings_set_enable_html5_local_storage(settings, TRUE);
+    webkit_settings_set_enable_html5_database(settings, TRUE);
+    webkit_settings_set_enable_webgl(settings, TRUE);
+    webkit_settings_set_enable_smooth_scrolling(settings, TRUE);
+    webkit_settings_set_enable_developer_extras(settings, TRUE);
+    webkit_settings_set_enable_resizable_text_areas(settings, TRUE);
+    webkit_settings_set_enable_page_cache(settings, TRUE);
+    webkit_settings_set_enable_site_specific_quirks(settings, TRUE);
+    webkit_settings_set_enable_media_stream(settings, TRUE);
+    webkit_settings_set_enable_mediasource(settings, TRUE);
+    webkit_settings_set_enable_encrypted_media(settings, TRUE);
+    webkit_settings_set_user_agent(settings,
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
+
     WebKitWebViewBackend *vb = webkit_web_view_backend_new(
         wpe_view_backend_exportable_fdo_get_view_backend(inst->exportable),
         NULL, NULL);
-    inst->view = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "backend", vb, NULL));
+    inst->view = WEBKIT_WEB_VIEW(g_object_new(
+        WEBKIT_TYPE_WEB_VIEW,
+        "backend", vb,
+        "settings", settings,
+        NULL));
+    g_object_unref(settings);
+    WebKitColor bg_color = { 1.0, 1.0, 1.0, 1.0 };
+    webkit_web_view_set_background_color(inst->view, &bg_color);
+
     g_signal_connect(inst->view, "load-changed", G_CALLBACK(on_load_changed), inst);
     g_signal_connect(inst->view, "mouse-target-changed", G_CALLBACK(on_mouse_target_changed), inst);
     g_signal_connect(inst->view, "notify::title", G_CALLBACK(on_notify_title), inst);
     g_signal_connect(inst->view, "notify::uri",   G_CALLBACK(on_notify_uri),   inst);
+
     if (initial_url) webkit_web_view_load_uri(inst->view, initial_url);
 
     // Hand the handle to the caller before we block on the main loop.
@@ -249,9 +267,13 @@ typedef struct { instance_t *inst; uint32_t w, h; } idle_resize_t;
 static gboolean idle_resize(gpointer p) {
     idle_resize_t *r = p;
     if (r->inst && r->inst->exportable) {
-        struct wpe_view_backend *vb =
-            wpe_view_backend_exportable_fdo_get_view_backend(r->inst->exportable);
-        wpe_view_backend_dispatch_set_size(vb, r->w, r->h);
+        if (r->inst->cur_w != r->w || r->inst->cur_h != r->h) {
+            r->inst->cur_w = r->w;
+            r->inst->cur_h = r->h;
+            struct wpe_view_backend *vb =
+                wpe_view_backend_exportable_fdo_get_view_backend(r->inst->exportable);
+            wpe_view_backend_dispatch_set_size(vb, r->w, r->h);
+        }
     }
     g_free(r);
     return G_SOURCE_REMOVE;
@@ -285,11 +307,12 @@ static gboolean idle_input(gpointer p) {
     if (!e->inst || !e->inst->exportable) { g_free(e); return G_SOURCE_REMOVE; }
     struct wpe_view_backend *vb =
         wpe_view_backend_exportable_fdo_get_view_backend(e->inst->exportable);
+    uint32_t now_ms = (uint32_t)(g_get_monotonic_time() / 1000);
     switch (e->kind) {
         case 0: {
             struct wpe_input_pointer_event ev = {
                 .type = wpe_input_pointer_event_type_motion,
-                .time = 0, .x = e->x, .y = e->y,
+                .time = now_ms, .x = e->x, .y = e->y,
                 .button = 0, .state = 0, .modifiers = e->modifiers,
             };
             wpe_view_backend_dispatch_pointer_event(vb, &ev);
@@ -298,7 +321,7 @@ static gboolean idle_input(gpointer p) {
         case 1: {
             struct wpe_input_pointer_event ev = {
                 .type = wpe_input_pointer_event_type_button,
-                .time = 0, .x = e->x, .y = e->y,
+                .time = now_ms, .x = e->x, .y = e->y,
                 .button = e->button, .state = e->pressed ? 1 : 0,
                 .modifiers = e->modifiers,
             };
@@ -307,7 +330,7 @@ static gboolean idle_input(gpointer p) {
         }
         case 2: {
             struct wpe_input_keyboard_event ev = {
-                .time = 0, .key_code = e->keysym,
+                .time = now_ms, .key_code = e->keysym,
                 .hardware_key_code = 0, .pressed = e->pressed,
                 .modifiers = e->modifiers,
             };
@@ -320,7 +343,7 @@ static gboolean idle_input(gpointer p) {
                     .type = (enum wpe_input_axis_event_type)
                         (wpe_input_axis_event_type_motion_smooth
                          | wpe_input_axis_event_type_mask_2d),
-                    .time = 0, .x = e->x, .y = e->y,
+                    .time = now_ms, .x = e->x, .y = e->y,
                     .axis = 0, .value = 0,
                     .modifiers = e->modifiers,
                 },
@@ -401,9 +424,10 @@ static gboolean idle_nav(gpointer p) {
     idle_nav_t *n = p;
     if (n->inst && n->inst->view) {
         switch (n->action) {
-            case 0: webkit_web_view_go_back(n->inst->view);    break;
-            case 1: webkit_web_view_go_forward(n->inst->view); break;
-            case 2: webkit_web_view_reload(n->inst->view);     break;
+            case 0: webkit_web_view_go_back(n->inst->view);      break;
+            case 1: webkit_web_view_go_forward(n->inst->view);   break;
+            case 2: webkit_web_view_reload(n->inst->view);       break;
+            case 3: webkit_web_view_stop_loading(n->inst->view); break;
         }
     }
     g_free(n);
@@ -421,3 +445,4 @@ static void enqueue_nav(gutted_wpe_handle h, int action) {
 void gutted_wpe_go_back(gutted_wpe_handle h)    { enqueue_nav(h, 0); }
 void gutted_wpe_go_forward(gutted_wpe_handle h) { enqueue_nav(h, 1); }
 void gutted_wpe_reload(gutted_wpe_handle h)     { enqueue_nav(h, 2); }
+void gutted_wpe_stop_loading(gutted_wpe_handle h){ enqueue_nav(h, 3); }

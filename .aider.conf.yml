@@ -15,6 +15,11 @@ model: openrouter/deepseek/deepseek-v4-pro
 # Mechanical tier — writes serialisation code, applies diffs, boilerplate.
 editor-model: openrouter/deepseek/deepseek-v4-flash
 
+# Force SEARCH/REPLACE-style diffs from the editor rather than whole-file
+# rewrites. On a cheap model streaming a 700-line file token-by-token is
+# painful; diffs cut both wall-clock and token cost dramatically.
+editor-edit-format: editor-diff
+
 # Weak model = used for cheap ops (commit messages, summarisation).
 weak-model: openrouter/deepseek/deepseek-v4-flash
 
@@ -24,5 +29,12 @@ map-tokens: 2048
 # Aider auto-commits by default; keep that behaviour so history stays clean.
 auto-commits: true
 gitignore: true
+
+# Build gate: run `cargo build --release` after every change; if it fails,
+# aider hands the errors back to the editor model and iterates instead of
+# committing. This is what turns "confident hallucination" into
+# "eventually-compiles" — non-negotiable for hands-off runs.
+auto-test: true
+test-cmd: cargo build --release
 
 # Sonic-boom terminal ui defaults are fine; leave verbose off.

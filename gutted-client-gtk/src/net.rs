@@ -21,6 +21,10 @@ const ALPN: &[u8] = b"gbrowser/1";
 pub enum GtkFrame {
     Full { width: u32, height: u32, stride: u32, pixels: Vec<u8> },
     Sub  { x: u32, y: u32, w: u32, h: u32, stride: u32, pixels: Vec<u8> },
+    TileData { hash: u64, _w: u32, _h: u32, _stride: u32, pixels: Vec<u8> },
+    TileRef  { x: u32, y: u32, w: u32, h: u32, hash: u64 },
+    AssetRegister { hash: [u8; 32], _kind: u8, data: Vec<u8> },
+    DrawCommands { _layer_id: u32, commands: Vec<gutted_proto::DrawCommand> },
     /// WebKit load state — used by the GTK URL entry to show progress.
     Load(u8),
     /// URL the server was already on when we connected — populate URL bar.
@@ -29,6 +33,8 @@ pub enum GtkFrame {
     Title(String),
     /// Committed URL change — GTK sets url entry unless user is editing.
     UrlChanged(String),
+    /// Cursor shape changed
+    Cursor(gutted_proto::CursorShape),
 }
 
 /// Anything the GTK thread wants to send back to the host.
@@ -37,10 +43,12 @@ pub enum OutMsg {
     Resize { w: u16, h: u16 },
     PointerMotion { x: i32, y: i32, mods: u32 },
     PointerButton { x: i32, y: i32, button: u32, pressed: bool, mods: u32 },
+    Key { keycode: u32, mods: u32, down: bool },
     Scroll { dx: i32, dy: i32 },
     SetZoom { level_milli: u32 },
     /// History nav. 0=back, 1=forward, 2=reload.
     NavAction { action: u8 },
+    Stop,
 }
 
 /// Public entry point — call from the network std::thread. Blocks until
@@ -93,7 +101,7 @@ pub async fn run(
     // HELLO
     let hello = Message::Hello {
         proto_version: PROTO_VERSION,
-        viewport_w: 1280, viewport_h: 720,
+        viewport_w: 1280, viewport_h: 648,
         dpr_hundredths: 100,
         client_name: "gutted-client-gtk".into(),
         capabilities: caps::H264 | caps::CLIENT_SCROLL,
@@ -161,6 +169,12 @@ pub async fn run(
                     m.encode(&mut b);
                     if send.write_all(&b).await.is_err() { break; }
                 }
+                OutMsg::Stop => {
+                    let m = Message::Stop;
+                    let mut b = Vec::with_capacity(8);
+                    m.encode(&mut b);
+                    if send.write_all(&b).await.is_err() { break; }
+                }
                 other => {
                     use std::time::{SystemTime, UNIX_EPOCH};
                     let ts_us = SystemTime::now().duration_since(UNIX_EPOCH)
@@ -170,6 +184,8 @@ pub async fn run(
                             Message::InputPointer { ts_us, x, y, modifiers: mods },
                         OutMsg::PointerButton { x, y, button, pressed, mods } =>
                             Message::InputButton { ts_us, x, y, button, pressed, modifiers: mods },
+                        OutMsg::Key { keycode, mods, down } =>
+                            Message::InputKey { ts_us, keycode, mods, down },
                         OutMsg::Scroll { dx, dy } =>
                             Message::InputScroll {
                                 ts_us, layer_id: 0,
@@ -179,7 +195,8 @@ pub async fn run(
                         OutMsg::Nav(_)
                         | OutMsg::Resize { .. }
                         | OutMsg::SetZoom { .. }
-                        | OutMsg::NavAction { .. } => unreachable!(),
+                        | OutMsg::NavAction { .. }
+                        | OutMsg::Stop => unreachable!(),
                     };
                     let mut b = Vec::with_capacity(48);
                     m.encode(&mut b);
@@ -225,6 +242,25 @@ pub async fn run(
                         }
                         Message::UrlChanged { url } => {
                             let _ = frames_tx.send(GtkFrame::UrlChanged(url));
+                        }
+                        Message::CursorState { shape, .. } => {
+                            let _ = frames_tx.send(GtkFrame::Cursor(shape));
+                        }
+                        Message::TileData { hash, w, h, stride, pixels, .. } => {
+                            let _ = frames_tx.send(GtkFrame::TileData {
+                                hash, _w: w as u32, _h: h as u32, _stride: stride, pixels,
+                            });
+                        }
+                        Message::TileRef { x, y, w, h, hash, .. } => {
+                            let _ = frames_tx.send(GtkFrame::TileRef {
+                                x: x as u32, y: y as u32, w: w as u32, h: h as u32, hash,
+                            });
+                        }
+                        Message::AssetRegister { hash, kind, data } => {
+                            let _ = frames_tx.send(GtkFrame::AssetRegister { hash, _kind: kind, data });
+                        }
+                        Message::DrawCommands { layer_id, commands, .. } => {
+                            let _ = frames_tx.send(GtkFrame::DrawCommands { _layer_id: layer_id, commands });
                         }
                         _ => {}
                     }
@@ -287,7 +323,8 @@ fn make_client_config(cert_pin_sha256: Option<Vec<u8>>) -> Result<ClientConfig> 
     let mut cfg = ClientConfig::new(Arc::new(quic_crypto));
     let mut t = quinn::TransportConfig::default();
     t.keep_alive_interval(Some(Duration::from_secs(5)));
-    t.max_datagram_frame_size(Some(65535));
+    t.datagram_receive_buffer_size(Some(128 * 1024));
+    t.datagram_send_buffer_size(128 * 1024);
     cfg.transport_config(Arc::new(t));
     Ok(cfg)
 }

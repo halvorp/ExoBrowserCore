@@ -28,6 +28,8 @@ pub mod tag {
     pub const NAV:            u32 = 0x04;
     /// Client → host: history nav. 0=back, 1=forward, 2=reload.
     pub const NAV_ACTION:     u32 = 0x06;
+    /// Client → host: stop page load.
+    pub const STOP:           u32 = 0x07;
     pub const HEARTBEAT:      u32 = 0x05;
 
     pub const INPUT_POINTER:  u32 = 0x10; // motion event
@@ -53,6 +55,14 @@ pub mod tag {
     /// Partial-frame update — pixels for a sub-rect of the framebuffer.
     /// Client blits into its existing texture at the given (x, y).
     pub const SUBFRAME:       u32 = 0x41;
+    /// Host → client: compressed tile payload with 64-bit hash.
+    pub const TILE_DATA:      u32 = 0x42;
+    /// Host → client: blit tile by hash (zero payload; client uses local tile cache).
+    pub const TILE_REF:       u32 = 0x43;
+    /// Host → client: register immutable asset by 256-bit SHA256 hash.
+    pub const ASSET_REGISTER: u32 = 0x50;
+    /// Host → client: vector display list commands.
+    pub const DRAW_COMMANDS:  u32 = 0x51;
 
     // Phase 3 scene protocol. Sent on the `scene` uni stream once the
     // WebKit fork exposes Nicosia's layer tree. See phase_plan memory.
@@ -204,6 +214,8 @@ pub enum Message {
     },
     /// Client → host: history nav. See `tag::NAV_ACTION` for values.
     NavAction { action: u8 },
+    /// Client → host: stop loading page.
+    Stop,
     Heartbeat {
         ts_us: u64,
     },
@@ -312,6 +324,47 @@ pub enum Message {
         /// UNCOMPRESSED pixel bytes; length must equal stride * height.
         pixels:  Vec<u8>,
     },
+    /// Host → client: compressed tile payload with 64-bit hash.
+    TileData {
+        hash: u64,
+        w: u16,
+        h: u16,
+        stride: u32,
+        format: u32,
+        compression: u8,
+        pixels: Vec<u8>,
+    },
+    /// Host → client: blit cached tile at (x, y).
+    TileRef {
+        ts_us: u64,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        hash: u64,
+    },
+    /// Host → client: register immutable asset by SHA256 hash.
+    AssetRegister {
+        hash: [u8; 32],
+        kind: u8,
+        data: Vec<u8>,
+    },
+    /// Host → client: vector display list commands.
+    DrawCommands {
+        ts_us: u64,
+        layer_id: u32,
+        commands: Vec<DrawCommand>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrawCommand {
+    FillRect { x: i32, y: i32, w: u32, h: u32, rgba: u32 },
+    StrokeRect { x: i32, y: i32, w: u32, h: u32, rgba: u32, line_width: u16 },
+    DrawText { x: i32, y: i32, font_size: u16, rgba: u32, text: String },
+    DrawImage { x: i32, y: i32, w: u32, h: u32, asset_hash: [u8; 32] },
+    SetClip { x: i32, y: i32, w: u32, h: u32 },
+    ClearClip,
 }
 
 #[repr(u8)]
@@ -432,6 +485,7 @@ impl Message {
             Message::Resize { .. }       => tag::RESIZE,
             Message::Nav { .. }          => tag::NAV,
             Message::NavAction { .. }    => tag::NAV_ACTION,
+            Message::Stop                => tag::STOP,
             Message::Heartbeat { .. }    => tag::HEARTBEAT,
             Message::InputPointer { .. } => tag::INPUT_POINTER,
             Message::InputButton { .. }  => tag::INPUT_BUTTON,
@@ -444,6 +498,10 @@ impl Message {
             Message::UrlChanged { .. }   => tag::URL_CHANGED,
             Message::RawFrame { .. }     => tag::RAW_FRAME,
             Message::Subframe { .. }     => tag::SUBFRAME,
+            Message::TileData { .. }     => tag::TILE_DATA,
+            Message::TileRef { .. }      => tag::TILE_REF,
+            Message::AssetRegister { .. } => tag::ASSET_REGISTER,
+            Message::DrawCommands { .. } => tag::DRAW_COMMANDS,
             Message::LayerAdd { .. }     => tag::LAYER_ADD,
             Message::LayerUpdate { .. }  => tag::LAYER_UPDATE,
             Message::LayerRemove { .. }  => tag::LAYER_REMOVE,
@@ -475,6 +533,7 @@ impl Message {
             }
             Message::Nav { url } => write_str(out, url),
             Message::NavAction { action } => write_u8_(out, *action),
+            Message::Stop => {}
             Message::Heartbeat { ts_us } => write_u64(out, *ts_us),
             Message::InputPointer { ts_us, x, y, modifiers } => {
                 write_u64(out, *ts_us);
@@ -557,6 +616,35 @@ impl Message {
                 write_u8_(out, *compression);
                 write_payload(out, *compression, pixels);
             }
+            Message::TileData { hash, w, h, stride, format, compression, pixels } => {
+                write_u64(out, *hash);
+                write_u16(out, *w);
+                write_u16(out, *h);
+                write_u32(out, *stride);
+                write_u32(out, *format);
+                write_u8_(out, *compression);
+                write_payload(out, *compression, pixels);
+            }
+            Message::TileRef { ts_us, x, y, w, h, hash } => {
+                write_u64(out, *ts_us);
+                write_u16(out, *x);
+                write_u16(out, *y);
+                write_u16(out, *w);
+                write_u16(out, *h);
+                write_u64(out, *hash);
+            }
+            Message::AssetRegister { hash, kind, data } => {
+                out.extend_from_slice(hash);
+                write_u8_(out, *kind);
+                write_varint(out, data.len() as u32);
+                out.extend_from_slice(data);
+            }
+            Message::DrawCommands { ts_us, layer_id, commands } => {
+                write_u64(out, *ts_us);
+                write_u32(out, *layer_id);
+                write_varint(out, commands.len() as u32);
+                for cmd in commands { write_draw_cmd(out, cmd); }
+            }
         }
     }
 
@@ -610,6 +698,7 @@ impl Message {
             },
             tag::NAV => Message::Nav { url: read_str(p)? },
             tag::NAV_ACTION => Message::NavAction { action: read_u8_(p)? },
+            tag::STOP => Message::Stop,
             tag::HEARTBEAT => Message::Heartbeat { ts_us: read_u64(p)? },
             tag::INPUT_POINTER => Message::InputPointer {
                 ts_us: read_u64(p)?,
@@ -698,6 +787,44 @@ impl Message {
                     (stride as usize).saturating_mul(h as usize))?;
                 Message::Subframe { ts_us, x, y, w, h, stride, format, compression, pixels }
             }
+            tag::TILE_DATA => {
+                let hash   = read_u64(p)?;
+                let w      = read_u16(p)?;
+                let h      = read_u16(p)?;
+                let stride = read_u32(p)?;
+                let format = read_u32(p)?;
+                let compression = read_u8_(p)?;
+                let pixels = read_payload(p, compression, (stride as usize).saturating_mul(h as usize))?;
+                Message::TileData { hash, w, h, stride, format, compression, pixels }
+            }
+            tag::TILE_REF => {
+                let ts_us = read_u64(p)?;
+                let x     = read_u16(p)?;
+                let y     = read_u16(p)?;
+                let w     = read_u16(p)?;
+                let h     = read_u16(p)?;
+                let hash  = read_u64(p)?;
+                Message::TileRef { ts_us, x, y, w, h, hash }
+            }
+            tag::ASSET_REGISTER => {
+                let bytes = p.get(..32).ok_or(Error::UnexpectedEof)?;
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(bytes);
+                *p = &p[32..];
+                let kind = read_u8_(p)?;
+                let len = read_varint(p)? as usize;
+                let data = p.get(..len).ok_or(Error::LengthOverflow)?.to_vec();
+                *p = &p[len..];
+                Message::AssetRegister { hash, kind, data }
+            }
+            tag::DRAW_COMMANDS => {
+                let ts_us    = read_u64(p)?;
+                let layer_id = read_u32(p)?;
+                let count    = read_varint(p)? as usize;
+                let mut commands = Vec::with_capacity(count);
+                for _ in 0..count { commands.push(read_draw_cmd(p)?); }
+                Message::DrawCommands { ts_us, layer_id, commands }
+            }
             other => return Err(Error::UnknownTag(other)),
         };
         if !p.is_empty() { return Err(Error::TrailingBytes); }
@@ -727,6 +854,78 @@ fn read_content_ref(p: &mut &[u8]) -> Result<ContentRef> {
             *p = &p[32..];
             ContentRef::AssetHash(h)
         }
+        _ => return Err(Error::InvalidValue),
+    })
+}
+
+// ─── DrawCommand codec ───────────────────────────────────────────────────
+
+fn write_draw_cmd(out: &mut Vec<u8>, cmd: &DrawCommand) {
+    match cmd {
+        DrawCommand::FillRect { x, y, w, h, rgba } => {
+            out.push(1);
+            write_i32(out, *x); write_i32(out, *y);
+            write_u32(out, *w); write_u32(out, *h);
+            write_u32(out, *rgba);
+        }
+        DrawCommand::StrokeRect { x, y, w, h, rgba, line_width } => {
+            out.push(2);
+            write_i32(out, *x); write_i32(out, *y);
+            write_u32(out, *w); write_u32(out, *h);
+            write_u32(out, *rgba); write_u16(out, *line_width);
+        }
+        DrawCommand::DrawText { x, y, font_size, rgba, text } => {
+            out.push(3);
+            write_i32(out, *x); write_i32(out, *y);
+            write_u16(out, *font_size); write_u32(out, *rgba);
+            write_str(out, text);
+        }
+        DrawCommand::DrawImage { x, y, w, h, asset_hash } => {
+            out.push(4);
+            write_i32(out, *x); write_i32(out, *y);
+            write_u32(out, *w); write_u32(out, *h);
+            out.extend_from_slice(asset_hash);
+        }
+        DrawCommand::SetClip { x, y, w, h } => {
+            out.push(5);
+            write_i32(out, *x); write_i32(out, *y);
+            write_u32(out, *w); write_u32(out, *h);
+        }
+        DrawCommand::ClearClip => out.push(6),
+    }
+}
+
+fn read_draw_cmd(p: &mut &[u8]) -> Result<DrawCommand> {
+    Ok(match read_u8_(p)? {
+        1 => DrawCommand::FillRect {
+            x: read_i32(p)?, y: read_i32(p)?,
+            w: read_u32(p)?, h: read_u32(p)?,
+            rgba: read_u32(p)?,
+        },
+        2 => DrawCommand::StrokeRect {
+            x: read_i32(p)?, y: read_i32(p)?,
+            w: read_u32(p)?, h: read_u32(p)?,
+            rgba: read_u32(p)?, line_width: read_u16(p)?,
+        },
+        3 => DrawCommand::DrawText {
+            x: read_i32(p)?, y: read_i32(p)?,
+            font_size: read_u16(p)?, rgba: read_u32(p)?,
+            text: read_str(p)?,
+        },
+        4 => {
+            let x = read_i32(p)?; let y = read_i32(p)?;
+            let w = read_u32(p)?; let h = read_u32(p)?;
+            let bytes = p.get(..32).ok_or(Error::UnexpectedEof)?;
+            let mut asset_hash = [0u8; 32];
+            asset_hash.copy_from_slice(bytes);
+            *p = &p[32..];
+            DrawCommand::DrawImage { x, y, w, h, asset_hash }
+        }
+        5 => DrawCommand::SetClip {
+            x: read_i32(p)?, y: read_i32(p)?,
+            w: read_u32(p)?, h: read_u32(p)?,
+        },
+        6 => DrawCommand::ClearClip,
         _ => return Err(Error::InvalidValue),
     })
 }
@@ -766,20 +965,43 @@ fn read_payload(p: &mut &[u8], compression: u8, expected_len: usize) -> Result<V
 
 #[cfg(feature = "std")]
 fn zstd_encode(bytes: &[u8]) -> Vec<u8> {
-    // Level 1 = fast, still 5–50× on rendered UI content.
-    zstd::encode_all(bytes, 1).expect("zstd encode never fails on valid input")
+    use std::cell::RefCell;
+    thread_local! {
+        static COMPRESSOR: RefCell<Option<zstd::bulk::Compressor<'static>>> = RefCell::new(None);
+    }
+    COMPRESSOR.with(|c| {
+        let mut borrow = c.borrow_mut();
+        if borrow.is_none() {
+            *borrow = zstd::bulk::Compressor::new(1).ok();
+        }
+        if let Some(comp) = borrow.as_mut() {
+            if let Ok(res) = comp.compress(bytes) {
+                return res;
+            }
+        }
+        zstd::encode_all(bytes, 1).expect("zstd encode never fails on valid input")
+    })
 }
 
 #[cfg(feature = "std")]
 fn zstd_decode(bytes: &[u8], expected_len: usize) -> Result<Vec<u8>> {
-    // Bound the output size to defend against zip-bomb-shaped frames.
-    let mut out = Vec::with_capacity(expected_len.min(MAX_MESSAGE_BYTES));
-    use std::io::Read;
-    let dec = zstd::stream::Decoder::new(bytes).map_err(|_| Error::InvalidValue)?;
-    // Cap what we'll accept regardless of what the stream claims.
-    let cap = expected_len.saturating_add(64).min(MAX_MESSAGE_BYTES) as u64;
-    dec.take(cap).read_to_end(&mut out).map_err(|_| Error::InvalidValue)?;
-    Ok(out)
+    use std::cell::RefCell;
+    thread_local! {
+        static DECOMPRESSOR: RefCell<Option<zstd::bulk::Decompressor<'static>>> = RefCell::new(None);
+    }
+    DECOMPRESSOR.with(|d| {
+        let mut borrow = d.borrow_mut();
+        if borrow.is_none() {
+            *borrow = zstd::bulk::Decompressor::new().ok();
+        }
+        if let Some(decomp) = borrow.as_mut() {
+            let mut out = vec![0u8; expected_len];
+            if decomp.decompress_to_buffer(bytes, &mut out).is_ok() {
+                return Ok(out);
+            }
+        }
+        zstd::bulk::decompress(bytes, expected_len).map_err(|_| Error::InvalidValue)
+    })
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────
@@ -1087,5 +1309,42 @@ mod tests {
         buf[last] = 99;
         let mut s = buf.as_slice();
         assert_eq!(Message::decode(&mut s), Err(Error::InvalidValue));
+    }
+
+    #[test]
+    fn stop_and_tile_roundtrips() {
+        roundtrip(Message::Stop);
+        let px = vec![0x12u8; 64 * 64 * 4];
+        roundtrip(Message::TileData {
+            hash: 0x123456789ABCDEF0,
+            w: 64, h: 64, stride: 256, format: 0,
+            compression: 1, pixels: px,
+        });
+        roundtrip(Message::TileRef {
+            ts_us: 99999, x: 128, y: 256, w: 64, h: 64,
+            hash: 0x123456789ABCDEF0,
+        });
+    }
+
+    #[test]
+    fn vector_and_asset_roundtrip() {
+        let hash = [0x55u8; 32];
+        roundtrip(Message::AssetRegister {
+            hash,
+            kind: 0,
+            data: vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+        });
+        roundtrip(Message::DrawCommands {
+            ts_us: 1234567,
+            layer_id: 1,
+            commands: vec![
+                DrawCommand::SetClip { x: 0, y: 0, w: 800, h: 600 },
+                DrawCommand::FillRect { x: 10, y: 20, w: 100, h: 50, rgba: 0xFF0000FF },
+                DrawCommand::StrokeRect { x: 120, y: 20, w: 100, h: 50, rgba: 0x00FF00FF, line_width: 2 },
+                DrawCommand::DrawText { x: 10, y: 100, font_size: 16, rgba: 0x000000FF, text: String::from("Hello QUIC") },
+                DrawCommand::DrawImage { x: 10, y: 150, w: 64, h: 64, asset_hash: hash },
+                DrawCommand::ClearClip,
+            ],
+        });
     }
 }

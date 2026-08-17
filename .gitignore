@@ -28,3 +28,4 @@ host/run*.log
 .aider.input.history
 .aider.tags.cache.v*/
 .aider.llm.history
+.aider*

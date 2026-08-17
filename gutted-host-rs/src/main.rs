@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
         let bus_for_wpe = bus.clone();
         let current_url_for_wpe = current_url.clone();
         tokio::spawn(async move {
-            let (mut runner, mut frames, mut loads, mut cursors, mut titles, mut urls) = wpe::WpeRunner::start(&url, 1280, 720);
+            let (mut runner, mut frames, mut loads, mut cursors, mut titles, mut urls) = wpe::WpeRunner::start(&url, 1280, 648);
             // Publish this runner's handle to the process-current slot so
             // the compat `wpe::load_uri/resize/inject_*` calls in the ctrl
             // handlers keep working. Small poll — on_ready fires quickly.
@@ -108,6 +108,30 @@ async fn main() -> Result<()> {
                         n += 1;
                         let ts_us = SystemTime::now().duration_since(UNIX_EPOCH)
                             .unwrap_or_default().as_micros() as u64;
+                        let (min_b, max_b, min_g, max_g, min_r, max_r, non_white_count) = {
+                            let mut min_b = 255u8; let mut max_b = 0u8;
+                            let mut min_g = 255u8; let mut max_g = 0u8;
+                            let mut min_r = 255u8; let mut max_r = 0u8;
+                            let mut non_white = 0u64;
+                            for px in f.pixels.chunks_exact(4) {
+                                min_b = min_b.min(px[0]); max_b = max_b.max(px[0]);
+                                min_g = min_g.min(px[1]); max_g = max_g.max(px[1]);
+                                min_r = min_r.min(px[2]); max_r = max_r.max(px[2]);
+                                 let is_bg = (px[0] == 255 && px[1] == 255 && px[2] == 255) ||
+                                             (px[0] >= 28 && px[0] <= 38 && px[1] >= 28 && px[1] <= 38 && px[2] >= 28 && px[2] <= 38);
+                                 if !is_bg {
+                                     non_white += 1;
+                                 }
+                            }
+                            (min_b, max_b, min_g, max_g, min_r, max_r, non_white)
+                        };
+                        info!(
+                            n, w = f.width, h = f.height, non_white_count,
+                            b = format!("{min_b}..{max_b}"),
+                            g = format!("{min_g}..{max_g}"),
+                            r = format!("{min_r}..{max_r}"),
+                            "WPE FRAME PIXEL STATS"
+                        );
                         let same_geom = last.as_ref().map_or(false, |l|
                             l.width == f.width && l.height == f.height && l.stride == f.stride);
                         let msg: Option<Arc<Message>> = if !same_geom {
@@ -380,7 +404,7 @@ async fn handle_ctrl_stream(
             Ok(s) => s,
             Err(e) => { warn!(error = %e, "open_uni video stream"); return; }
         };
-        vs.set_priority((-1i32).into());   // lower than default (0)
+        let _ = vs.set_priority((-1i32).into());   // lower than default (0)
         info!("video uni-stream open");
 
         async fn write_frame(vs: &mut quinn::SendStream, msg: &Message) -> (Result<()>, usize) {
@@ -418,18 +442,29 @@ async fn handle_ctrl_stream(
             tokio::select! {
                 r = stream_rx.recv() => match r {
                     Ok(m) => {
+                        let mut buf = match &*m {
+                            Message::RawFrame { pixels, .. } => Vec::with_capacity(32 + pixels.len()),
+                            Message::Subframe { pixels, .. } => Vec::with_capacity(32 + pixels.len()),
+                            _ => Vec::with_capacity(64),
+                        };
+                        m.encode(&mut buf);
+
                         // SUBFRAME → try QUIC datagram (faster, no HoL blocking)
-                        // Fallback to stream if message too large.
+                        // Fallback to reliable stream if datagram fails or is too large.
                         if let Message::Subframe { .. } = &*m {
-                            let mut buf = Vec::with_capacity(1024);
-                            m.encode(&mut buf);
-                            // Send via datagram; with max_datagram_frame_size = 65535 it always fits.
-                            let _ = video_conn.send_datagram(buf.into());
-                            continue;
+                            if video_conn.send_datagram(bytes::Bytes::copy_from_slice(&buf)).is_ok() {
+                                published += 1;
+                                cum_bytes += buf.len() as u64;
+                                cum_sub += buf.len() as u64;
+                                continue;
+                            }
                         }
-                        // Everything else goes to the reliable stream.
-                        let (res, n) = write_frame(&mut vs, &m).await;
-                        if let Err(e) = res { warn!(error = %e, "video write"); break; }
+                        // Everything else (or datagram fallback) goes to reliable stream.
+                        let n = buf.len();
+                        if let Err(e) = vs.write_all(&buf).await {
+                            warn!(error = %e, "video write");
+                            break;
+                        }
                         published += 1;
                         cum_bytes += n as u64;
                         match &*m {
@@ -488,6 +523,10 @@ async fn handle_ctrl_stream(
                     2 => { info!("NAV_ACTION reload");  wpe::reload(); }
                     _ => info!(action, "NAV_ACTION unknown"),
                 }
+            }
+            Message::Stop => {
+                info!("STOP request");
+                wpe::stop_loading();
             }
             other => info!(?other, "ctrl msg (unhandled yet)"),
         }
@@ -562,7 +601,8 @@ fn make_self_signed_config() -> Result<(ServerConfig, Vec<u8>)> {
         .max_concurrent_bidi_streams(64u32.into())
         .max_concurrent_uni_streams(64u32.into())
         .keep_alive_interval(Some(std::time::Duration::from_secs(5)))
-        .max_datagram_frame_size(Some(65535));
+        .datagram_receive_buffer_size(Some(128 * 1024))
+        .datagram_send_buffer_size(128 * 1024);
     server_cfg.transport_config(Arc::new(transport));
 
     Ok((server_cfg, cert_der))
@@ -618,12 +658,11 @@ fn diff_regions(
         for yy in top..=bot {
             let ra = &a[yy * s .. yy * s + row_bytes];
             let rb = &b[yy * s .. yy * s + row_bytes];
-            let mut lx = w;
-            for x in 0..w { if ra[x*4..x*4+4] != rb[x*4..x*4+4] { lx = x; break; } }
-            let mut rx = 0usize;
-            for x in (0..w).rev() { if ra[x*4..x*4+4] != rb[x*4..x*4+4] { rx = x; break; } }
-            if lx < w { left = left.min(lx); }
-            if rx > 0 { right = right.max(rx); }
+            if let Some(lx) = ra.chunks_exact(4).zip(rb.chunks_exact(4)).position(|(px_a, px_b)| px_a != px_b) {
+                left = left.min(lx);
+                let rx = ra.chunks_exact(4).zip(rb.chunks_exact(4)).rposition(|(px_a, px_b)| px_a != px_b).unwrap_or(lx);
+                right = right.max(rx);
+            }
         }
         if right >= left {
             out.push((left as u16, top as u16,

@@ -110,6 +110,7 @@ void gutted_wpe_set_zoom(gutted_wpe_handle h, double level);
 void gutted_wpe_go_back(gutted_wpe_handle h);
 void gutted_wpe_go_forward(gutted_wpe_handle h);
 void gutted_wpe_reload(gutted_wpe_handle h);
+void gutted_wpe_stop_loading(gutted_wpe_handle h);
 
 #ifdef __cplusplus
 }
