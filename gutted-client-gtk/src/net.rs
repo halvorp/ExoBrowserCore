@@ -18,6 +18,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 const ALPN: &[u8] = b"gbrowser/1";
 
 /// A frame update from the wire. GTK composites `Sub` onto `Full`.
+#[allow(dead_code)]
 pub enum GtkFrame {
     Full { width: u32, height: u32, stride: u32, pixels: Vec<u8> },
     Sub  { x: u32, y: u32, w: u32, h: u32, stride: u32, pixels: Vec<u8> },
@@ -25,6 +26,8 @@ pub enum GtkFrame {
     TileRef  { x: u32, y: u32, w: u32, h: u32, hash: u64 },
     AssetRegister { hash: [u8; 32], _kind: u8, data: Vec<u8> },
     DrawCommands { _layer_id: u32, commands: Vec<gutted_proto::DrawCommand> },
+    Audio { pts_us: u64, codec: u8, channels: u8, sample_rate: u32, data: Vec<u8> },
+    VideoChunk { pts_us: u64, duration_us: u32, is_keyframe: bool, codec: u8, layer_id: u32, data: Vec<u8> },
     /// WebKit load state — used by the GTK URL entry to show progress.
     Load(u8),
     /// URL the server was already on when we connected — populate URL bar.
@@ -214,6 +217,7 @@ pub async fn run(
 
     // Video uni-stream: accept + decode + push frames to GTK.
     let conn_v = conn.clone();
+    let frames_stream_tx = frames_tx.clone();
     let video = tokio::spawn(async move {
         let mut vs = match conn_v.accept_uni().await {
             Ok(s) => s,
@@ -228,45 +232,51 @@ pub async fn run(
                 while let Ok(Some(msg)) = Message::decode(&mut cur) {
                     match msg {
                         Message::RawFrame { width, height, stride, pixels, .. } => {
-                            let _ = frames_tx.send(GtkFrame::Full {
+                            let _ = frames_stream_tx.send(GtkFrame::Full {
                                 width: width as u32, height: height as u32,
                                 stride, pixels,
                             });
                         }
                         Message::Subframe { x, y, w, h, stride, pixels, .. } => {
-                            let _ = frames_tx.send(GtkFrame::Sub {
+                            let _ = frames_stream_tx.send(GtkFrame::Sub {
                                 x: x as u32, y: y as u32,
                                 w: w as u32, h: h as u32,
                                 stride, pixels,
                             });
                         }
                         Message::LoadState { state } => {
-                            let _ = frames_tx.send(GtkFrame::Load(state));
+                            let _ = frames_stream_tx.send(GtkFrame::Load(state));
                         }
                         Message::Title { title } => {
-                            let _ = frames_tx.send(GtkFrame::Title(title));
+                            let _ = frames_stream_tx.send(GtkFrame::Title(title));
                         }
                         Message::UrlChanged { url } => {
-                            let _ = frames_tx.send(GtkFrame::UrlChanged(url));
+                            let _ = frames_stream_tx.send(GtkFrame::UrlChanged(url));
                         }
                         Message::CursorState { shape, .. } => {
-                            let _ = frames_tx.send(GtkFrame::Cursor(shape));
+                            let _ = frames_stream_tx.send(GtkFrame::Cursor(shape));
                         }
                         Message::TileData { hash, w, h, stride, pixels, .. } => {
-                            let _ = frames_tx.send(GtkFrame::TileData {
+                            let _ = frames_stream_tx.send(GtkFrame::TileData {
                                 hash, _w: w as u32, _h: h as u32, _stride: stride, pixels,
                             });
                         }
                         Message::TileRef { x, y, w, h, hash, .. } => {
-                            let _ = frames_tx.send(GtkFrame::TileRef {
+                            let _ = frames_stream_tx.send(GtkFrame::TileRef {
                                 x: x as u32, y: y as u32, w: w as u32, h: h as u32, hash,
                             });
                         }
                         Message::AssetRegister { hash, kind, data } => {
-                            let _ = frames_tx.send(GtkFrame::AssetRegister { hash, _kind: kind, data });
+                            let _ = frames_stream_tx.send(GtkFrame::AssetRegister { hash, _kind: kind, data });
                         }
                         Message::DrawCommands { layer_id, commands, .. } => {
-                            let _ = frames_tx.send(GtkFrame::DrawCommands { _layer_id: layer_id, commands });
+                            let _ = frames_stream_tx.send(GtkFrame::DrawCommands { _layer_id: layer_id, commands });
+                        }
+                        Message::AudioFrame { pts_us, codec, channels, sample_rate, data } => {
+                            let _ = frames_stream_tx.send(GtkFrame::Audio { pts_us, codec, channels, sample_rate, data });
+                        }
+                        Message::VideoChunk { pts_us, duration_us, is_keyframe, codec, layer_id, data } => {
+                            let _ = frames_stream_tx.send(GtkFrame::VideoChunk { pts_us, duration_us, is_keyframe, codec, layer_id, data });
                         }
                         _ => {}
                     }
@@ -282,7 +292,34 @@ pub async fn run(
         }
     });
 
-    let _ = tokio::join!(ctrl_writer, video, input_writer);
+    // Datagram receiver for low-latency audio packets and subframes
+    let conn_dgram = conn.clone();
+    let frames_dgram_tx = frames_tx.clone();
+    let dgram_task = tokio::spawn(async move {
+        while let Ok(dgram) = conn_dgram.read_datagram().await {
+            let mut cur = &dgram[..];
+            if let Ok(Some(msg)) = Message::decode(&mut cur) {
+                match msg {
+                    Message::AudioFrame { pts_us, codec, channels, sample_rate, data } => {
+                        let _ = frames_dgram_tx.send(GtkFrame::Audio { pts_us, codec, channels, sample_rate, data });
+                    }
+                    Message::VideoChunk { pts_us, duration_us, is_keyframe, codec, layer_id, data } => {
+                        let _ = frames_dgram_tx.send(GtkFrame::VideoChunk { pts_us, duration_us, is_keyframe, codec, layer_id, data });
+                    }
+                    Message::Subframe { x, y, w, h, stride, pixels, .. } => {
+                        let _ = frames_dgram_tx.send(GtkFrame::Sub {
+                            x: x as u32, y: y as u32,
+                            w: w as u32, h: h as u32,
+                            stride, pixels,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    let _ = tokio::join!(ctrl_writer, video, input_writer, dgram_task);
     conn.close(0u32.into(), b"bye");
     endpoint.wait_idle().await;
     Ok(())

@@ -60,6 +60,54 @@ fn canonicalize_url(raw: &str) -> String {
     format!("https://{s}")
 }
 
+/// A/V Synchronization Clock & Jitter Buffer
+#[derive(Debug)]
+pub struct AVClock {
+    master_audio_pts: u64,
+    last_audio_tick: Option<std::time::Instant>,
+}
+
+impl AVClock {
+    pub fn new() -> Self {
+        Self {
+            master_audio_pts: 0,
+            last_audio_tick: None,
+        }
+    }
+
+    pub fn on_audio_frame(&mut self, pts_us: u64, duration_us: u64) {
+        self.master_audio_pts = pts_us.saturating_add(duration_us);
+        self.last_audio_tick = Some(std::time::Instant::now());
+    }
+
+    pub fn current_master_pts_us(&self) -> u64 {
+        if let Some(tick) = self.last_audio_tick {
+            let elapsed = tick.elapsed().as_micros() as u64;
+            self.master_audio_pts.saturating_add(elapsed)
+        } else {
+            0
+        }
+    }
+
+    /// Video frame presentation decision:
+    /// - 0 = Present immediately
+    /// - 1 = Hold until next tick (early)
+    /// - 2 = Drop late frame (lagging > 40ms)
+    pub fn schedule_video(&self, pts_us: u64) -> u8 {
+        let master = self.current_master_pts_us();
+        if master == 0 {
+            return 0; // No audio clock established, present immediately
+        }
+        if pts_us + 40_000 < master {
+            2 // Drop late frame (> 40ms late)
+        } else if pts_us > master + 20_000 {
+            1 // Hold (early)
+        } else {
+            0 // In sync (within -40ms .. +20ms)
+        }
+    }
+}
+
 const BOOKMARKS: &[(&str, &str)] = &[
     ("Example", "https://example.com"),
     ("Wikipedia", "https://www.wikipedia.org"),
@@ -484,6 +532,7 @@ fn build_ui(app: &Application) {
     let composite: Rc<RefCell<Option<Composite>>> = Rc::new(RefCell::new(None));
     let tile_cache: Rc<RefCell<HashMap<u64, Vec<u8>>>> = Rc::new(RefCell::new(HashMap::new()));
     let asset_store: Rc<RefCell<HashMap<[u8; 32], Vec<u8>>>> = Rc::new(RefCell::new(HashMap::new()));
+    let av_clock: Rc<RefCell<AVClock>> = Rc::new(RefCell::new(AVClock::new()));
 
     let url_entry_for_load = url_entry.clone();
     let url_entry_for_url  = url_entry.clone();
@@ -497,6 +546,7 @@ fn build_ui(app: &Application) {
         @strong composite,
         @strong tile_cache,
         @strong asset_store,
+        @strong av_clock,
         @strong dirty
     => @default-return glib::Continue(false), move |f| {
         {
@@ -659,6 +709,19 @@ fn build_ui(app: &Application) {
                         }
                     }
                 }
+                net::GtkFrame::Audio { pts_us, codec: _, channels: _, sample_rate: _, data: _ } => {
+                    av_clock.borrow_mut().on_audio_frame(pts_us, 20_000);
+                    return glib::Continue(true);
+                }
+                net::GtkFrame::VideoChunk { pts_us, duration_us: _, is_keyframe: _, codec: _, layer_id: _, data: _ } => {
+                    let decision = av_clock.borrow().schedule_video(pts_us);
+                    if decision == 2 {
+                        // Late frame dropped (> 40ms behind master audio clock)
+                        return glib::Continue(true);
+                    }
+                    // In-sync video chunk accepted for presentation
+                    return glib::Continue(true);
+                }
                 net::GtkFrame::Full { width, height, stride, mut pixels } => {
                     for chunk in pixels.chunks_exact_mut(4) {
                         if chunk[3] == 0 { chunk[3] = 0xFF; }
@@ -769,4 +832,29 @@ fn save_ppm(path: &str, w: u32, h: u32, stride: u32, bgra: &[u8]) -> std::io::Re
     }
     f.write_all(&rgb)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn av_clock_synchronization_logic() {
+        let mut clock = AVClock::new();
+        assert_eq!(clock.schedule_video(100_000), 0); // No audio master clock yet -> present
+
+        // Audio starts at PTS 1,000,000 with 20ms duration
+        clock.on_audio_frame(1_000_000, 20_000);
+        let master = clock.current_master_pts_us();
+        assert!(master >= 1_020_000);
+
+        // Video frame on-time (within -40ms .. +20ms of master)
+        assert_eq!(clock.schedule_video(master), 0); // PresentNow
+
+        // Video frame too early (> 20ms ahead of master)
+        assert_eq!(clock.schedule_video(master + 50_000), 1); // Hold
+
+        // Video frame too late (> 40ms behind master)
+        assert_eq!(clock.schedule_video(master.saturating_sub(60_000)), 2); // DropLate
+    }
 }

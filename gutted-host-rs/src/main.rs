@@ -480,13 +480,15 @@ async fn handle_ctrl_stream(
                         let mut buf = match &*m {
                             Message::RawFrame { pixels, .. } => Vec::with_capacity(32 + pixels.len()),
                             Message::Subframe { pixels, .. } => Vec::with_capacity(32 + pixels.len()),
+                            Message::AudioFrame { data, .. } => Vec::with_capacity(32 + data.len()),
+                            Message::VideoChunk { data, .. } => Vec::with_capacity(32 + data.len()),
                             _ => Vec::with_capacity(64),
                         };
                         m.encode(&mut buf);
 
-                        // SUBFRAME → try QUIC datagram (faster, no HoL blocking)
+                        // SUBFRAME & AUDIO_FRAME → try QUIC datagram (low-latency, no HoL blocking)
                         // Fallback to reliable stream if datagram fails or is too large.
-                        if let Message::Subframe { .. } = &*m {
+                        if matches!(&*m, Message::Subframe { .. } | Message::AudioFrame { .. }) {
                             if video_conn.send_datagram(bytes::Bytes::copy_from_slice(&buf)).is_ok() {
                                 published += 1;
                                 cum_bytes += buf.len() as u64;

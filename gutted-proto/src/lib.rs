@@ -59,6 +59,10 @@ pub mod tag {
     pub const TILE_DATA:      u32 = 0x42;
     /// Host → client: blit tile by hash (zero payload; client uses local tile cache).
     pub const TILE_REF:       u32 = 0x43;
+    /// Host → client: Opus / PCM audio frame.
+    pub const AUDIO_FRAME:    u32 = 0x48;
+    /// Host → client: Encoded H.264 / AV1 video track chunk.
+    pub const VIDEO_CHUNK:    u32 = 0x49;
     /// Host → client: register immutable asset by 256-bit SHA256 hash.
     pub const ASSET_REGISTER: u32 = 0x50;
     /// Host → client: vector display list commands.
@@ -70,6 +74,19 @@ pub mod tag {
     pub const LAYER_UPDATE:   u32 = 0x61;
     pub const LAYER_REMOVE:   u32 = 0x62;
     pub const SCENE_COMMIT:   u32 = 0x63;
+}
+
+pub mod audio_codec {
+    pub const PCM_S16LE: u8 = 0;
+    pub const OPUS:      u8 = 1;
+    pub const AAC:       u8 = 2;
+}
+
+pub mod video_codec {
+    pub const H264: u8 = 0;
+    pub const AV1:  u8 = 1;
+    pub const VP9:  u8 = 2;
+    pub const VP8:  u8 = 3;
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────
@@ -355,6 +372,23 @@ pub enum Message {
         layer_id: u32,
         commands: Vec<DrawCommand>,
     },
+    /// Host → client: Opus / PCM audio frame.
+    AudioFrame {
+        pts_us: u64,
+        codec: u8,
+        channels: u8,
+        sample_rate: u32,
+        data: Vec<u8>,
+    },
+    /// Host → client: encoded video track chunk (H.264 / AV1 / VP9).
+    VideoChunk {
+        pts_us: u64,
+        duration_us: u32,
+        is_keyframe: bool,
+        codec: u8,
+        layer_id: u32,
+        data: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -502,6 +536,8 @@ impl Message {
             Message::TileRef { .. }      => tag::TILE_REF,
             Message::AssetRegister { .. } => tag::ASSET_REGISTER,
             Message::DrawCommands { .. } => tag::DRAW_COMMANDS,
+            Message::AudioFrame { .. }   => tag::AUDIO_FRAME,
+            Message::VideoChunk { .. }   => tag::VIDEO_CHUNK,
             Message::LayerAdd { .. }     => tag::LAYER_ADD,
             Message::LayerUpdate { .. }  => tag::LAYER_UPDATE,
             Message::LayerRemove { .. }  => tag::LAYER_REMOVE,
@@ -644,6 +680,23 @@ impl Message {
                 write_u32(out, *layer_id);
                 write_varint(out, commands.len() as u32);
                 for cmd in commands { write_draw_cmd(out, cmd); }
+            }
+            Message::AudioFrame { pts_us, codec, channels, sample_rate, data } => {
+                write_u64(out, *pts_us);
+                write_u8_(out, *codec);
+                write_u8_(out, *channels);
+                write_u32(out, *sample_rate);
+                write_varint(out, data.len() as u32);
+                out.extend_from_slice(data);
+            }
+            Message::VideoChunk { pts_us, duration_us, is_keyframe, codec, layer_id, data } => {
+                write_u64(out, *pts_us);
+                write_u32(out, *duration_us);
+                write_u8_(out, if *is_keyframe { 1 } else { 0 });
+                write_u8_(out, *codec);
+                write_u32(out, *layer_id);
+                write_varint(out, data.len() as u32);
+                out.extend_from_slice(data);
             }
         }
     }
@@ -824,6 +877,27 @@ impl Message {
                 let mut commands = Vec::with_capacity(count);
                 for _ in 0..count { commands.push(read_draw_cmd(p)?); }
                 Message::DrawCommands { ts_us, layer_id, commands }
+            }
+            tag::AUDIO_FRAME => {
+                let pts_us      = read_u64(p)?;
+                let codec       = read_u8_(p)?;
+                let channels    = read_u8_(p)?;
+                let sample_rate = read_u32(p)?;
+                let len         = read_varint(p)? as usize;
+                let data        = p.get(..len).ok_or(Error::LengthOverflow)?.to_vec();
+                *p = &p[len..];
+                Message::AudioFrame { pts_us, codec, channels, sample_rate, data }
+            }
+            tag::VIDEO_CHUNK => {
+                let pts_us      = read_u64(p)?;
+                let duration_us = read_u32(p)?;
+                let is_keyframe = read_u8_(p)? != 0;
+                let codec       = read_u8_(p)?;
+                let layer_id    = read_u32(p)?;
+                let len         = read_varint(p)? as usize;
+                let data        = p.get(..len).ok_or(Error::LengthOverflow)?.to_vec();
+                *p = &p[len..];
+                Message::VideoChunk { pts_us, duration_us, is_keyframe, codec, layer_id, data }
             }
             other => return Err(Error::UnknownTag(other)),
         };
@@ -1358,6 +1432,28 @@ mod tests {
         let mut b1 = Vec::new(); m1.encode(&mut b1);
         let mut b2 = Vec::new(); m2.encode(&mut b2);
         assert!(b2.len() < b1.len(), "ZSTD_DELTA ({} B) should be smaller than standard ZSTD ({} B)", b2.len(), b1.len());
+    }
+
+    #[test]
+    fn audio_and_video_roundtrip() {
+        let opus_data = vec![0xFC, 0xFF, 0xFE, 0x01, 0x02, 0x03, 0x04];
+        roundtrip(Message::AudioFrame {
+            pts_us: 123456789,
+            codec: audio_codec::OPUS,
+            channels: 2,
+            sample_rate: 48000,
+            data: opus_data,
+        });
+
+        let h264_nal = vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E];
+        roundtrip(Message::VideoChunk {
+            pts_us: 987654321,
+            duration_us: 16666,
+            is_keyframe: true,
+            codec: video_codec::H264,
+            layer_id: 1,
+            data: h264_nal,
+        });
     }
 
     #[test]
