@@ -562,7 +562,7 @@ fn make_self_signed_config() -> Result<(ServerConfig, Vec<u8>)> {
         .max_concurrent_bidi_streams(64u32.into())
         .max_concurrent_uni_streams(64u32.into())
         .keep_alive_interval(Some(std::time::Duration::from_secs(5)))
-        .max_datagram_frame_size(Some(1200));
+        .max_datagram_frame_size(Some(65535));
     server_cfg.transport_config(Arc::new(transport));
 
     Ok((server_cfg, cert_der))
