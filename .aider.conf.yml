@@ -1,0 +1,28 @@
+# Aider configuration for ExoBrowserCore.
+#
+# Architect/Editor split: the reasoning model plans the change, the cheap
+# model applies the diffs. Saves ~60-90% on OpenRouter spend versus running
+# everything through a frontier reasoning tier.
+#
+# API key: set OPENROUTER_API_KEY in your shell (see .env.example).
+
+architect: true
+auto-accept-architect: true
+
+# Reasoning tier — plans systems changes, wire protocol, WebKit hooks.
+model: openrouter/deepseek/deepseek-v4-pro
+
+# Mechanical tier — writes serialisation code, applies diffs, boilerplate.
+editor-model: openrouter/deepseek/deepseek-v4-flash
+
+# Weak model = used for cheap ops (commit messages, summarisation).
+weak-model: openrouter/deepseek/deepseek-v4-flash
+
+# Keep the repo map compact so we don't burn tokens on every turn.
+map-tokens: 2048
+
+# Aider auto-commits by default; keep that behaviour so history stays clean.
+auto-commits: true
+gitignore: true
+
+# Sonic-boom terminal ui defaults are fine; leave verbose off.

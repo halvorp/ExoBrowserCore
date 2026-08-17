@@ -1,0 +1,21 @@
+# Keep aider's repo-map + context small and focused.
+
+# Build cache — 1.2 GB
+target/
+**/*.rs.bk
+
+# C build artifacts
+host/*.o
+host/*.a
+host/gutted-host
+
+# Test / demo outputs
+/0
+*.ppm
+*.png
+*.log
+
+# Vendored / harness
+.claude/
+.aider*
+.git/

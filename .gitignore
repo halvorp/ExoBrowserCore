@@ -20,3 +20,11 @@ host/run*.log
 .idea/
 .vscode/
 *.swp
+
+# Secrets (aider / OpenRouter)
+.env
+# Aider runtime state (never these — but keep .aider.conf.yml / .aiderignore in the tree)
+.aider.chat.history.md
+.aider.input.history
+.aider.tags.cache.v*/
+.aider.llm.history
