@@ -38,7 +38,7 @@ struct FrameBus {
 }
 impl FrameBus {
     fn new() -> Self {
-        let (tx, _) = broadcast::channel(64);
+        let (tx, _) = broadcast::channel(16);
         Self { full: Arc::new(AsyncMutex::new(None)), tx }
     }
     async fn publish(&self, msg: Arc<Message>) {
@@ -74,12 +74,12 @@ async fn main() -> Result<()> {
         .context("parse listen addr")?;
 
     let (server_cfg, cert_der) = make_self_signed_config()?;
-    let endpoint = Endpoint::server(server_cfg, addr).context("bind quic endpoint")?;
+    let pin_hex = hex_sha256(&cert_der);
+    println!("GBROWSER_CERT_SHA256={pin_hex}");
+    info!(GBROWSER_CERT_SHA256 = %pin_hex, "cert pin (pass to client)");
 
-    info!(?addr, "gutted-host listening (QUIC/1)");
-    let pin = hex_sha256(&cert_der);
-    println!("GBROWSER_CERT_SHA256={pin}");
-    info!(cert_sha256 = %pin, "self-signed cert fingerprint (pin this on the client)");
+    let endpoint = Endpoint::server(server_cfg, addr).context("bind quic endpoint")?;
+    info!(listen = %addr, "gutted-host listening");
 
     let bus = FrameBus::new();
     // Tracks the currently-loaded URL so late-joining clients can see it
@@ -108,30 +108,6 @@ async fn main() -> Result<()> {
                         n += 1;
                         let ts_us = SystemTime::now().duration_since(UNIX_EPOCH)
                             .unwrap_or_default().as_micros() as u64;
-                        let (min_b, max_b, min_g, max_g, min_r, max_r, non_white_count) = {
-                            let mut min_b = 255u8; let mut max_b = 0u8;
-                            let mut min_g = 255u8; let mut max_g = 0u8;
-                            let mut min_r = 255u8; let mut max_r = 0u8;
-                            let mut non_white = 0u64;
-                            for px in f.pixels.chunks_exact(4) {
-                                min_b = min_b.min(px[0]); max_b = max_b.max(px[0]);
-                                min_g = min_g.min(px[1]); max_g = max_g.max(px[1]);
-                                min_r = min_r.min(px[2]); max_r = max_r.max(px[2]);
-                                 let is_bg = (px[0] == 255 && px[1] == 255 && px[2] == 255) ||
-                                             (px[0] >= 28 && px[0] <= 38 && px[1] >= 28 && px[1] <= 38 && px[2] >= 28 && px[2] <= 38);
-                                 if !is_bg {
-                                     non_white += 1;
-                                 }
-                            }
-                            (min_b, max_b, min_g, max_g, min_r, max_r, non_white)
-                        };
-                        info!(
-                            n, w = f.width, h = f.height, non_white_count,
-                            b = format!("{min_b}..{max_b}"),
-                            g = format!("{min_g}..{max_g}"),
-                            r = format!("{min_r}..{max_r}"),
-                            "WPE FRAME PIXEL STATS"
-                        );
                         let same_geom = last.as_ref().map_or(false, |l|
                             l.width == f.width && l.height == f.height && l.stride == f.stride);
                         let msg: Option<Arc<Message>> = if !same_geom {

@@ -177,7 +177,7 @@ int gutted_wpe_run(
     webkit_cookie_manager_set_accept_policy(cm, WEBKIT_COOKIE_POLICY_ACCEPT_ALWAYS);
 
     WebKitSettings *settings = webkit_settings_new();
-    webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
+    webkit_settings_set_enable_write_console_messages_to_stdout(settings, FALSE);
     webkit_settings_set_enable_javascript(settings, TRUE);
     webkit_settings_set_enable_html5_local_storage(settings, TRUE);
     webkit_settings_set_enable_html5_database(settings, TRUE);
@@ -187,9 +187,13 @@ int gutted_wpe_run(
     webkit_settings_set_enable_resizable_text_areas(settings, TRUE);
     webkit_settings_set_enable_page_cache(settings, TRUE);
     webkit_settings_set_enable_site_specific_quirks(settings, TRUE);
+    webkit_settings_set_enable_media(settings, TRUE);
     webkit_settings_set_enable_media_stream(settings, TRUE);
     webkit_settings_set_enable_mediasource(settings, TRUE);
     webkit_settings_set_enable_encrypted_media(settings, TRUE);
+    webkit_settings_set_enable_webaudio(settings, TRUE);
+    webkit_settings_set_media_playback_allows_inline(settings, TRUE);
+    webkit_settings_set_media_playback_requires_user_gesture(settings, FALSE);
     webkit_settings_set_user_agent(settings,
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
 
