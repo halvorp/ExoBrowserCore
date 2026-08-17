@@ -380,6 +380,7 @@ async fn handle_ctrl_stream(
             Ok(s) => s,
             Err(e) => { warn!(error = %e, "open_uni video stream"); return; }
         };
+        vs.set_priority(1i32.into()); // lower priority
         info!("video uni-stream open");
 
         async fn write_frame(vs: &mut quinn::SendStream, msg: &Message) -> (Result<()>, usize) {
@@ -417,8 +418,20 @@ async fn handle_ctrl_stream(
             tokio::select! {
                 r = stream_rx.recv() => match r {
                     Ok(m) => {
-                        // If we already delivered this exact Arc as snapshot,
-                        // skip (avoids duplicate FULL at start).
+                        // SUBFRAME → try QUIC datagram (faster, no HoL blocking)
+                        // Fallback to stream if message too large.
+                        if matches!(&*m, Message::Subframe { .. }) {
+                            let mut buf = Vec::with_capacity(1024);
+                            m.encode(&mut buf);
+                            if let Some(max_dgram) = video_conn.max_datagram_size() {
+                                if buf.len() <= max_dgram {
+                                    let _ = video_conn.send_datagram(buf.into());
+                                    // Skip stream write for this message.
+                                    continue;
+                                }
+                            }
+                        }
+                        // Fallback: write to stream for everything else.
                         let (res, n) = write_frame(&mut vs, &m).await;
                         if let Err(e) = res { warn!(error = %e, "video write"); break; }
                         published += 1;
@@ -552,7 +565,8 @@ fn make_self_signed_config() -> Result<(ServerConfig, Vec<u8>)> {
     transport
         .max_concurrent_bidi_streams(64u32.into())
         .max_concurrent_uni_streams(64u32.into())
-        .keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+        .keep_alive_interval(Some(std::time::Duration::from_secs(5)))
+        .max_datagram_frame_size(Some(1200));
     server_cfg.transport_config(Arc::new(transport));
 
     Ok((server_cfg, cert_der))

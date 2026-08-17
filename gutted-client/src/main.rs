@@ -311,6 +311,43 @@ async fn net_main(
         })
     };
 
+    // ── Datagram receiver: SUBFRAME arrives via QUIC datagrams ────────────
+    let video_dgram_task = {
+        let conn = conn.clone();
+        let frames_tx = frames_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match conn.read_datagram().await {
+                    Ok(data) => {
+                        let mut raw = &data[..];
+                        match Message::decode(&mut raw) {
+                            Ok(Some(Message::Subframe { x, y, w, h, stride, pixels, .. })) => {
+                                let _ = frames_tx.send(RenderEvent::Subframe(
+                                    render::GfxSubframe {
+                                        x: x as u32, y: y as u32,
+                                        w: w as u32, h: h as u32,
+                                        stride, pixels,
+                                    },
+                                ));
+                            }
+                            Ok(Some(_)) => {}  // ignore other message types on datagrams
+                            _ => {}  // corrupt, drop silently
+                        }
+                    }
+                    Err(quinn::ReadDatagramError::ConnectionClosed(_)) => break,
+                    Err(quinn::ReadDatagramError::TooBig) => {
+                        // shouldn't happen with our size limit
+                        tracing::warn!("oversize datagram received");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "datagram read error");
+                        break;
+                    }
+                }
+            }
+        })
+    };
+
     // Input publisher: pull events from the winit thread's std::mpsc and
     // route each event: InputEvent::Navigate → ctrl (via ctrl_tx), everything
     // else → input uni stream.
@@ -375,7 +412,11 @@ async fn net_main(
                 msg.encode(&mut buf);
                 if send.is_none() {
                     match open_stream() {
-                        Ok(s) => { tracing::info!("input uni-stream opened"); send = Some(s); }
+                        Ok(s) => {
+                            s.set_priority((-1i32).into());
+                            tracing::info!("input uni-stream opened");
+                            send = Some(s);
+                        }
                         Err(e) => { tracing::warn!(error = %e, "open input stream"); return Err(e); }
                     }
                 }
@@ -446,6 +487,7 @@ fn make_client_config(cert_pin_sha256: Option<Vec<u8>>) -> Result<ClientConfig> 
 
     let mut t = quinn::TransportConfig::default();
     t.keep_alive_interval(Some(Duration::from_secs(5)));
+    t.max_datagram_frame_size(Some(1200));
     cfg.transport_config(Arc::new(t));
     Ok(cfg)
 }
