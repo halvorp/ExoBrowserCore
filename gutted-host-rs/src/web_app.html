@@ -1,0 +1,968 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>ExoBrowser Cloud</title>
+  <style>
+    :root {
+      --bg-base: #09090b;
+      --bg-surface: #18181b;
+      --bg-elevated: #27272a;
+      --bg-hover: #3f3f46;
+      --border-subtle: #27272a;
+      --border-accent: #3b82f6;
+      --text-main: #f4f4f5;
+      --text-muted: #a1a1aa;
+      --accent-blue: #3b82f6;
+      --accent-hover: #2563eb;
+      --accent-green: #22c55e;
+      --accent-red: #ef4444;
+      --accent-gold: #eab308;
+      --chrome-height: 84px;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    body, html {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: var(--bg-base);
+      color: var(--text-main);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-size: 13px;
+    }
+
+    #app-container {
+      display: flex;
+      flex-direction: column;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ─── Top Browser Chrome ─────────────────────────────────────────── */
+    #chrome-header {
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+      z-index: 100;
+    }
+
+    /* Tab Bar */
+    #tab-bar-strip {
+      height: 38px;
+      display: flex;
+      align-items: center;
+      padding: 4px 8px 0 8px;
+      background: #111114;
+      gap: 6px;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    #tab-bar-strip::-webkit-scrollbar { display: none; }
+
+    .brand-pill {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      font-weight: 700;
+      font-size: 12px;
+      letter-spacing: 0.5px;
+      color: #60a5fa;
+      background: rgba(59, 130, 246, 0.12);
+      border: 1px solid rgba(59, 130, 246, 0.25);
+      border-radius: 6px;
+      margin-right: 4px;
+      white-space: nowrap;
+    }
+
+    #tabs-list {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      flex: 1;
+      height: 100%;
+    }
+
+    .tab-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 12px;
+      height: 32px;
+      background: #18181b;
+      border: 1px solid #27272a;
+      border-bottom: none;
+      border-radius: 8px 8px 0 0;
+      color: var(--text-muted);
+      cursor: pointer;
+      min-width: 120px;
+      max-width: 220px;
+      font-size: 12px;
+      font-weight: 500;
+      transition: all 0.15s ease;
+      position: relative;
+    }
+
+    .tab-item:hover {
+      background: #27272a;
+      color: var(--text-main);
+    }
+
+    .tab-item.active {
+      background: #27272a;
+      color: #ffffff;
+      border-color: #3f3f46;
+      font-weight: 600;
+    }
+    .tab-item.active::after {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 2px;
+      background: var(--accent-blue);
+      border-radius: 8px 8px 0 0;
+    }
+
+    .tab-title {
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .tab-close-btn {
+      width: 18px;
+      height: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 4px;
+      font-size: 14px;
+      opacity: 0.6;
+      transition: all 0.1s;
+    }
+    .tab-close-btn:hover {
+      background: rgba(239, 68, 68, 0.2);
+      color: var(--accent-red);
+      opacity: 1;
+    }
+
+    .btn-new-tab {
+      width: 28px;
+      height: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-size: 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn-new-tab:hover {
+      background: var(--bg-hover);
+      color: var(--text-main);
+    }
+
+    .header-status {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding-right: 8px;
+    }
+
+    .status-badge {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--accent-gold);
+    }
+    .status-dot.online { background: var(--accent-green); }
+    .status-dot.offline { background: var(--accent-red); }
+
+    /* Navigation Toolbar */
+    #nav-toolbar {
+      height: 44px;
+      display: flex;
+      align-items: center;
+      padding: 0 10px;
+      gap: 8px;
+      background: var(--bg-surface);
+    }
+
+    .nav-btn-group {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+    }
+
+    .nav-btn {
+      width: 32px;
+      height: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: transparent;
+      border: none;
+      color: var(--text-main);
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+      transition: background 0.15s;
+    }
+    .nav-btn:hover { background: var(--bg-hover); }
+    .nav-btn:active { transform: scale(0.96); }
+
+    /* Omnibox / Address Bar */
+    #omnibox-wrapper {
+      flex: 1;
+      height: 32px;
+      display: flex;
+      align-items: center;
+      background: var(--bg-base);
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      padding: 0 10px;
+      gap: 8px;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    #omnibox-wrapper:focus-within {
+      border-color: var(--accent-blue);
+      box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.25);
+    }
+
+    #security-icon {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    #security-icon.secure { color: var(--accent-green); }
+
+    #url-input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      outline: none;
+      color: var(--text-main);
+      font-size: 13px;
+      font-family: inherit;
+      user-select: text;
+      -webkit-user-select: text;
+    }
+    #url-input::placeholder { color: var(--text-muted); }
+
+    .zoom-pill {
+      display: flex;
+      align-items: center;
+      background: var(--bg-base);
+      border: 1px solid var(--border-subtle);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .zoom-btn {
+      padding: 4px 8px;
+      background: transparent;
+      border: none;
+      color: var(--text-main);
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .zoom-btn:hover { background: var(--bg-hover); }
+    .zoom-value {
+      padding: 0 6px;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-muted);
+    }
+
+    /* ─── Viewport Area ──────────────────────────────────────────────── */
+    #viewport-container {
+      flex: 1;
+      width: 100%;
+      height: calc(100vh - var(--chrome-height));
+      position: relative;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+
+    #browser-canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      cursor: default;
+      image-rendering: auto;
+    }
+
+    #connecting-modal {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(9, 9, 11, 0.85);
+      backdrop-filter: blur(8px);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      z-index: 50;
+    }
+    #connecting-modal.hidden { display: none; }
+
+    .spinner {
+      width: 36px;
+      height: 36px;
+      border: 3px solid rgba(59, 130, 246, 0.2);
+      border-top-color: var(--accent-blue);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* HUD overlay */
+    #hud-info {
+      position: absolute;
+      bottom: 12px;
+      left: 12px;
+      background: rgba(24, 24, 27, 0.75);
+      border: 1px solid rgba(63, 63, 70, 0.5);
+      backdrop-filter: blur(6px);
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 11px;
+      color: var(--text-muted);
+      pointer-events: none;
+      display: flex;
+      gap: 10px;
+    }
+  </style>
+</head>
+<body>
+  <div id="app-container">
+    <!-- Chrome Header -->
+    <header id="chrome-header">
+      <!-- Tabs Strip -->
+      <div id="tab-bar-strip">
+        <div class="brand-pill"><span>⚡</span> ExoBrowser</div>
+        <div id="tabs-list"></div>
+        <button id="btn-add-tab" class="btn-new-tab" title="New Tab (Ctrl+T)">+</button>
+        <div class="header-status">
+          <div class="status-badge"><span id="status-dot" class="status-dot"></span> <span id="status-text">Connecting</span></div>
+          <button id="btn-fullscreen" class="nav-btn" title="Fullscreen" style="width:26px; height:26px;">⛶</button>
+        </div>
+      </div>
+
+      <!-- Navigation Toolbar -->
+      <div id="nav-toolbar">
+        <div class="nav-btn-group">
+          <button id="btn-back" class="nav-btn" title="Back (Alt+Left)">←</button>
+          <button id="btn-fwd" class="nav-btn" title="Forward (Alt+Right)">→</button>
+          <button id="btn-reload" class="nav-btn" title="Reload (F5)">↻</button>
+          <button id="btn-home" class="nav-btn" title="Home">🏠</button>
+        </div>
+
+        <div id="omnibox-wrapper">
+          <span id="security-icon">🔒</span>
+          <input type="text" id="url-input" placeholder="Search DuckDuckGo or enter URL..." autocomplete="off" spellcheck="false">
+        </div>
+
+        <div class="zoom-pill">
+          <button id="btn-zoom-out" class="zoom-btn">-</button>
+          <span id="zoom-label" class="zoom-value">100%</span>
+          <button id="btn-zoom-in" class="zoom-btn">+</button>
+        </div>
+
+        <button id="btn-clear-data" class="nav-btn" title="Clear Cookies & Cache" style="font-size: 12px;">🧹</button>
+      </div>
+    </header>
+
+    <!-- Main Viewport Canvas -->
+    <main id="viewport-container">
+      <canvas id="browser-canvas" tabindex="0"></canvas>
+      <div id="connecting-modal">
+        <div class="spinner"></div>
+        <div style="font-weight: 600; font-size: 15px;">Connecting to ExoBrowser Cloud...</div>
+        <div style="font-size: 12px; color: var(--text-muted);">Streaming low-latency spatial deltas via WebSocket</div>
+      </div>
+      <div id="hud-info">
+        <span id="hud-fps">60 FPS</span>
+        <span id="hud-res">1280×720</span>
+        <span id="hud-rtt">1 ms</span>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    (function() {
+      // ─── Protocol Tags ───────────────────────────────────────────────
+      const TAG = {
+        HELLO: 0x01, WELCOME: 0x02, RESIZE: 0x03, NAV: 0x04, HEARTBEAT: 0x05,
+        NAV_ACTION: 0x06, STOP: 0x07,
+        INPUT_POINTER: 0x10, INPUT_KEY: 0x11, INPUT_SCROLL: 0x12, INPUT_BUTTON: 0x13, SET_ZOOM: 0x14,
+        CURSOR_STATE: 0x30, LOAD_STATE: 0x31, TITLE: 0x32, URL_CHANGED: 0x33,
+        RAW_FRAME: 0x40, SUBFRAME: 0x41, AUDIO_FRAME: 0x48,
+        CREATE_TAB: 0x70, CLOSE_TAB: 0x71, SWITCH_TAB: 0x72,
+        TAB_CREATED: 0x73, TAB_CLOSED: 0x74, TAB_ACTIVATED: 0x75, TAB_TITLE: 0x76, TAB_URL: 0x77,
+        CLEAR_DATA: 0x80
+      };
+
+      // ─── UI State & Elements ─────────────────────────────────────────
+      const canvas = document.getElementById('browser-canvas');
+      const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+      const viewportContainer = document.getElementById('viewport-container');
+      const urlInput = document.getElementById('url-input');
+      const securityIcon = document.getElementById('security-icon');
+      const tabsList = document.getElementById('tabs-list');
+      const statusDot = document.getElementById('status-dot');
+      const statusText = document.getElementById('status-text');
+      const connectingModal = document.getElementById('connecting-modal');
+      const zoomLabel = document.getElementById('zoom-label');
+      const hudFps = document.getElementById('hud-fps');
+      const hudRes = document.getElementById('hud-res');
+
+      let ws = null;
+      let activeTabId = 1;
+      let nextTabId = 2;
+      let tabs = [];
+      let zoomLevel = 1000;
+      let frameWidth = 1280, frameHeight = 720;
+      let frameCount = 0, lastFpsTime = performance.now();
+
+      // ─── Binary Protocol Codec ───────────────────────────────────────
+      function writeVarint(buf, val) {
+        let v = val >>> 0;
+        while (v >= 0x80) {
+          buf.push((v & 0x7f) | 0x80);
+          v >>>= 7;
+        }
+        buf.push(v);
+      }
+
+      function readVarint(view, offset) {
+        let result = 0, shift = 0, bytesRead = 0;
+        while (true) {
+          if (offset + bytesRead >= view.byteLength) return null;
+          const byte = view.getUint8(offset + bytesRead);
+          bytesRead++;
+          result |= (byte & 0x7f) << shift;
+          if ((byte & 0x80) === 0) break;
+          shift += 7;
+        }
+        return { value: result, bytesRead };
+      }
+
+      function encodeMessage(tag, payloadBytes) {
+        const header = [];
+        writeVarint(header, tag);
+        writeVarint(header, payloadBytes.length);
+        const out = new Uint8Array(header.length + payloadBytes.length);
+        out.set(header, 0);
+        out.set(payloadBytes, header.length);
+        return out;
+      }
+
+      function sendMsg(tag, payload) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          const wire = encodeMessage(tag, payload);
+          ws.send(wire);
+        }
+      }
+
+      function encodeString(str) {
+        const enc = new TextEncoder().encode(str);
+        const buf = [];
+        writeVarint(buf, enc.length);
+        const out = new Uint8Array(buf.length + enc.length);
+        out.set(buf, 0);
+        out.set(enc, buf.length);
+        return out;
+      }
+
+      // ─── Connect WebSocket ───────────────────────────────────────────
+      function connect() {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws`;
+        statusDot.className = 'status-dot';
+        statusText.textContent = 'Connecting';
+
+        ws = new WebSocket(wsUrl);
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = () => {
+          statusDot.className = 'status-dot online';
+          statusText.textContent = 'Live';
+          connectingModal.classList.add('hidden');
+          // Send Hello
+          const w = Math.max(640, viewportContainer.clientWidth);
+          const h = Math.max(360, viewportContainer.clientHeight);
+          const buf = new Uint8Array(4 + 2 + 2 + 2 + 4 + 1);
+          const dv = new DataView(buf.buffer);
+          dv.setUint32(0, 1, true); // proto version
+          dv.setUint16(4, w, true);
+          dv.setUint16(6, h, true);
+          dv.setUint16(8, 100, true); // DPR
+          dv.setUint32(10, 0x10, true); // caps
+          buf[14] = 0; // client_name len
+          sendMsg(TAG.HELLO, buf);
+        };
+
+        ws.onmessage = (event) => {
+          decodeMessages(new Uint8Array(event.data));
+        };
+
+        ws.onclose = () => {
+          statusDot.className = 'status-dot offline';
+          statusText.textContent = 'Disconnected';
+          connectingModal.classList.remove('hidden');
+          setTimeout(connect, 1500);
+        };
+
+        ws.onerror = () => {
+          ws.close();
+        };
+      }
+
+      function decodeMessages(bytes) {
+        let offset = 0;
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+        while (offset < bytes.byteLength) {
+          const tagInfo = readVarint(view, offset);
+          if (!tagInfo) break;
+          offset += tagInfo.bytesRead;
+
+          const lenInfo = readVarint(view, offset);
+          if (!lenInfo) break;
+          offset += lenInfo.bytesRead;
+
+          const tag = tagInfo.value;
+          const len = lenInfo.value;
+          if (offset + len > bytes.byteLength) break;
+
+          const payload = bytes.subarray(offset, offset + len);
+          handlePayload(tag, payload);
+          offset += len;
+        }
+      }
+
+      function handlePayload(tag, p) {
+        const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
+        switch (tag) {
+          case TAG.RAW_FRAME: {
+            const w = dv.getUint16(8, true);
+            const h = dv.getUint16(10, true);
+            const stride = dv.getUint32(12, true);
+            const raw = p.subarray(21);
+            if (canvas.width !== w || canvas.height !== h) {
+              canvas.width = w;
+              canvas.height = h;
+              frameWidth = w;
+              frameHeight = h;
+              hudRes.textContent = `${w}×${h}`;
+            }
+            // Fast BGRA -> RGBA in-place swap
+            const u32 = new Uint32Array(raw.buffer, raw.byteOffset, (w * h));
+            for (let i = 0; i < u32.length; i++) {
+              const val = u32[i];
+              u32[i] = (val & 0xFF00FF00) | ((val >> 16) & 0xFF) | ((val & 0xFF) << 16) | 0xFF000000;
+            }
+            const imgData = new ImageData(new Uint8ClampedArray(raw.buffer, raw.byteOffset, w * h * 4), w, h);
+            ctx.putImageData(imgData, 0, 0);
+            updateFps();
+            break;
+          }
+          case TAG.SUBFRAME: {
+            const x = dv.getUint16(8, true);
+            const y = dv.getUint16(10, true);
+            const w = dv.getUint16(12, true);
+            const h = dv.getUint16(14, true);
+            const raw = p.subarray(25);
+            const u32 = new Uint32Array(raw.buffer, raw.byteOffset, (w * h));
+            for (let i = 0; i < u32.length; i++) {
+              const val = u32[i];
+              u32[i] = (val & 0xFF00FF00) | ((val >> 16) & 0xFF) | ((val & 0xFF) << 16) | 0xFF000000;
+            }
+            const imgData = new ImageData(new Uint8ClampedArray(raw.buffer, raw.byteOffset, w * h * 4), w, h);
+            ctx.putImageData(imgData, x, y);
+            updateFps();
+            break;
+          }
+          case TAG.URL_CHANGED: {
+            const url = readString(p, 0);
+            if (document.activeElement !== urlInput) {
+              urlInput.value = url;
+            }
+            const isHttps = url.startsWith('https://');
+            securityIcon.textContent = isHttps ? '🔒' : 'ℹ️';
+            securityIcon.className = isHttps ? 'secure' : '';
+            break;
+          }
+          case TAG.TITLE: {
+            const title = readString(p, 0);
+            document.title = `${title} — ExoBrowser Cloud`;
+            const tab = tabs.find(t => t.id === activeTabId);
+            if (tab) { tab.title = title; renderTabs(); }
+            break;
+          }
+          case TAG.CURSOR_STATE: {
+            const shape = dv.getUint8(0);
+            const cursors = ['default', 'pointer', 'text', 'wait', 'wait', 'crosshair', 'move', 'not-allowed', 'grab', 'grabbing'];
+            canvas.style.cursor = cursors[shape] || 'default';
+            break;
+          }
+          case TAG.TAB_CREATED: {
+            const tabId = dv.getUint32(0, true);
+            const title = readString(p, 4);
+            if (!tabs.some(t => t.id === tabId)) {
+              tabs.push({ id: tabId, title: title || 'New Tab', url: '' });
+              renderTabs();
+            }
+            break;
+          }
+          case TAG.TAB_CLOSED: {
+            const tabId = dv.getUint32(0, true);
+            tabs = tabs.filter(t => t.id !== tabId);
+            renderTabs();
+            break;
+          }
+          case TAG.TAB_ACTIVATED: {
+            activeTabId = dv.getUint32(0, true);
+            renderTabs();
+            break;
+          }
+          case TAG.TAB_TITLE: {
+            const tabId = dv.getUint32(0, true);
+            const title = readString(p, 4);
+            const t = tabs.find(tb => tb.id === tabId);
+            if (t) { t.title = title; renderTabs(); }
+            break;
+          }
+        }
+      }
+
+      function readString(p, off) {
+        const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
+        const lenInfo = readVarint(dv, off);
+        if (!lenInfo) return '';
+        const bytes = p.subarray(off + lenInfo.bytesRead, off + lenInfo.bytesRead + lenInfo.value);
+        return new TextDecoder().decode(bytes);
+      }
+
+      function updateFps() {
+        frameCount++;
+        const now = performance.now();
+        if (now - lastFpsTime >= 1000) {
+          hudFps.textContent = `${frameCount} FPS`;
+          frameCount = 0;
+          lastFpsTime = now;
+        }
+      }
+
+      // ─── Tab Strip Rendering ─────────────────────────────────────────
+      function renderTabs() {
+        tabsList.innerHTML = '';
+        tabs.forEach(tab => {
+          const el = document.createElement('div');
+          el.className = `tab-item ${tab.id === activeTabId ? 'active' : ''}`;
+          el.innerHTML = `
+            <span style="font-size:10px;">●</span>
+            <span class="tab-title">${escapeHtml(tab.title || 'New Tab')}</span>
+            <span class="tab-close-btn" title="Close Tab">×</span>
+          `;
+          el.onclick = (e) => {
+            if (e.target.classList.contains('tab-close-btn')) {
+              e.stopPropagation();
+              closeTab(tab.id);
+            } else {
+              switchTab(tab.id);
+            }
+          };
+          tabsList.appendChild(el);
+        });
+      }
+
+      function escapeHtml(str) {
+        return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      }
+
+      function createTab(url = 'https://duckduckgo.com') {
+        const newId = nextTabId++;
+        tabs.push({ id: newId, title: 'New Tab', url });
+        activeTabId = newId;
+        renderTabs();
+        const b = new Uint8Array(4 + 1 + url.length);
+        new DataView(b.buffer).setUint32(0, newId, true);
+        b[4] = url.length;
+        for (let i = 0; i < url.length; i++) b[5 + i] = url.charCodeAt(i);
+        sendMsg(TAG.CREATE_TAB, b);
+      }
+
+      function closeTab(tabId) {
+        if (tabs.length <= 1) return;
+        const b = new Uint8Array(4);
+        new DataView(b.buffer).setUint32(0, tabId, true);
+        sendMsg(TAG.CLOSE_TAB, b);
+        const idx = tabs.findIndex(t => t.id === tabId);
+        tabs = tabs.filter(t => t.id !== tabId);
+        if (activeTabId === tabId && tabs.length > 0) {
+          const newActive = tabs[Math.max(0, idx - 1)].id;
+          switchTab(newActive);
+        }
+        renderTabs();
+      }
+
+      function switchTab(tabId) {
+        activeTabId = tabId;
+        renderTabs();
+        const b = new Uint8Array(4);
+        new DataView(b.buffer).setUint32(0, tabId, true);
+        sendMsg(TAG.SWITCH_TAB, b);
+      }
+
+      // ─── Input & Event Dispatch ──────────────────────────────────────
+      function getCanvasCoords(e) {
+        const rect = canvas.getBoundingClientRect();
+        const scaleX = frameWidth / rect.width;
+        const scaleY = frameHeight / rect.height;
+        return {
+          x: Math.round((e.clientX - rect.left) * scaleX),
+          y: Math.round((e.clientY - rect.top) * scaleY)
+        };
+      }
+
+      let lastMotion = 0;
+      canvas.addEventListener('mousemove', (e) => {
+        const now = performance.now();
+        if (now - lastMotion < 8) return;
+        lastMotion = now;
+        const { x, y } = getCanvasCoords(e);
+        const b = new Uint8Array(8 + 4 + 4 + 4);
+        const dv = new DataView(b.buffer);
+        dv.setBigUint64(0, BigInt(Math.round(performance.now() * 1000)), true);
+        dv.setInt32(8, x, true);
+        dv.setInt32(12, y, true);
+        dv.setUint32(16, 0, true);
+        sendMsg(TAG.INPUT_POINTER, b);
+      });
+
+      canvas.addEventListener('mousedown', (e) => {
+        canvas.focus();
+        const { x, y } = getCanvasCoords(e);
+        const btn = e.button === 0 ? 1 : e.button === 1 ? 2 : 3;
+        const b = new Uint8Array(8 + 4 + 4 + 4 + 1 + 4);
+        const dv = new DataView(b.buffer);
+        dv.setBigUint64(0, BigInt(Math.round(performance.now() * 1000)), true);
+        dv.setInt32(8, x, true);
+        dv.setInt32(12, y, true);
+        dv.setUint32(16, btn, true);
+        dv.setUint8(20, 1); // pressed
+        dv.setUint32(21, 1 << (20 + btn - 1), true);
+        sendMsg(TAG.INPUT_BUTTON, b);
+      });
+
+      canvas.addEventListener('mouseup', (e) => {
+        const { x, y } = getCanvasCoords(e);
+        const btn = e.button === 0 ? 1 : e.button === 1 ? 2 : 3;
+        const b = new Uint8Array(8 + 4 + 4 + 4 + 1 + 4);
+        const dv = new DataView(b.buffer);
+        dv.setBigUint64(0, BigInt(Math.round(performance.now() * 1000)), true);
+        dv.setInt32(8, x, true);
+        dv.setInt32(12, y, true);
+        dv.setUint32(16, btn, true);
+        dv.setUint8(20, 0); // released
+        dv.setUint32(21, 0, true);
+        sendMsg(TAG.INPUT_BUTTON, b);
+      });
+
+      canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+      canvas.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        if (e.ctrlKey) {
+          zoomLevel = Math.max(250, Math.min(5000, zoomLevel + (e.deltaY < 0 ? 100 : -100)));
+          zoomLabel.textContent = `${Math.round(zoomLevel / 10)}%`;
+          const b = new Uint8Array(4);
+          new DataView(b.buffer).setUint32(0, zoomLevel, true);
+          sendMsg(TAG.SET_ZOOM, b);
+          return;
+        }
+        const dx = Math.round(e.deltaX);
+        const dy = Math.round(e.deltaY);
+        const b = new Uint8Array(8 + 4 + 4 + 4 + 1);
+        const dv = new DataView(b.buffer);
+        dv.setBigUint64(0, BigInt(Math.round(performance.now() * 1000)), true);
+        dv.setUint32(8, 0, true); // layer_id
+        dv.setInt32(12, dx, true);
+        dv.setInt32(16, dy, true);
+        dv.setUint8(20, 2); // Update phase
+        sendMsg(TAG.INPUT_SCROLL, b);
+      }, { passive: false });
+
+      // Keyboard handler
+      window.addEventListener('keydown', (e) => {
+        if (document.activeElement === urlInput) {
+          if (e.key === 'Enter') {
+            navigate(urlInput.value);
+            canvas.focus();
+          }
+          return;
+        }
+        if (e.ctrlKey && e.key.toLowerCase() === 't') { e.preventDefault(); createTab(); return; }
+        if (e.ctrlKey && e.key.toLowerCase() === 'w') { e.preventDefault(); closeTab(activeTabId); return; }
+        if (e.ctrlKey && e.key.toLowerCase() === 'l') { e.preventDefault(); urlInput.focus(); urlInput.select(); return; }
+        if (e.key === 'F5' || (e.ctrlKey && e.key.toLowerCase() === 'r')) {
+          e.preventDefault();
+          sendNavAction(2);
+          return;
+        }
+
+        const keycode = mapJsKeyToKeysym(e);
+        let mods = 0;
+        if (e.ctrlKey)  mods |= 1 << 0;
+        if (e.shiftKey) mods |= 1 << 1;
+        if (e.altKey)   mods |= 1 << 2;
+        if (e.metaKey)  mods |= 1 << 3;
+
+        const b = new Uint8Array(8 + 4 + 4 + 1);
+        const dv = new DataView(b.buffer);
+        dv.setBigUint64(0, BigInt(Math.round(performance.now() * 1000)), true);
+        dv.setUint32(8, keycode, true);
+        dv.setUint32(12, mods, true);
+        dv.setUint8(16, 1); // down
+        sendMsg(TAG.INPUT_KEY, b);
+      });
+
+      window.addEventListener('keyup', (e) => {
+        if (document.activeElement === urlInput) return;
+        const keycode = mapJsKeyToKeysym(e);
+        let mods = 0;
+        if (e.ctrlKey)  mods |= 1 << 0;
+        if (e.shiftKey) mods |= 1 << 1;
+        if (e.altKey)   mods |= 1 << 2;
+        if (e.metaKey)  mods |= 1 << 3;
+
+        const b = new Uint8Array(8 + 4 + 4 + 1);
+        const dv = new DataView(b.buffer);
+        dv.setBigUint64(0, BigInt(Math.round(performance.now() * 1000)), true);
+        dv.setUint32(8, keycode, true);
+        dv.setUint32(12, mods, true);
+        dv.setUint8(16, 0); // up
+        sendMsg(TAG.INPUT_KEY, b);
+      });
+
+      function mapJsKeyToKeysym(e) {
+        const map = {
+          'Enter': 0xFF0D, 'Backspace': 0xFF08, 'Tab': 0xFF09, 'Escape': 0xFF1B,
+          'Delete': 0xFFFF, 'ArrowLeft': 0xFF51, 'ArrowUp': 0xFF52, 'ArrowRight': 0xFF53, 'ArrowDown': 0xFF54,
+          'PageUp': 0xFF55, 'PageDown': 0xFF56, 'Home': 0xFF50, 'End': 0xFF57,
+          'F1': 0xFFBE, 'F2': 0xFFBF, 'F3': 0xFFC0, 'F4': 0xFFC1, 'F5': 0xFFC2, 'F6': 0xFFC3,
+          'F7': 0xFFC4, 'F8': 0xFFC5, 'F9': 0xFFC6, 'F10': 0xFFC7, 'F11': 0xFFC8, 'F12': 0xFFC9
+        };
+        if (map[e.key]) return map[e.key];
+        if (e.key.length === 1) return e.key.charCodeAt(0);
+        return 0;
+      }
+
+      function navigate(raw) {
+        let url = raw.trim();
+        if (!url) url = 'https://duckduckgo.com';
+        else if (!/^https?:\/\//i.test(url) && !url.startsWith('about:')) {
+          if (url.includes('.') && !url.includes(' ')) {
+            url = 'https://' + url;
+          } else {
+            url = 'https://duckduckgo.com/?q=' + encodeURIComponent(url);
+          }
+        }
+        urlInput.value = url;
+        sendMsg(TAG.NAV, encodeString(url));
+      }
+
+      function sendNavAction(action) {
+        const b = new Uint8Array([action]);
+        sendMsg(TAG.NAV_ACTION, b);
+      }
+
+      // ─── Button Handlers ─────────────────────────────────────────────
+      document.getElementById('btn-back').onclick = () => sendNavAction(0);
+      document.getElementById('btn-fwd').onclick = () => sendNavAction(1);
+      document.getElementById('btn-reload').onclick = () => sendNavAction(2);
+      document.getElementById('btn-home').onclick = () => navigate('https://duckduckgo.com');
+      document.getElementById('btn-add-tab').onclick = () => createTab();
+      document.getElementById('btn-fullscreen').onclick = () => {
+        if (!document.fullscreenElement) document.documentElement.requestFullscreen();
+        else document.exitFullscreen();
+      };
+      document.getElementById('btn-clear-data').onclick = () => {
+        if (confirm('Clear all cookies, cache, and local storage?')) {
+          const b = new Uint8Array([1, 1, 1]);
+          sendMsg(TAG.CLEAR_DATA, b);
+        }
+      };
+
+      // Zoom
+      document.getElementById('btn-zoom-in').onclick = () => {
+        zoomLevel = Math.min(5000, zoomLevel + 100);
+        zoomLabel.textContent = `${Math.round(zoomLevel / 10)}%`;
+        const b = new Uint8Array(4);
+        new DataView(b.buffer).setUint32(0, zoomLevel, true);
+        sendMsg(TAG.SET_ZOOM, b);
+      };
+      document.getElementById('btn-zoom-out').onclick = () => {
+        zoomLevel = Math.max(250, zoomLevel - 100);
+        zoomLabel.textContent = `${Math.round(zoomLevel / 10)}%`;
+        const b = new Uint8Array(4);
+        new DataView(b.buffer).setUint32(0, zoomLevel, true);
+        sendMsg(TAG.SET_ZOOM, b);
+      };
+
+      // Resize Observer
+      const resizeObserver = new ResizeObserver(entries => {
+        for (let entry of entries) {
+          const w = Math.round(entry.contentRect.width);
+          const h = Math.round(entry.contentRect.height);
+          if (w >= 100 && h >= 100) {
+            const b = new Uint8Array(2 + 2 + 2);
+            const dv = new DataView(b.buffer);
+            dv.setUint16(0, w, true);
+            dv.setUint16(2, h, true);
+            dv.setUint16(4, 100, true);
+            sendMsg(TAG.RESIZE, b);
+          }
+        }
+      });
+      resizeObserver.observe(viewportContainer);
+
+      // Start connection
+      tabs.push({ id: 1, title: 'DuckDuckGo', url: 'https://duckduckgo.com' });
+      renderTabs();
+      connect();
+    })();
+  </script>
+</body>
+</html>

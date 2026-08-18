@@ -11,6 +11,7 @@
 //! prove the transport works end-to-end.
 
 mod wpe;
+mod web;
 
 use anyhow::{anyhow, Context, Result};
 use gutted_proto::{caps, Message, PROTO_VERSION};
@@ -55,6 +56,7 @@ impl FrameBus {
 
 const ALPN: &[u8] = b"gbrowser/1";
 const DEFAULT_ADDR: &str = "0.0.0.0:4433";
+const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:8080";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -86,6 +88,18 @@ async fn main() -> Result<()> {
     let bus = FrameBus::new();
     let initial_url = std::env::var("GBROWSER_URL").unwrap_or_else(|_| "https://example.com".into());
     let host_state = HostState::new(bus.clone(), &initial_url).await;
+
+    // Spawn built-in Web Client Server (HTTP + WebSocket)
+    let http_addr: SocketAddr = std::env::var("GBROWSER_HTTP_LISTEN")
+        .unwrap_or_else(|_| DEFAULT_HTTP_ADDR.into())
+        .parse()
+        .context("parse http listen addr")?;
+    let host_state_web = host_state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = web::run_web_server(http_addr, host_state_web).await {
+            error!(error = %e, "web server failed");
+        }
+    });
 
     while let Some(incoming) = endpoint.accept().await {
         let host_state = host_state.clone();
