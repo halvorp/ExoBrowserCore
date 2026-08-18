@@ -38,6 +38,14 @@ pub enum GtkFrame {
     UrlChanged(String),
     /// Cursor shape changed
     Cursor(gutted_proto::CursorShape),
+    /// Tab lifecycle
+    TabCreated { tab_id: u32, title: String, url: String },
+    TabClosed { tab_id: u32 },
+    TabActivated { tab_id: u32 },
+    TabTitle { tab_id: u32, title: String },
+    TabUrl { tab_id: u32, url: String },
+    /// Auth confirmation with remote node info
+    AuthSuccess { node_id: String },
 }
 
 /// Anything the GTK thread wants to send back to the host.
@@ -52,6 +60,10 @@ pub enum OutMsg {
     /// History nav. 0=back, 1=forward, 2=reload.
     NavAction { action: u8 },
     Stop,
+    CreateTab { tab_id: u32, url: String },
+    CloseTab { tab_id: u32 },
+    SwitchTab { tab_id: u32 },
+    ClearData { clear_cookies: bool, clear_cache: bool, clear_storage: bool },
 }
 
 /// Public entry point — call from the network std::thread. Blocks until
@@ -74,30 +86,6 @@ pub async fn run(
         .await
         .context("QUIC connect")?;
     tracing::info!(rtt = ?conn.rtt(), "connected");
-
-    // Datagram receiver for SUBFRAME (GTK)
-    let dgram_frames_tx = frames_tx.clone();
-    let dgram_conn = conn.clone();
-    tokio::spawn(async move {
-        loop {
-            match dgram_conn.read_datagram().await {
-                Ok(data) => {
-                    let mut raw = &data[..];
-                    match Message::decode(&mut raw) {
-                        Ok(Some(Message::Subframe { x, y, w, h, stride, pixels, .. })) => {
-                            let _ = dgram_frames_tx.send(GtkFrame::Sub {
-                                x: x as u32, y: y as u32,
-                                w: w as u32, h: h as u32,
-                                stride, pixels,
-                            });
-                        }
-                        _ => {} // ignore other types or corrupted datagrams
-                    }
-                }
-                Err(_) => break, // connection closed or datagrams disabled
-            }
-        }
-    });
 
     let (mut send, mut recv) = conn.open_bi().await.context("open ctrl bi stream")?;
 
@@ -145,6 +133,47 @@ pub async fn run(
         }
     });
 
+    let frames_ctrl_tx = frames_tx.clone();
+    let ctrl_reader = tokio::spawn(async move {
+        let mut inbuf: Vec<u8> = Vec::with_capacity(4096);
+        let mut chunk = vec![0u8; 8192];
+        while let Ok(Some(msg)) = read_next(&mut recv, &mut inbuf, &mut chunk).await {
+            match msg {
+                Message::LoadState { state } => {
+                    let _ = frames_ctrl_tx.send(GtkFrame::Load(state));
+                }
+                Message::Title { title } => {
+                    let _ = frames_ctrl_tx.send(GtkFrame::Title(title));
+                }
+                Message::UrlChanged { url } => {
+                    let _ = frames_ctrl_tx.send(GtkFrame::UrlChanged(url));
+                }
+                Message::CursorState { shape, .. } => {
+                    let _ = frames_ctrl_tx.send(GtkFrame::Cursor(shape));
+                }
+                Message::TabCreated { tab_id, title, url } => {
+                    let _ = frames_ctrl_tx.send(GtkFrame::TabCreated { tab_id, title, url });
+                }
+                Message::TabClosed { tab_id } => {
+                    let _ = frames_ctrl_tx.send(GtkFrame::TabClosed { tab_id });
+                }
+                Message::TabActivated { tab_id } => {
+                    let _ = frames_ctrl_tx.send(GtkFrame::TabActivated { tab_id });
+                }
+                Message::TabTitle { tab_id, title } => {
+                    let _ = frames_ctrl_tx.send(GtkFrame::TabTitle { tab_id, title });
+                }
+                Message::TabUrl { tab_id, url } => {
+                    let _ = frames_ctrl_tx.send(GtkFrame::TabUrl { tab_id, url });
+                }
+                Message::AuthSuccess { node_id } => {
+                    let _ = frames_ctrl_tx.send(GtkFrame::AuthSuccess { node_id });
+                }
+                _ => {}
+            }
+        }
+    });
+
     let conn_for_input = conn.clone();
     let ctrl_writer = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
@@ -179,6 +208,30 @@ pub async fn run(
                     m.encode(&mut b);
                     if send.write_all(&b).await.is_err() { break; }
                 }
+                OutMsg::CreateTab { tab_id, url } => {
+                    let m = Message::CreateTab { tab_id, url };
+                    let mut b = Vec::with_capacity(64);
+                    m.encode(&mut b);
+                    if send.write_all(&b).await.is_err() { break; }
+                }
+                OutMsg::CloseTab { tab_id } => {
+                    let m = Message::CloseTab { tab_id };
+                    let mut b = Vec::with_capacity(16);
+                    m.encode(&mut b);
+                    if send.write_all(&b).await.is_err() { break; }
+                }
+                OutMsg::SwitchTab { tab_id } => {
+                    let m = Message::SwitchTab { tab_id };
+                    let mut b = Vec::with_capacity(16);
+                    m.encode(&mut b);
+                    if send.write_all(&b).await.is_err() { break; }
+                }
+                OutMsg::ClearData { clear_cookies, clear_cache, clear_storage } => {
+                    let m = Message::ClearData { clear_cookies, clear_cache, clear_storage };
+                    let mut b = Vec::with_capacity(16);
+                    m.encode(&mut b);
+                    if send.write_all(&b).await.is_err() { break; }
+                }
                 other => {
                     use std::time::{SystemTime, UNIX_EPOCH};
                     let ts_us = SystemTime::now().duration_since(UNIX_EPOCH)
@@ -200,7 +253,11 @@ pub async fn run(
                         | OutMsg::Resize { .. }
                         | OutMsg::SetZoom { .. }
                         | OutMsg::NavAction { .. }
-                        | OutMsg::Stop => unreachable!(),
+                        | OutMsg::Stop
+                        | OutMsg::CreateTab { .. }
+                        | OutMsg::CloseTab { .. }
+                        | OutMsg::SwitchTab { .. }
+                        | OutMsg::ClearData { .. } => unreachable!(),
                     };
                     let mut b = Vec::with_capacity(48);
                     m.encode(&mut b);
@@ -232,12 +289,14 @@ pub async fn run(
                 while let Ok(Some(msg)) = Message::decode(&mut cur) {
                     match msg {
                         Message::RawFrame { width, height, stride, pixels, .. } => {
+                            tracing::debug!(width, height, stride, bytes = pixels.len(), "Decoded RawFrame on video stream");
                             let _ = frames_stream_tx.send(GtkFrame::Full {
                                 width: width as u32, height: height as u32,
                                 stride, pixels,
                             });
                         }
                         Message::Subframe { x, y, w, h, stride, pixels, .. } => {
+                            tracing::debug!(x, y, w, h, stride, bytes = pixels.len(), "Decoded Subframe on video stream");
                             let _ = frames_stream_tx.send(GtkFrame::Sub {
                                 x: x as u32, y: y as u32,
                                 w: w as u32, h: h as u32,
@@ -306,6 +365,11 @@ pub async fn run(
                     Message::VideoChunk { pts_us, duration_us, is_keyframe, codec, layer_id, data } => {
                         let _ = frames_dgram_tx.send(GtkFrame::VideoChunk { pts_us, duration_us, is_keyframe, codec, layer_id, data });
                     }
+                    Message::TileRef { x, y, w, h, hash, .. } => {
+                        let _ = frames_dgram_tx.send(GtkFrame::TileRef {
+                            x: x as u32, y: y as u32, w: w as u32, h: h as u32, hash,
+                        });
+                    }
                     Message::Subframe { x, y, w, h, stride, pixels, .. } => {
                         let _ = frames_dgram_tx.send(GtkFrame::Sub {
                             x: x as u32, y: y as u32,
@@ -319,7 +383,7 @@ pub async fn run(
         }
     });
 
-    let _ = tokio::join!(ctrl_writer, video, input_writer, dgram_task);
+    let _ = tokio::join!(ctrl_writer, ctrl_reader, video, input_writer, dgram_task);
     conn.close(0u32.into(), b"bye");
     endpoint.wait_idle().await;
     Ok(())

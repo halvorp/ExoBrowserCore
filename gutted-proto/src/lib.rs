@@ -74,6 +74,24 @@ pub mod tag {
     pub const LAYER_UPDATE:   u32 = 0x61;
     pub const LAYER_REMOVE:   u32 = 0x62;
     pub const SCENE_COMMIT:   u32 = 0x63;
+
+    // Tabs & session management
+    pub const CREATE_TAB:     u32 = 0x70;
+    pub const CLOSE_TAB:      u32 = 0x71;
+    pub const SWITCH_TAB:     u32 = 0x72;
+    pub const TAB_CREATED:    u32 = 0x73;
+    pub const TAB_CLOSED:     u32 = 0x74;
+    pub const TAB_ACTIVATED:  u32 = 0x75;
+    pub const TAB_TITLE:      u32 = 0x76;
+    pub const TAB_URL:        u32 = 0x77;
+
+    // Cookie & Data management
+    pub const CLEAR_DATA:     u32 = 0x80;
+
+    // Remote Auth
+    pub const AUTH_CHALLENGE: u32 = 0x90;
+    pub const AUTH_RESPONSE:  u32 = 0x91;
+    pub const AUTH_SUCCESS:   u32 = 0x92;
 }
 
 pub mod audio_codec {
@@ -389,6 +407,61 @@ pub enum Message {
         layer_id: u32,
         data: Vec<u8>,
     },
+    /// Client → host: open a new tab
+    CreateTab {
+        tab_id: u32,
+        url: String,
+    },
+    /// Client → host: close an existing tab
+    CloseTab {
+        tab_id: u32,
+    },
+    /// Client → host: switch focus to a tab
+    SwitchTab {
+        tab_id: u32,
+    },
+    /// Host → client: tab created confirmation
+    TabCreated {
+        tab_id: u32,
+        title: String,
+        url: String,
+    },
+    /// Host → client: tab closed
+    TabClosed {
+        tab_id: u32,
+    },
+    /// Host → client: active tab changed
+    TabActivated {
+        tab_id: u32,
+    },
+    /// Host → client: tab title changed
+    TabTitle {
+        tab_id: u32,
+        title: String,
+    },
+    /// Host → client: tab URL changed
+    TabUrl {
+        tab_id: u32,
+        url: String,
+    },
+    /// Client → host: clear cookies/cache/storage
+    ClearData {
+        clear_cookies: bool,
+        clear_cache: bool,
+        clear_storage: bool,
+    },
+    /// Host → client: cryptographic auth challenge nonce
+    AuthChallenge {
+        nonce: [u8; 32],
+    },
+    /// Client → host: auth response token hash / HMAC
+    AuthResponse {
+        token_hash: [u8; 32],
+    },
+    /// Host → client: auth successful confirmation with remote node info
+    AuthSuccess {
+        node_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -542,6 +615,18 @@ impl Message {
             Message::LayerUpdate { .. }  => tag::LAYER_UPDATE,
             Message::LayerRemove { .. }  => tag::LAYER_REMOVE,
             Message::SceneCommit { .. }  => tag::SCENE_COMMIT,
+            Message::CreateTab { .. }    => tag::CREATE_TAB,
+            Message::CloseTab { .. }     => tag::CLOSE_TAB,
+            Message::SwitchTab { .. }    => tag::SWITCH_TAB,
+            Message::TabCreated { .. }   => tag::TAB_CREATED,
+            Message::TabClosed { .. }    => tag::TAB_CLOSED,
+            Message::TabActivated { .. } => tag::TAB_ACTIVATED,
+            Message::TabTitle { .. }     => tag::TAB_TITLE,
+            Message::TabUrl { .. }       => tag::TAB_URL,
+            Message::ClearData { .. }    => tag::CLEAR_DATA,
+            Message::AuthChallenge { .. } => tag::AUTH_CHALLENGE,
+            Message::AuthResponse { .. } => tag::AUTH_RESPONSE,
+            Message::AuthSuccess { .. }  => tag::AUTH_SUCCESS,
         }
     }
 
@@ -697,6 +782,49 @@ impl Message {
                 write_u32(out, *layer_id);
                 write_varint(out, data.len() as u32);
                 out.extend_from_slice(data);
+            }
+            Message::CreateTab { tab_id, url } => {
+                write_u32(out, *tab_id);
+                write_str(out, url);
+            }
+            Message::CloseTab { tab_id } => {
+                write_u32(out, *tab_id);
+            }
+            Message::SwitchTab { tab_id } => {
+                write_u32(out, *tab_id);
+            }
+            Message::TabCreated { tab_id, title, url } => {
+                write_u32(out, *tab_id);
+                write_str(out, title);
+                write_str(out, url);
+            }
+            Message::TabClosed { tab_id } => {
+                write_u32(out, *tab_id);
+            }
+            Message::TabActivated { tab_id } => {
+                write_u32(out, *tab_id);
+            }
+            Message::TabTitle { tab_id, title } => {
+                write_u32(out, *tab_id);
+                write_str(out, title);
+            }
+            Message::TabUrl { tab_id, url } => {
+                write_u32(out, *tab_id);
+                write_str(out, url);
+            }
+            Message::ClearData { clear_cookies, clear_cache, clear_storage } => {
+                write_u8_(out, if *clear_cookies { 1 } else { 0 });
+                write_u8_(out, if *clear_cache { 1 } else { 0 });
+                write_u8_(out, if *clear_storage { 1 } else { 0 });
+            }
+            Message::AuthChallenge { nonce } => {
+                out.extend_from_slice(nonce);
+            }
+            Message::AuthResponse { token_hash } => {
+                out.extend_from_slice(token_hash);
+            }
+            Message::AuthSuccess { node_id } => {
+                write_str(out, node_id);
             }
         }
     }
@@ -899,6 +1027,67 @@ impl Message {
                 *p = &p[len..];
                 Message::VideoChunk { pts_us, duration_us, is_keyframe, codec, layer_id, data }
             }
+            tag::CREATE_TAB => {
+                let tab_id = read_u32(p)?;
+                let url = read_str(p)?;
+                Message::CreateTab { tab_id, url }
+            }
+            tag::CLOSE_TAB => {
+                let tab_id = read_u32(p)?;
+                Message::CloseTab { tab_id }
+            }
+            tag::SWITCH_TAB => {
+                let tab_id = read_u32(p)?;
+                Message::SwitchTab { tab_id }
+            }
+            tag::TAB_CREATED => {
+                let tab_id = read_u32(p)?;
+                let title = read_str(p)?;
+                let url = read_str(p)?;
+                Message::TabCreated { tab_id, title, url }
+            }
+            tag::TAB_CLOSED => {
+                let tab_id = read_u32(p)?;
+                Message::TabClosed { tab_id }
+            }
+            tag::TAB_ACTIVATED => {
+                let tab_id = read_u32(p)?;
+                Message::TabActivated { tab_id }
+            }
+            tag::TAB_TITLE => {
+                let tab_id = read_u32(p)?;
+                let title = read_str(p)?;
+                Message::TabTitle { tab_id, title }
+            }
+            tag::TAB_URL => {
+                let tab_id = read_u32(p)?;
+                let url = read_str(p)?;
+                Message::TabUrl { tab_id, url }
+            }
+            tag::CLEAR_DATA => {
+                let clear_cookies = read_u8_(p)? != 0;
+                let clear_cache = read_u8_(p)? != 0;
+                let clear_storage = read_u8_(p)? != 0;
+                Message::ClearData { clear_cookies, clear_cache, clear_storage }
+            }
+            tag::AUTH_CHALLENGE => {
+                let bytes = p.get(..32).ok_or(Error::UnexpectedEof)?;
+                let mut nonce = [0u8; 32];
+                nonce.copy_from_slice(bytes);
+                *p = &p[32..];
+                Message::AuthChallenge { nonce }
+            }
+            tag::AUTH_RESPONSE => {
+                let bytes = p.get(..32).ok_or(Error::UnexpectedEof)?;
+                let mut token_hash = [0u8; 32];
+                token_hash.copy_from_slice(bytes);
+                *p = &p[32..];
+                Message::AuthResponse { token_hash }
+            }
+            tag::AUTH_SUCCESS => {
+                let node_id = read_str(p)?;
+                Message::AuthSuccess { node_id }
+            }
             other => return Err(Error::UnknownTag(other)),
         };
         if !p.is_empty() { return Err(Error::TrailingBytes); }
@@ -1041,8 +1230,9 @@ fn read_payload(p: &mut &[u8], compression: u8, expected_len: usize) -> Result<V
         1 => zstd_decode(&wire, expected_len)?,
         #[cfg(feature = "std")]
         2 => {
-            let filtered = zstd_decode(&wire, expected_len)?;
-            spatial_unfilter_sub(&filtered)
+            let mut out = zstd_decode(&wire, expected_len)?;
+            spatial_unfilter_sub_in_place(&mut out);
+            out
         }
         _ => return Err(Error::InvalidValue),
     };
@@ -1055,35 +1245,35 @@ fn spatial_filter_sub(pixels: &[u8]) -> Vec<u8> {
     let n = pixels.len() / 4;
     if n == 0 { return out; }
     out[0..4].copy_from_slice(&pixels[0..4]);
-    for i in 1..n {
-        let prev = &pixels[(i - 1) * 4 .. (i - 1) * 4 + 4];
-        let curr = &pixels[i * 4 .. i * 4 + 4];
-        out[i * 4]     = curr[0].wrapping_sub(prev[0]);
-        out[i * 4 + 1] = curr[1].wrapping_sub(prev[1]);
-        out[i * 4 + 2] = curr[2].wrapping_sub(prev[2]);
-        out[i * 4 + 3] = curr[3].wrapping_sub(prev[3]);
+    let mut prev = &pixels[0..4];
+    for (curr, dst) in pixels[4..].chunks_exact(4).zip(out[4..].chunks_exact_mut(4)) {
+        dst[0] = curr[0].wrapping_sub(prev[0]);
+        dst[1] = curr[1].wrapping_sub(prev[1]);
+        dst[2] = curr[2].wrapping_sub(prev[2]);
+        dst[3] = curr[3].wrapping_sub(prev[3]);
+        prev = curr;
     }
     out
 }
 
-fn spatial_unfilter_sub(filtered: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; filtered.len()];
-    let n = filtered.len() / 4;
-    if n == 0 { return out; }
-    out[0..4].copy_from_slice(&filtered[0..4]);
-    for i in 1..n {
-        let prev0 = out[(i - 1) * 4];
-        let prev1 = out[(i - 1) * 4 + 1];
-        let prev2 = out[(i - 1) * 4 + 2];
-        let prev3 = out[(i - 1) * 4 + 3];
-
-        let curr = &filtered[i * 4 .. i * 4 + 4];
-        out[i * 4]     = curr[0].wrapping_add(prev0);
-        out[i * 4 + 1] = curr[1].wrapping_add(prev1);
-        out[i * 4 + 2] = curr[2].wrapping_add(prev2);
-        out[i * 4 + 3] = curr[3].wrapping_add(prev3);
+#[cfg(feature = "std")]
+fn spatial_unfilter_sub_in_place(buf: &mut [u8]) {
+    let n = buf.len() / 4;
+    if n <= 1 { return; }
+    let mut prev0 = buf[0];
+    let mut prev1 = buf[1];
+    let mut prev2 = buf[2];
+    let mut prev3 = buf[3];
+    for chunk in buf[4..].chunks_exact_mut(4) {
+        prev0 = chunk[0].wrapping_add(prev0);
+        prev1 = chunk[1].wrapping_add(prev1);
+        prev2 = chunk[2].wrapping_add(prev2);
+        prev3 = chunk[3].wrapping_add(prev3);
+        chunk[0] = prev0;
+        chunk[1] = prev1;
+        chunk[2] = prev2;
+        chunk[3] = prev3;
     }
-    out
 }
 
 // ─── zstd helpers (std-only) ─────────────────────────────────────────────
@@ -1104,7 +1294,7 @@ fn zstd_encode(bytes: &[u8]) -> Vec<u8> {
                 return res;
             }
         }
-        zstd::encode_all(bytes, 1).expect("zstd encode never fails on valid input")
+        zstd::encode_all(bytes, 1).unwrap_or_else(|_| bytes.to_vec())
     })
 }
 
@@ -1522,5 +1712,21 @@ mod tests {
                 DrawCommand::ClearClip,
             ],
         });
+    }
+
+    #[test]
+    fn tabs_clear_data_and_auth_roundtrip() {
+        roundtrip(Message::CreateTab { tab_id: 1, url: "https://example.com".into() });
+        roundtrip(Message::CloseTab { tab_id: 2 });
+        roundtrip(Message::SwitchTab { tab_id: 3 });
+        roundtrip(Message::TabCreated { tab_id: 1, title: "Example Domain".into(), url: "https://example.com".into() });
+        roundtrip(Message::TabClosed { tab_id: 2 });
+        roundtrip(Message::TabActivated { tab_id: 3 });
+        roundtrip(Message::TabTitle { tab_id: 1, title: "New Title".into() });
+        roundtrip(Message::TabUrl { tab_id: 1, url: "https://youtube.com".into() });
+        roundtrip(Message::ClearData { clear_cookies: true, clear_cache: true, clear_storage: false });
+        roundtrip(Message::AuthChallenge { nonce: [0x42; 32] });
+        roundtrip(Message::AuthResponse { token_hash: [0x99; 32] });
+        roundtrip(Message::AuthSuccess { node_id: "node_ed25519_abcd1234".into() });
     }
 }

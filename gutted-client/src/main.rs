@@ -252,6 +252,12 @@ async fn net_main(
                                 w: w as u32, h: h as u32,
                                 stride, pixels,
                             }));
+                        } else if let Message::TileData { hash, pixels, .. } = msg {
+                            let _ = frames_tx.send(RenderEvent::TileData { hash, pixels });
+                        } else if let Message::TileRef { x, y, w, h, hash, .. } = msg {
+                            let _ = frames_tx.send(RenderEvent::TileRef {
+                                x: x as u32, y: y as u32, w: w as u32, h: h as u32, hash,
+                            });
                         } else if let Message::CursorState { shape, .. } = msg {
                             tracing::info!(?shape, "cursor shape from server");
                             let _ = frames_tx.send(RenderEvent::CursorShape(shape as u8));
@@ -321,6 +327,13 @@ async fn net_main(
                     Ok(data) => {
                         let mut raw = &data[..];
                         match Message::decode(&mut raw) {
+                            Ok(Some(Message::TileRef { x, y, w, h, hash, .. })) => {
+                                let _ = frames_tx.send(RenderEvent::TileRef {
+                                    x: x as u32, y: y as u32,
+                                    w: w as u32, h: h as u32,
+                                    hash,
+                                });
+                            }
                             Ok(Some(Message::Subframe { x, y, w, h, stride, pixels, .. })) => {
                                 let _ = frames_tx.send(RenderEvent::Subframe(
                                     render::GfxSubframe {

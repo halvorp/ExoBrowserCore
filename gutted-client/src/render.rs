@@ -227,6 +227,7 @@ struct Gpu {
     sampler: wgpu::Sampler,
     cursor_uniform: wgpu::Buffer,
     cursor_data:    CursorUniform,
+    tile_cache:     std::collections::HashMap<u64, Vec<u8>>,
     _font_tex:      wgpu::Texture,
     _font_view:     wgpu::TextureView,
 }
@@ -404,6 +405,7 @@ impl Gpu {
             surface, device, queue, config, pipeline, quad_vb,
             tex: None, tex_size: (0, 0), bind_group: None, bind_layout, sampler,
             cursor_uniform, cursor_data,
+            tile_cache: std::collections::HashMap::new(),
             _font_tex: font_tex, _font_view: font_view,
         })
     }
@@ -650,6 +652,8 @@ impl Gpu {
 pub enum RenderEvent {
     Frame(GfxFrame),
     Subframe(GfxSubframe),
+    TileData { hash: u64, pixels: Vec<u8> },
+    TileRef  { x: u32, y: u32, w: u32, h: u32, hash: u64 },
     /// Server-hinted cursor shape (0 = default, 1 = pointer, 2 = text).
     CursorShape(u8),
     /// Server-side load state: 0 started, 1 redirected, 2 committed, 3 finished.
@@ -816,6 +820,22 @@ impl ApplicationHandler<RenderEvent> for App {
                     }
                     self.frames_seen += 1;
                     if let Some(w) = self.window.as_ref() { w.request_redraw(); }
+                }
+            }
+            RenderEvent::TileData { hash, pixels } => {
+                if let Some(g) = self.gpu.as_mut() {
+                    g.tile_cache.insert(hash, pixels);
+                }
+            }
+            RenderEvent::TileRef { x, y, w, h, hash } => {
+                if let Some(g) = self.gpu.as_mut() {
+                    if let Some(pixels) = g.tile_cache.get(&hash) {
+                        g.upload_sub(&GfxSubframe {
+                            x, y, w, h, stride: w * 4, pixels: pixels.clone(),
+                        });
+                        self.frames_seen += 1;
+                        if let Some(w) = self.window.as_ref() { w.request_redraw(); }
+                    }
                 }
             }
             RenderEvent::Subframe(s) => {
@@ -1158,6 +1178,22 @@ impl ApplicationHandler<RenderEvent> for App {
                             self.frames_seen += 1;
                         }
                         if let Some(w) = self.window.as_ref() { w.request_redraw(); }
+                    }
+                    RenderEvent::TileData { hash, pixels } => {
+                        if let Some(g) = self.gpu.as_mut() {
+                            g.tile_cache.insert(hash, pixels);
+                        }
+                    }
+                    RenderEvent::TileRef { x, y, w, h, hash } => {
+                        if let Some(g) = self.gpu.as_mut() {
+                            if let Some(pixels) = g.tile_cache.get(&hash) {
+                                g.upload_sub(&GfxSubframe {
+                                    x, y, w, h, stride: w * 4, pixels: pixels.clone(),
+                                });
+                                self.frames_seen += 1;
+                                if let Some(w) = self.window.as_ref() { w.request_redraw(); }
+                            }
+                        }
                     }
                     RenderEvent::Subframe(s) => {
                         if let Some(g) = self.gpu.as_mut() {
