@@ -20,22 +20,22 @@ static const unsigned STOP_AFTER = 60;
 // Set by on_ready; picked up by on_frame (STOP_AFTER) and on_sigint.
 static gutted_wpe_handle g_h = NULL;
 
-static void on_frame(void *ud, const uint8_t *px, int32_t w, int32_t h,
+static void on_frame(void *ud, uint32_t tab_id, const uint8_t *px, int32_t w, int32_t h,
                      int32_t stride, uint32_t fmt)
 {
-    (void)ud; (void)px;
+    (void)ud; (void)tab_id; (void)px;
     g_count++;
-    printf("[frame %4u] %dx%d stride=%d fmt=0x%08x bytes=%d\n",
-           g_count, w, h, stride, fmt, stride * h);
+    printf("[frame %4u tab %u] %dx%d stride=%d fmt=0x%08x bytes=%d\n",
+           g_count, tab_id, w, h, stride, fmt, stride * h);
     if (g_count >= STOP_AFTER && g_h) gutted_wpe_stop(g_h);
 }
 
-static void on_load(void *ud, int32_t s)
+static void on_load(void *ud, uint32_t tab_id, int32_t s)
 {
-    (void)ud;
+    (void)ud; (void)tab_id;
     static const char *names[] = { "started", "redirected", "committed", "finished" };
     if (s >= 0 && (size_t)s < sizeof(names)/sizeof(*names))
-        printf("[load ] %s\n", names[s]);
+        printf("[load tab %u] %s\n", tab_id, names[s]);
 }
 
 static void on_ready(void *ud, gutted_wpe_handle h)

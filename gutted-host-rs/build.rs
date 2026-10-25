@@ -30,6 +30,7 @@ fn main() {
     //    which lands BEFORE the pkg-config -l flags we emit next — correct order.
     let mut build = cc::Build::new();
     build.file("../host/gutted_wpe.c");
+    build.opt_level(3);
     for inc in &include_paths {
         build.include(inc);
     }

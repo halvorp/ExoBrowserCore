@@ -141,19 +141,20 @@ pub struct WpeRunner {
     stopped: AtomicBool,
 }
 
+pub struct WpeChannels {
+    pub frames:  mpsc::UnboundedReceiver<Frame>,
+    pub loads:   mpsc::UnboundedReceiver<(u32, LoadState)>,
+    pub cursors: mpsc::UnboundedReceiver<(u32, u8)>,
+    pub titles:  mpsc::UnboundedReceiver<(u32, String)>,
+    pub urls:    mpsc::UnboundedReceiver<(u32, String)>,
+}
+
 impl WpeRunner {
     pub fn start(
         initial_url: &str,
         viewport_w: i32,
         viewport_h: i32,
-    ) -> (
-        Self,
-        mpsc::UnboundedReceiver<Frame>,
-        mpsc::UnboundedReceiver<(u32, LoadState)>,
-        mpsc::UnboundedReceiver<(u32, u8)>,
-        mpsc::UnboundedReceiver<(u32, String)>,
-        mpsc::UnboundedReceiver<(u32, String)>,
-    ) {
+    ) -> (Self, WpeChannels) {
         let (ftx, frx) = mpsc::unbounded_channel();
         let (ltx, lrx) = mpsc::unbounded_channel();
         let (ctx, crx) = mpsc::unbounded_channel();
@@ -196,7 +197,13 @@ impl WpeRunner {
                 handle,
                 stopped: AtomicBool::new(false),
             },
-            frx, lrx, crx, trx, urx,
+            WpeChannels {
+                frames: frx,
+                loads: lrx,
+                cursors: crx,
+                titles: trx,
+                urls: urx,
+            },
         )
     }
 

@@ -14,44 +14,85 @@ mod wpe;
 mod web;
 
 use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
 use gutted_proto::{caps, Message, PROTO_VERSION};
 use quinn::{Endpoint, ServerConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::{net::SocketAddr, sync::Arc};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 use tracing::{error, info, warn};
 
+#[derive(Clone)]
+pub struct BusItem {
+    pub msg: Arc<Message>,
+    pub wire_quic: Bytes,
+}
+
 /// Fan-out for WPE frames.
 ///
-/// `full` = most recent whole-frame `RawFrame` — used as the *initial*
-/// state we hand a fresh subscriber, so they always have a base to blit
-/// subsequent Subframes onto. It's updated ONLY when a `RawFrame`
-/// publishes (Subframes/CursorState leave it alone).
-///
-/// `tx` broadcasts the full ordered stream of published messages
-/// (RawFrame + Subframe + CursorState). Subscribers subscribe first,
-/// snapshot `full` second, then process the stream — this ordering
-/// avoids missing a message between snapshot and subscribe.
+/// Pre-encodes each published message once into `wire_quic` so multiple QUIC
+/// subscribers write directly without re-running spatial filtering or ZSTD
+/// compression. `snapshot()` always reads the active tab's latest full
+/// framebuffer from `last_frames`.
 #[derive(Clone)]
-struct FrameBus {
-    full: Arc<AsyncMutex<Option<Arc<Message>>>>,
-    tx:   broadcast::Sender<Arc<Message>>,
+pub struct FrameBus {
+    last_frames: Arc<StdMutex<HashMap<u32, wpe::Frame>>>,
+    active_tab_id: Arc<AtomicU32>,
+    tx: broadcast::Sender<BusItem>,
 }
+
 impl FrameBus {
-    fn new() -> Self {
-        let (tx, _) = broadcast::channel(16);
-        Self { full: Arc::new(AsyncMutex::new(None)), tx }
+    fn new(
+        last_frames: Arc<StdMutex<HashMap<u32, wpe::Frame>>>,
+        active_tab_id: Arc<AtomicU32>,
+    ) -> Self {
+        let (tx, _) = broadcast::channel(256);
+        Self { last_frames, active_tab_id, tx }
     }
-    async fn publish(&self, msg: Arc<Message>) {
-        if matches!(&*msg, Message::RawFrame { .. }) {
-            *self.full.lock().await = Some(msg.clone());
+
+    fn encode_item(msg: Arc<Message>) -> BusItem {
+        let cap = match &*msg {
+            Message::RawFrame { pixels, .. } | Message::Subframe { pixels, .. } => 32 + pixels.len() / 2,
+            _ => 64,
+        };
+        let mut buf = Vec::with_capacity(cap);
+        msg.encode(&mut buf);
+        BusItem { msg, wire_quic: Bytes::from(buf) }
+    }
+
+    fn publish(&self, msg: Arc<Message>) {
+        if self.tx.receiver_count() == 0 {
+            return;
         }
-        let _ = self.tx.send(msg);
+        let item = Self::encode_item(msg);
+        let _ = self.tx.send(item);
     }
-    fn subscribe(&self) -> broadcast::Receiver<Arc<Message>> { self.tx.subscribe() }
-    async fn snapshot(&self) -> Option<Arc<Message>> { self.full.lock().await.clone() }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<BusItem> {
+        self.tx.subscribe()
+    }
+
+    pub fn snapshot(&self) -> Option<BusItem> {
+        let active = self.active_tab_id.load(Ordering::Relaxed);
+        let f = self.last_frames.lock().ok()?.get(&active)?.clone();
+        let ts_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        let msg = Arc::new(Message::RawFrame {
+            ts_us,
+            width: f.width as u16,
+            height: f.height as u16,
+            stride: f.stride as u32,
+            format: f.format,
+            compression: gutted_proto::compression::ZSTD,
+            pixels: f.pixels,
+        });
+        Some(Self::encode_item(msg))
+    }
 }
 
 const ALPN: &[u8] = b"gbrowser/1";
@@ -85,9 +126,8 @@ async fn main() -> Result<()> {
     let endpoint = Endpoint::server(server_cfg, addr).context("bind quic endpoint")?;
     info!(listen = %addr, "gutted-host listening");
 
-    let bus = FrameBus::new();
     let initial_url = std::env::var("GBROWSER_URL").unwrap_or_else(|_| "https://example.com".into());
-    let host_state = HostState::new(bus.clone(), &initial_url).await;
+    let host_state = HostState::new(&initial_url).await;
 
     // Spawn built-in Web Client Server (HTTP + WebSocket)
     let http_addr: SocketAddr = std::env::var("GBROWSER_HTTP_LISTEN")
@@ -98,6 +138,23 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         if let Err(e) = web::run_web_server(http_addr, host_state_web).await {
             error!(error = %e, "web server failed");
+        }
+    });
+
+    // Spawn C-free Pure-Rust Framed TCP listener on the same port (TCP :4433 alongside UDP :4433 QUIC)
+    let tcp_listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .context("bind tcp listener")?;
+    info!(listen = %addr, "gutted-host TCP stream listener ready (Redox/relibc & C-free clients)");
+    let host_state_tcp = host_state.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, peer)) = tcp_listener.accept().await {
+            let hs = host_state_tcp.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_tcp_connection(stream, peer, hs).await {
+                    warn!(%peer, error = %e, "tcp connection ended with error");
+                }
+            });
         }
     });
 
@@ -120,7 +177,6 @@ async fn main() -> Result<()> {
 struct TabEntry {
     url: String,
     title: String,
-    last_frame: Option<wpe::Frame>,
 }
 
 #[derive(Clone)]
@@ -128,14 +184,16 @@ struct HostState {
     bus: FrameBus,
     runner: Arc<wpe::WpeRunner>,
     tabs: Arc<AsyncMutex<HashMap<u32, TabEntry>>>,
+    last_frames: Arc<StdMutex<HashMap<u32, wpe::Frame>>>,
     active_tab_id: Arc<AtomicU32>,
     viewport_w: Arc<AtomicU32>,
     viewport_h: Arc<AtomicU32>,
 }
 
 impl HostState {
-    async fn new(bus: FrameBus, initial_url: &str) -> Self {
-        let (runner, mut frames, mut loads, mut cursors, mut titles, mut urls) =
+    async fn new(initial_url: &str) -> Self {
+        init_pulse_null_sink();
+        let (runner, wpe::WpeChannels { mut frames, mut loads, mut cursors, mut titles, mut urls }) =
             wpe::WpeRunner::start(initial_url, 1280, 648);
         let runner = Arc::new(runner);
 
@@ -150,20 +208,23 @@ impl HostState {
             t.insert(1, TabEntry {
                 url: initial_url.to_string(),
                 title: "New Tab".to_string(),
-                last_frame: None,
             });
         }
 
+        let last_frames = Arc::new(StdMutex::new(HashMap::new()));
         let active_tab_id = Arc::new(AtomicU32::new(1));
         let viewport_w = Arc::new(AtomicU32::new(1280));
         let viewport_h = Arc::new(AtomicU32::new(648));
+        let bus = FrameBus::new(last_frames.clone(), active_tab_id.clone());
+        spawn_audio_capture(bus.clone());
 
         let bus_clone = bus.clone();
         let active_atomic = active_tab_id.clone();
         let tabs_ref = tabs.clone();
+        let last_frames_ref = last_frames.clone();
 
         tokio::spawn(async move {
-            let mut last_per_tab: HashMap<u32, wpe::Frame> = HashMap::new();
+            let mut force_full: HashSet<u32> = HashSet::new();
             loop {
                 tokio::select! {
                     Some(first_f) = frames.recv() => {
@@ -174,81 +235,91 @@ impl HostState {
                         }
 
                         for (this_tab_id, f) in batch {
-                            info!(tab_id = this_tab_id, w = f.width, h = f.height, "WPE frame received in Rust");
-                            {
-                                let mut t = tabs_ref.lock().await;
-                                if let Some(tab) = t.get_mut(&this_tab_id) {
-                                    tab.last_frame = Some(f.clone());
-                                }
-                            }
-
                             let active = active_atomic.load(Ordering::Relaxed);
                             if active == this_tab_id {
                                 let ts_us = SystemTime::now().duration_since(UNIX_EPOCH)
                                     .unwrap_or_default().as_micros() as u64;
-                                let last = last_per_tab.get(&this_tab_id);
-                                let same_geom = last.is_some_and(|l|
+                                let must_full = force_full.remove(&this_tab_id);
+                                let prev = last_frames_ref.lock().ok().and_then(|mut g| g.remove(&this_tab_id));
+                                let same_geom = !must_full && prev.as_ref().is_some_and(|l|
                                     l.width == f.width && l.height == f.height && l.stride == f.stride);
-                                let msg: Option<Arc<Message>> = if !same_geom {
-                                    Some(Arc::new(Message::RawFrame {
+
+                                if !same_geom {
+                                    let msg = Arc::new(Message::RawFrame {
                                         ts_us,
                                         width: f.width as u16, height: f.height as u16,
                                         stride: f.stride as u32, format: f.format,
-                                        compression: gutted_proto::compression::ZSTD_DELTA,
+                                        compression: gutted_proto::compression::ZSTD,
                                         pixels: f.pixels.clone(),
-                                    }))
+                                    });
+                                    if let Ok(mut g) = last_frames_ref.lock() {
+                                        g.insert(this_tab_id, f);
+                                    }
+                                    bus_clone.publish(msg);
                                 } else {
-                                    let prev = last.unwrap();
-                                    let regions = diff_regions(&prev.pixels, &f.pixels, f.width, f.height, f.stride);
-                                    if regions.is_empty() {
-                                        None
-                                    } else {
+                                    let prev_f = prev.unwrap();
+                                    let regions = diff_regions(&prev_f.pixels, &f.pixels, f.width, f.height, f.stride);
+                                    if !regions.is_empty() {
                                         let total_px: u64 = regions.iter().map(|(_, _, w, h)| (*w as u64) * (*h as u64)).sum();
                                         let full_px = (f.width as u64) * (f.height as u64);
-                                        if total_px * 20 >= full_px * 7 || regions.len() > 3 {
-                                            Some(Arc::new(Message::RawFrame {
+                                        if total_px * 10 >= full_px * 8 || regions.len() > 16 {
+                                            let msg = Arc::new(Message::RawFrame {
                                                 ts_us,
                                                 width: f.width as u16, height: f.height as u16,
                                                 stride: f.stride as u32, format: f.format,
-                                                compression: gutted_proto::compression::ZSTD_DELTA,
+                                                compression: gutted_proto::compression::ZSTD,
                                                 pixels: f.pixels.clone(),
-                                            }))
-                                        } else {
-                                            for (x, y, w, h) in &regions {
-                                                let sub = extract_subrect(&f.pixels, f.stride, *x, *y, *w, *h);
-                                                let m = Arc::new(Message::Subframe {
-                                                    ts_us, x: *x, y: *y, w: *w, h: *h,
-                                                    stride: (*w as u32) * 4, format: f.format,
-                                                    compression: gutted_proto::compression::ZSTD_DELTA,
-                                                    pixels: sub,
-                                                });
-                                                bus_clone.publish(m).await;
+                                            });
+                                            if let Ok(mut g) = last_frames_ref.lock() {
+                                                g.insert(this_tab_id, f);
                                             }
-                                            Some(Arc::new(Message::Heartbeat { ts_us: 0 }))
+                                            bus_clone.publish(msg);
+                                        } else {
+                                            let fmt = f.format;
+                                            let stride = f.stride;
+                                            let sub_msgs: Vec<Arc<Message>> = regions.iter().map(|&(x, y, w, h)| {
+                                                let sub = extract_subrect(&f.pixels, stride, x, y, w, h);
+                                                let area = (w as usize) * (h as usize);
+                                                let comp = if area >= 96_000 {
+                                                    gutted_proto::compression::LZ4_DELTA_Q2
+                                                } else if area >= 32_000 {
+                                                    gutted_proto::compression::ZSTD
+                                                } else {
+                                                    gutted_proto::compression::ZSTD_DELTA
+                                                };
+                                                Arc::new(Message::Subframe {
+                                                    ts_us, x, y, w, h,
+                                                    stride: (w as u32) * 4, format: fmt,
+                                                    compression: comp,
+                                                    pixels: sub,
+                                                })
+                                            }).collect();
+                                            if let Ok(mut g) = last_frames_ref.lock() {
+                                                g.insert(this_tab_id, f);
+                                            }
+                                            for m in sub_msgs {
+                                                bus_clone.publish(m);
+                                            }
                                         }
-                                    }
-                                };
-                                last_per_tab.insert(this_tab_id, f);
-                                if let Some(m) = msg {
-                                    if !matches!(&*m, Message::Heartbeat { .. }) {
-                                        bus_clone.publish(m).await;
+                                    } else if let Ok(mut g) = last_frames_ref.lock() {
+                                        g.insert(this_tab_id, f);
                                     }
                                 }
-                            } else {
-                                last_per_tab.insert(this_tab_id, f);
+                            } else if let Ok(mut g) = last_frames_ref.lock() {
+                                g.insert(this_tab_id, f);
                             }
                         }
                     }
                     Some((this_tab_id, s)) = loads.recv() => {
                         let state = match s {
-                            wpe::LoadState::Started    => { last_per_tab.remove(&this_tab_id); 0u8 },
+                            wpe::LoadState::Started    => { force_full.insert(this_tab_id); 0u8 },
                             wpe::LoadState::Redirected => 1u8,
-                            wpe::LoadState::Committed  => { last_per_tab.remove(&this_tab_id); 2u8 },
+                            wpe::LoadState::Committed  => { force_full.insert(this_tab_id); 2u8 },
                             wpe::LoadState::Finished   => 3u8,
                             wpe::LoadState::Unknown    => 255u8,
                         };
                         if active_atomic.load(Ordering::Relaxed) == this_tab_id {
-                            bus_clone.publish(Arc::new(Message::LoadState { state })).await;
+                            bus_clone.publish(Arc::new(Message::LoadState { state }));
                         }
                     }
                     Some((this_tab_id, title)) = titles.recv() => {
@@ -258,22 +329,22 @@ impl HostState {
                                 tab.title = title.clone();
                             }
                         }
-                        bus_clone.publish(Arc::new(Message::TabTitle { tab_id: this_tab_id, title: title.clone() })).await;
+                        bus_clone.publish(Arc::new(Message::TabTitle { tab_id: this_tab_id, title: title.clone() }));
                         if active_atomic.load(Ordering::Relaxed) == this_tab_id {
-                            bus_clone.publish(Arc::new(Message::Title { title })).await;
+                            bus_clone.publish(Arc::new(Message::Title { title }));
                         }
                     }
                     Some((this_tab_id, new_url)) = urls.recv() => {
-                        last_per_tab.remove(&this_tab_id);
+                        force_full.insert(this_tab_id);
                         {
                             let mut t = tabs_ref.lock().await;
                             if let Some(tab) = t.get_mut(&this_tab_id) {
                                 tab.url = new_url.clone();
                             }
                         }
-                        bus_clone.publish(Arc::new(Message::TabUrl { tab_id: this_tab_id, url: new_url.clone() })).await;
+                        bus_clone.publish(Arc::new(Message::TabUrl { tab_id: this_tab_id, url: new_url.clone() }));
                         if active_atomic.load(Ordering::Relaxed) == this_tab_id {
-                            bus_clone.publish(Arc::new(Message::UrlChanged { url: new_url })).await;
+                            bus_clone.publish(Arc::new(Message::UrlChanged { url: new_url }));
                         }
                     }
                     Some((this_tab_id, shape_id)) = cursors.recv() => {
@@ -284,7 +355,7 @@ impl HostState {
                                 2 => CursorShape::Text,
                                 _ => CursorShape::Default,
                             };
-                            bus_clone.publish(Arc::new(Message::CursorState { shape, hotspot_x: 0, hotspot_y: 0, image_ref: 0 })).await;
+                            bus_clone.publish(Arc::new(Message::CursorState { shape, hotspot_x: 0, hotspot_y: 0, image_ref: 0 }));
                         }
                     }
                     else => break,
@@ -296,6 +367,7 @@ impl HostState {
             bus,
             runner,
             tabs,
+            last_frames,
             active_tab_id,
             viewport_w,
             viewport_h,
@@ -308,7 +380,6 @@ impl HostState {
             tabs.insert(tab_id, TabEntry {
                 url: url.to_string(),
                 title: "New Tab".to_string(),
-                last_frame: None,
             });
         }
         self.runner.create_tab(tab_id, url);
@@ -321,20 +392,20 @@ impl HostState {
         self.active_tab_id.store(tab_id, Ordering::Relaxed);
         let tabs = self.tabs.lock().await;
         if let Some(tab) = tabs.get(&tab_id) {
-            if let Some(f) = &tab.last_frame {
+            if let Some(f) = self.last_frames.lock().ok().and_then(|g| g.get(&tab_id).cloned()) {
                 let ts_us = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
                 let msg = Arc::new(Message::RawFrame {
                     ts_us,
                     width: f.width as u16, height: f.height as u16,
                     stride: f.stride as u32, format: f.format,
-                    compression: gutted_proto::compression::ZSTD_DELTA,
-                    pixels: f.pixels.clone(),
+                    compression: gutted_proto::compression::ZSTD,
+                    pixels: f.pixels,
                 });
-                self.bus.publish(msg).await;
+                self.bus.publish(msg);
             }
-            self.bus.publish(Arc::new(Message::Title { title: tab.title.clone() })).await;
-            self.bus.publish(Arc::new(Message::UrlChanged { url: tab.url.clone() })).await;
-            self.bus.publish(Arc::new(Message::TabActivated { tab_id })).await;
+            self.bus.publish(Arc::new(Message::Title { title: tab.title.clone() }));
+            self.bus.publish(Arc::new(Message::UrlChanged { url: tab.url.clone() }));
+            self.bus.publish(Arc::new(Message::TabActivated { tab_id }));
         }
     }
 
@@ -342,6 +413,9 @@ impl HostState {
         {
             let mut tabs = self.tabs.lock().await;
             tabs.remove(&tab_id);
+        }
+        if let Ok(mut g) = self.last_frames.lock() {
+            g.remove(&tab_id);
         }
         self.runner.close_tab(tab_id);
     }
@@ -468,39 +542,43 @@ async fn handle_input_stream(mut recv: quinn::RecvStream, host_state: HostState)
     let mut last_pointer: (i32, i32) = (0, 0);
     info!("input uni-stream open");
     loop {
-        loop {
+        {
             let mut cur = inbuf.as_slice();
-            match Message::decode(&mut cur) {
-                Ok(Some(msg)) => {
-                    let consumed = inbuf.len() - cur.len();
-                    inbuf.drain(..consumed);
-                    n_events += 1;
-                    match msg {
-                        Message::InputPointer { x, y, modifiers, .. } => {
-                            last_pointer = (x, y);
-                            host_state.inject_pointer_motion(x, y, modifiers).await;
+            loop {
+                match Message::decode(&mut cur) {
+                    Ok(Some(msg)) => {
+                        n_events += 1;
+                        match msg {
+                            Message::InputPointer { x, y, modifiers, .. } => {
+                                last_pointer = (x, y);
+                                host_state.inject_pointer_motion(x, y, modifiers).await;
+                            }
+                            Message::InputButton { x, y, button, pressed, modifiers, .. } => {
+                                last_pointer = (x, y);
+                                host_state.inject_pointer_button(x, y, button, pressed, modifiers).await;
+                                info!(x, y, button, pressed, "button injected");
+                            }
+                            Message::InputKey { keycode, mods, down, .. } => {
+                                host_state.inject_key(keycode, mods, down).await;
+                                info!(keycode = format!("0x{keycode:x}"), down, "key injected");
+                            }
+                            Message::InputScroll { dx_units, dy_units, .. } => {
+                                let dx = dx_units as f64 * 40.0;
+                                let dy = dy_units as f64 * 40.0;
+                                let (px, py) = last_pointer;
+                                host_state.inject_axis(px, py, dx, dy, 0).await;
+                                info!(px, py, dx, dy, "axis injected");
+                            }
+                            other => warn!(?other, "unexpected input msg"),
                         }
-                        Message::InputButton { x, y, button, pressed, modifiers, .. } => {
-                            last_pointer = (x, y);
-                            host_state.inject_pointer_button(x, y, button, pressed, modifiers).await;
-                            info!(x, y, button, pressed, "button injected");
-                        }
-                        Message::InputKey { keycode, mods, down, .. } => {
-                            host_state.inject_key(keycode, mods, down).await;
-                            info!(keycode = format!("0x{keycode:x}"), down, "key injected");
-                        }
-                        Message::InputScroll { dx_units, dy_units, .. } => {
-                            let dx = dx_units as f64 * 40.0;
-                            let dy = dy_units as f64 * 40.0;
-                            let (px, py) = last_pointer;
-                            host_state.inject_axis(px, py, dx, dy, 0).await;
-                            info!(px, py, dx, dy, "axis injected");
-                        }
-                        other => warn!(?other, "unexpected input msg"),
                     }
+                    Ok(None) => break,
+                    Err(e) => return Err(anyhow!("input decode: {:?}", e)),
                 }
-                Ok(None) => break,
-                Err(e) => return Err(anyhow!("input decode: {:?}", e)),
+            }
+            let consumed = inbuf.len() - cur.len();
+            if consumed > 0 {
+                inbuf.drain(..consumed);
             }
         }
         match recv.read(&mut chunk).await {
@@ -553,6 +631,7 @@ async fn handle_ctrl_stream(
         cursor_track_id: 0, // no cursor track yet — Phase 2
         current_url: host_state.current_url().await,
     };
+    let _ = send.set_priority(20); // High priority for control & navigation messages
     let mut out = Vec::with_capacity(64);
     welcome.encode(&mut out);
     send.write_all(&out).await?;
@@ -567,28 +646,17 @@ async fn handle_ctrl_stream(
             Ok(s) => s,
             Err(e) => { warn!(error = %e, "open_uni video stream"); return; }
         };
-        let _ = vs.set_priority((-1i32).into());   // lower than default (0)
+        let _ = vs.set_priority(10);   // high priority for smooth video stream
         info!("video uni-stream open");
-
-        async fn write_frame(vs: &mut quinn::SendStream, msg: &Message) -> (Result<()>, usize) {
-            let mut buf = match msg {
-                Message::RawFrame { pixels, .. } => Vec::with_capacity(32 + pixels.len()),
-                Message::Subframe { pixels, .. } => Vec::with_capacity(32 + pixels.len()),
-                _ => Vec::with_capacity(64),
-            };
-            msg.encode(&mut buf);
-            let r = vs.write_all(&buf).await.map_err(|e| anyhow!(e));
-            (r, buf.len())
-        }
 
         // Initial state: send the last full RawFrame
         let mut published = 0u64;
         let mut cum_bytes: u64 = 0;
         let mut cum_full: u64 = 0;
         let mut cum_sub: u64 = 0;
-        if let Some(snap_m) = bus_for_video.snapshot().await {
-            let (res, snap_len) = write_frame(&mut vs, &snap_m).await;
-            if let Ok(()) = res {
+        if let Some(snap_item) = bus_for_video.snapshot() {
+            let snap_len = snap_item.wire_quic.len();
+            if vs.write_all(&snap_item.wire_quic).await.is_ok() {
                 published += 1;
                 cum_bytes += snap_len as u64; cum_full += snap_len as u64;
                 info!(bytes = snap_len, "initial FULL frame snapshot delivered to new subscriber");
@@ -598,15 +666,46 @@ async fn handle_ctrl_stream(
         loop {
             tokio::select! {
                 res = stream_rx.recv() => match res {
-                    Ok(m) => {
-                        let (res, n) = write_frame(&mut vs, &m).await;
-                        if let Err(e) = res {
+                    Ok(mut item) => {
+                        while let Ok(newer) = stream_rx.try_recv() {
+                            match (&*item.msg, &*newer.msg) {
+                                (Message::RawFrame { .. } | Message::Subframe { .. }, Message::RawFrame { .. }) => {
+                                    item = newer;
+                                }
+                                (
+                                    Message::Subframe { x: x1, y: y1, w: w1, h: h1, .. },
+                                    Message::Subframe { x: x2, y: y2, w: w2, h: h2, .. },
+                                ) if *x2 <= *x1
+                                    && *y2 <= *y1
+                                    && (*x2 as u32 + *w2 as u32) >= (*x1 as u32 + *w1 as u32)
+                                    && (*y2 as u32 + *h2 as u32) >= (*y1 as u32 + *h1 as u32) =>
+                                {
+                                    item = newer;
+                                }
+                                _ => {
+                                    let n = item.wire_quic.len();
+                                    if vs.write_all(&item.wire_quic).await.is_err() {
+                                        return;
+                                    }
+                                    published += 1;
+                                    cum_bytes += n as u64;
+                                    match &*item.msg {
+                                        Message::RawFrame { .. } => cum_full += n as u64,
+                                        Message::Subframe { .. } => cum_sub  += n as u64,
+                                        _ => {}
+                                    }
+                                    item = newer;
+                                }
+                            }
+                        }
+                        let n = item.wire_quic.len();
+                        if let Err(e) = vs.write_all(&item.wire_quic).await {
                             warn!(error = %e, "video write");
                             break;
                         }
                         published += 1;
                         cum_bytes += n as u64;
-                        match &*m {
+                        match &*item.msg {
                             Message::RawFrame { .. } => cum_full += n as u64,
                             Message::Subframe { .. } => cum_sub  += n as u64,
                             _ => {}
@@ -614,9 +713,9 @@ async fn handle_ctrl_stream(
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(dropped = n, "video subscriber lagged — resyncing via immediate FULL snapshot");
-                        if let Some(snap_m) = bus_for_video.snapshot().await {
-                            let (res, snap_len) = write_frame(&mut vs, &snap_m).await;
-                            if let Ok(()) = res {
+                        if let Some(snap_item) = bus_for_video.snapshot() {
+                            let snap_len = snap_item.wire_quic.len();
+                            if vs.write_all(&snap_item.wire_quic).await.is_ok() {
                                 published += 1;
                                 cum_bytes += snap_len as u64; cum_full += snap_len as u64;
                             }
@@ -737,6 +836,237 @@ async fn read_next(
     }
 }
 
+async fn read_next_tcp(
+    recv: &mut tokio::net::tcp::OwnedReadHalf,
+    inbuf: &mut Vec<u8>,
+    chunk: &mut [u8],
+) -> Result<Option<Message>> {
+    use tokio::io::AsyncReadExt;
+    loop {
+        {
+            let mut cur = inbuf.as_slice();
+            match Message::decode(&mut cur) {
+                Ok(Some(msg)) => {
+                    let consumed = inbuf.len() - cur.len();
+                    inbuf.drain(..consumed);
+                    return Ok(Some(msg));
+                }
+                Ok(None) => {}
+                Err(e) => return Err(anyhow!("decode error: {:?}", e)),
+            }
+        }
+        match recv.read(chunk).await {
+            Ok(0) => {
+                return if inbuf.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(anyhow!("tcp stream ended mid-frame ({} bytes)", inbuf.len()))
+                };
+            }
+            Ok(n) => inbuf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset && inbuf.is_empty() => {
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+async fn handle_tcp_connection(
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    host_state: HostState,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let _ = stream.set_nodelay(true);
+    info!(%peer, "TCP client connected");
+
+    let (mut recv, mut send) = stream.into_split();
+    let mut inbuf = Vec::with_capacity(4096);
+    let mut chunk = vec![0u8; 8192];
+
+    let hello = read_next_tcp(&mut recv, &mut inbuf, &mut chunk)
+        .await?
+        .ok_or_else(|| anyhow!("tcp stream closed before HELLO"))?;
+    let Message::Hello {
+        proto_version,
+        viewport_w,
+        viewport_h,
+        dpr_hundredths,
+        client_name,
+        capabilities,
+    } = hello
+    else {
+        return Err(anyhow!("first tcp message was not HELLO: {:?}", hello));
+    };
+    if proto_version != PROTO_VERSION {
+        return Err(anyhow!(
+            "proto version mismatch: client={proto_version} host={PROTO_VERSION}"
+        ));
+    }
+    info!(
+        %peer,
+        client = %client_name,
+        viewport = format!("{viewport_w}x{viewport_h}"),
+        dpr = format!("{:.2}", dpr_hundredths as f32 / 100.0),
+        caps = format!("0x{capabilities:08x}"),
+        "TCP HELLO received",
+    );
+    if viewport_w > 0 && viewport_h > 0 {
+        host_state.resize_all(viewport_w as u32, viewport_h as u32).await;
+    }
+
+    let session_id: u64 = rand64();
+    let welcome = Message::Welcome {
+        proto_version: PROTO_VERSION,
+        session_id,
+        features: capabilities & (caps::H264 | caps::CLIENT_SCROLL),
+        cursor_track_id: 0,
+        current_url: host_state.current_url().await,
+    };
+    let mut out = Vec::with_capacity(64);
+    welcome.encode(&mut out);
+    send.write_all(&out).await?;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let bus_for_video = host_state.bus.clone();
+    let mut stream_rx = host_state.bus.subscribe();
+    let writer_task = tokio::spawn(async move {
+        if let Some(snap_item) = bus_for_video.snapshot() {
+            if send.write_all(&snap_item.wire_quic).await.is_err() {
+                return;
+            }
+        }
+        loop {
+            tokio::select! {
+                Some(b) = reply_rx.recv() => {
+                    if send.write_all(&b).await.is_err() {
+                        break;
+                    }
+                }
+                res = stream_rx.recv() => match res {
+                    Ok(mut item) => {
+                        while let Ok(newer) = stream_rx.try_recv() {
+                            match (&*item.msg, &*newer.msg) {
+                                // A new RawFrame supersedes any older RawFrame or Subframe
+                                (Message::RawFrame { .. } | Message::Subframe { .. }, Message::RawFrame { .. }) => {
+                                    item = newer;
+                                }
+                                // If a newer Subframe covers the older Subframe (e.g. consecutive video frames),
+                                // drop the older Subframe directly without triggering a full-frame snapshot.
+                                (
+                                    Message::Subframe { x: x1, y: y1, w: w1, h: h1, .. },
+                                    Message::Subframe { x: x2, y: y2, w: w2, h: h2, .. },
+                                ) if *x2 <= *x1
+                                    && *y2 <= *y1
+                                    && (*x2 as u32 + *w2 as u32) >= (*x1 as u32 + *w1 as u32)
+                                    && (*y2 as u32 + *h2 as u32) >= (*y1 as u32 + *h1 as u32) =>
+                                {
+                                    item = newer;
+                                }
+                                _ => {
+                                    if send.write_all(&item.wire_quic).await.is_err() {
+                                        return;
+                                    }
+                                    item = newer;
+                                }
+                            }
+                        }
+                        if send.write_all(&item.wire_quic).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if let Some(snap_item) = bus_for_video.snapshot() {
+                            if send.write_all(&snap_item.wire_quic).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    });
+
+    let mut last_pointer: (i32, i32) = (0, 0);
+    while let Some(msg) = read_next_tcp(&mut recv, &mut inbuf, &mut chunk).await? {
+        match msg {
+            Message::Heartbeat { ts_us } => {
+                let mut buf = Vec::with_capacity(16);
+                Message::Heartbeat { ts_us }.encode(&mut buf);
+                let _ = reply_tx.send(Bytes::from(buf)).await;
+            }
+            Message::Nav { url } => {
+                info!(%url, "NAV request (tcp)");
+                host_state.load_uri(&url).await;
+            }
+            Message::Resize { viewport_w, viewport_h, .. } => {
+                host_state.resize_all(viewport_w as u32, viewport_h as u32).await;
+            }
+            Message::SetZoom { level_milli } => {
+                host_state.set_zoom((level_milli as f64) / 1000.0).await;
+            }
+            Message::NavAction { action } => match action {
+                0 => host_state.go_back().await,
+                1 => host_state.go_forward().await,
+                2 => host_state.reload().await,
+                _ => {}
+            },
+            Message::Stop => {
+                host_state.stop_loading().await;
+            }
+            Message::ClearData { clear_cookies, clear_cache, clear_storage } => {
+                host_state.clear_data(clear_cookies, clear_cache, clear_storage);
+            }
+            Message::CreateTab { tab_id, url } => {
+                host_state.create_tab(tab_id, &url, true).await;
+                let mut buf = Vec::with_capacity(64);
+                Message::TabCreated {
+                    tab_id,
+                    title: "New Tab".into(),
+                    url,
+                }
+                .encode(&mut buf);
+                let _ = reply_tx.send(Bytes::from(buf)).await;
+            }
+            Message::CloseTab { tab_id } => {
+                host_state.close_tab(tab_id).await;
+                let mut buf = Vec::with_capacity(16);
+                Message::TabClosed { tab_id }.encode(&mut buf);
+                let _ = reply_tx.send(Bytes::from(buf)).await;
+            }
+            Message::SwitchTab { tab_id } => {
+                host_state.switch_tab(tab_id).await;
+                let mut buf = Vec::with_capacity(16);
+                Message::TabActivated { tab_id }.encode(&mut buf);
+                let _ = reply_tx.send(Bytes::from(buf)).await;
+            }
+            Message::InputPointer { x, y, modifiers, .. } => {
+                last_pointer = (x, y);
+                host_state.inject_pointer_motion(x, y, modifiers).await;
+            }
+            Message::InputButton { x, y, button, pressed, modifiers, .. } => {
+                last_pointer = (x, y);
+                host_state.inject_pointer_button(x, y, button, pressed, modifiers).await;
+            }
+            Message::InputKey { keycode, mods, down, .. } => {
+                host_state.inject_key(keycode, mods, down).await;
+            }
+            Message::InputScroll { dx_units, dy_units, .. } => {
+                let (px, py) = last_pointer;
+                host_state
+                    .inject_axis(px, py, dx_units as f64 * 40.0, dy_units as f64 * 40.0, 0)
+                    .await;
+            }
+            _ => {}
+        }
+    }
+    writer_task.abort();
+    info!(%peer, "TCP client disconnected");
+    Ok(())
+}
+
 fn rand64() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
@@ -763,17 +1093,18 @@ fn make_self_signed_config() -> Result<(ServerConfig, Vec<u8>)> {
     let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_cfg)?;
     let mut server_cfg = ServerConfig::with_crypto(Arc::new(quic_crypto));
 
-    // Aggressive defaults for LAN. Tune later.
+    // Aggressive defaults for LAN / Internet. Tune later.
     let mut transport = quinn::TransportConfig::default();
     transport
-        .max_concurrent_bidi_streams(64u32.into())
-        .max_concurrent_uni_streams(64u32.into())
-        .keep_alive_interval(Some(std::time::Duration::from_secs(5)))
-        .datagram_receive_buffer_size(Some(1024 * 1024))
-        .datagram_send_buffer_size(1024 * 1024)
-        .stream_receive_window((1024 * 1024u32).into())
-        .receive_window((2 * 1024 * 1024u32).into())
-        .send_window(2 * 1024 * 1024);
+        .max_concurrent_bidi_streams(128u32.into())
+        .max_concurrent_uni_streams(128u32.into())
+        .keep_alive_interval(Some(std::time::Duration::from_secs(2)))
+        .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()))
+        .datagram_receive_buffer_size(Some(4 * 1024 * 1024))
+        .datagram_send_buffer_size(4 * 1024 * 1024)
+        .stream_receive_window((16 * 1024 * 1024u32).into())
+        .receive_window((32 * 1024 * 1024u32).into())
+        .send_window(32 * 1024 * 1024);
     server_cfg.transport_config(Arc::new(transport));
 
     Ok((server_cfg, cert_der))
@@ -782,6 +1113,54 @@ fn make_self_signed_config() -> Result<(ServerConfig, Vec<u8>)> {
 fn hex_sha256(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(bytes))
+}
+
+/// Update horizontal dirty bounds `[left, right]` for a known-dirty row `(ra, rb)`.
+/// Only scans outside the existing `[left, right]` interval once initialized!
+#[inline]
+fn update_row_bounds(ra: &[u8], rb: &[u8], w: usize, left: &mut usize, right: &mut usize) {
+    if *left == 0 && *right + 1 >= w {
+        return;
+    }
+    if let (Some(sa), Some(sb)) = (align_slice_u32(ra), align_slice_u32(rb)) {
+        if *left > *right {
+            if let Some(lx) = sa.iter().zip(sb.iter()).position(|(pa, pb)| pa != pb) {
+                *left = lx;
+                *right = sa.iter().zip(sb.iter()).rposition(|(pa, pb)| pa != pb).unwrap_or(lx);
+            }
+        } else {
+            if *left > 0 && sa[..*left] != sb[..*left] {
+                if let Some(lx) = sa[..*left].iter().zip(sb[..*left].iter()).position(|(pa, pb)| pa != pb) {
+                    *left = lx;
+                }
+            }
+            if *right + 1 < w && sa[*right + 1..] != sb[*right + 1..] {
+                if let Some(rx) = sa[*right + 1..].iter().zip(sb[*right + 1..].iter()).rposition(|(pa, pb)| pa != pb) {
+                    *right = *right + 1 + rx;
+                }
+            }
+        }
+    } else {
+        let ca = ra.as_chunks::<4>().0;
+        let cb = rb.as_chunks::<4>().0;
+        if *left > *right {
+            if let Some(lx) = ca.iter().zip(cb.iter()).position(|(pa, pb)| pa != pb) {
+                *left = lx;
+                *right = ca.iter().zip(cb.iter()).rposition(|(pa, pb)| pa != pb).unwrap_or(lx);
+            }
+        } else {
+            if *left > 0 && ca[..*left] != cb[..*left] {
+                if let Some(lx) = ca[..*left].iter().zip(cb[..*left].iter()).position(|(pa, pb)| pa != pb) {
+                    *left = lx;
+                }
+            }
+            if *right + 1 < w && ca[*right + 1..] != cb[*right + 1..] {
+                if let Some(rx) = ca[*right + 1..].iter().zip(cb[*right + 1..].iter()).rposition(|(pa, pb)| pa != pb) {
+                    *right = *right + 1 + rx;
+                }
+            }
+        }
+    }
 }
 
 /// Split a frame diff into up to N tight sub-rects by grouping changed
@@ -802,11 +1181,11 @@ fn diff_regions(
     let mut first_dirty = h;
     let mut last_dirty = 0usize;
 
-    for y in 0..h {
+    for (y, is_dirty_slot) in dirty.iter_mut().enumerate().take(h) {
         let ra = &a[y * s .. y * s + row_bytes];
         let rb = &b[y * s .. y * s + row_bytes];
         let is_d = ra != rb;
-        dirty[y] = is_d;
+        *is_dirty_slot = is_d;
         if is_d {
             dirty_count += 1;
             if first_dirty == h { first_dirty = y; }
@@ -818,27 +1197,42 @@ fn diff_regions(
     }
 
     // Fast-path: if >25% of the screen rows changed (e.g. video or scrolling),
-    // emit a single bounding subrect across the full width to prevent multi-region tearing.
+    // compute tight horizontal bounds across the dirty rows.
     if dirty_count * 4 >= h {
-        return vec![(0, first_dirty as u16, w as u16, (last_dirty - first_dirty + 1) as u16)];
+        let mut min_left = w;
+        let mut max_right = 0usize;
+        for (yy, &is_d) in dirty.iter().enumerate().take(last_dirty + 1).skip(first_dirty) {
+            if !is_d { continue; }
+            let ra = &a[yy * s .. yy * s + row_bytes];
+            let rb = &b[yy * s .. yy * s + row_bytes];
+            update_row_bounds(ra, rb, w, &mut min_left, &mut max_right);
+            if min_left == 0 && max_right + 1 >= w {
+                break;
+            }
+        }
+        if max_right >= min_left {
+            return vec![(min_left as u16, first_dirty as u16, (max_right - min_left + 1) as u16, (last_dirty - first_dirty + 1) as u16)];
+        } else {
+            return vec![(0, first_dirty as u16, w as u16, (last_dirty - first_dirty + 1) as u16)];
+        }
     }
 
     // 2) coalesce into runs; tolerate up to `gap` clean rows so we don't
     //    over-fragment when a shape has interior whitespace lines.
     let gap: usize = 4;
     let mut runs: Vec<(usize, usize)> = Vec::new();
-    let mut y = 0;
-    while y < h {
+    let mut y = first_dirty;
+    while y <= last_dirty {
         if !dirty[y] { y += 1; continue; }
         let start = y;
         let mut end = y;
         y += 1;
-        while y < h {
+        while y <= last_dirty {
             if dirty[y] {
                 end = y;
                 y += 1;
             } else {
-                let look = (1..=gap).find(|&k| y + k < h && dirty[y + k]);
+                let look = (1..=gap).find(|&k| y + k <= last_dirty && dirty[y + k]);
                 if let Some(k) = look {
                     y += k;
                 } else {
@@ -853,23 +1247,13 @@ fn diff_regions(
     for (top, bot) in runs {
         let mut left  = w;
         let mut right = 0usize;
-        for yy in top..=bot {
+        for (yy, &is_d) in dirty.iter().enumerate().take(bot + 1).skip(top) {
+            if !is_d { continue; }
             let ra = &a[yy * s .. yy * s + row_bytes];
             let rb = &b[yy * s .. yy * s + row_bytes];
-            let ra_u32 = align_slice_u32(ra);
-            let rb_u32 = align_slice_u32(rb);
-            if let (Some(sa), Some(sb)) = (ra_u32, rb_u32) {
-                if let Some(lx) = sa.iter().zip(sb.iter()).position(|(pa, pb)| pa != pb) {
-                    left = left.min(lx);
-                    let rx = sa.iter().zip(sb.iter()).rposition(|(pa, pb)| pa != pb).unwrap_or(lx);
-                    right = right.max(rx);
-                }
-            } else {
-                if let Some(lx) = ra.chunks_exact(4).zip(rb.chunks_exact(4)).position(|(px_a, px_b)| px_a != px_b) {
-                    left = left.min(lx);
-                    let rx = ra.chunks_exact(4).zip(rb.chunks_exact(4)).rposition(|(px_a, px_b)| px_a != px_b).unwrap_or(lx);
-                    right = right.max(rx);
-                }
+            update_row_bounds(ra, rb, w, &mut left, &mut right);
+            if left == 0 && right + 1 >= w {
+                break;
             }
         }
         if right >= left {
@@ -880,9 +1264,103 @@ fn diff_regions(
     out
 }
 
+fn init_pulse_null_sink() {
+    use std::process::{Command, Stdio};
+    let pactl_ok = Command::new("pactl")
+        .arg("info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !pactl_ok {
+        let _ = Command::new("pulseaudio")
+            .args([
+                "--daemonize=yes",
+                "--exit-idle-time=-1",
+                "--disallow-exit",
+                "-n",
+                "-L",
+                "module-null-sink sink_name=gutted_sink sink_properties=device.description=GuttedBrowser",
+                "-L",
+                "module-native-protocol-unix auth-anonymous=1",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    } else {
+        let sinks = Command::new("pactl")
+            .args(["list", "short", "sinks"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        if !sinks.contains("gutted_sink") {
+            let _ = Command::new("pactl")
+                .args([
+                    "load-module",
+                    "module-null-sink",
+                    "sink_name=gutted_sink",
+                    "sink_properties=device.description=GuttedBrowser",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    std::env::set_var("PULSE_SINK", "gutted_sink");
+}
+
+fn spawn_audio_capture(bus: FrameBus) {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let _ = std::thread::Builder::new()
+        .name("gutted-audio".into())
+        .spawn(move || {
+            let Ok(mut child) = Command::new("parec")
+                .args([
+                    "--device=gutted_sink.monitor",
+                    "--format=s16le",
+                    "--rate=48000",
+                    "--channels=2",
+                    "--raw",
+                    "--latency-msec=20",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            else {
+                return;
+            };
+            let Some(mut stdout) = child.stdout.take() else { return; };
+            // 20ms of 48kHz stereo S16LE = 960 frames * 4 bytes = 3840 bytes
+            let mut buf = [0u8; 3840];
+            loop {
+                if stdout.read_exact(&mut buf).is_err() {
+                    break;
+                }
+                // Skip completely silent chunks so idle pages consume 0 audio bandwidth
+                if buf.iter().all(|&b| b == 0) {
+                    continue;
+                }
+                let pts_us = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_micros() as u64;
+                bus.publish(Arc::new(Message::AudioFrame {
+                    pts_us,
+                    codec: 0, // PCM S16LE
+                    channels: 2,
+                    sample_rate: 48_000,
+                    data: buf.to_vec(),
+                }));
+            }
+            let _ = child.kill();
+        });
+}
+
 #[inline(always)]
 fn align_slice_u32(s: &[u8]) -> Option<&[u32]> {
-    if (s.as_ptr() as usize) % std::mem::align_of::<u32>() == 0 && s.len() % 4 == 0 {
+    if (s.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u32>()) && s.len().is_multiple_of(4) {
         Some(unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u32, s.len() / 4) })
     } else {
         None
@@ -906,7 +1384,7 @@ mod tests {
     fn make_frame(w: usize, h: usize, fill: [u8; 4]) -> (Vec<u8>, i32) {
         let stride = w * 4;
         let mut px = vec![0u8; stride * h];
-        for chunk in px.chunks_exact_mut(4) { chunk.copy_from_slice(&fill); }
+        for chunk in px.as_chunks_mut::<4>().0 { chunk.copy_from_slice(&fill); }
         (px, stride as i32)
     }
 

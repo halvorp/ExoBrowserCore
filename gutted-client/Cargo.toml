@@ -3,24 +3,25 @@ name = "gutted-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Portable 100% Pure-Rust #![no_std] + alloc browser client library and standalone application (zero C dependencies)."
+
+[lib]
+name = "gutted_client"
+path = "src/lib.rs"
 
 [[bin]]
 name = "gutted-client"
 path = "src/main.rs"
+required-features = ["std"]
+
+[features]
+default = ["std"]
+std = ["gutted-proto/std", "dep:ab_glyph", "dep:x11rb"]
 
 [dependencies]
-tokio.workspace = true
-quinn.workspace = true
-rustls.workspace = true
-anyhow.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-bytes.workspace = true
-hex.workspace = true
-sha2.workspace = true
-gutted-proto = { path = "../gutted-proto" }
-wgpu       = "0.20"
-winit      = "0.30"
-pollster   = "0.3"
-bytemuck   = { version = "1", features = ["derive"] }
-font8x8    = { version = "0.3", default-features = false, features = ["unicode"] }
+gutted-proto = { path = "../gutted-proto", default-features = false }
+font8x8 = { version = "0.3", default-features = false, features = ["unicode"] }
+ab_glyph = { version = "0.2", optional = true }
+
+[target.'cfg(all(unix, not(target_os = "redox")))'.dependencies]
+x11rb = { version = "0.13", default-features = false, optional = true }

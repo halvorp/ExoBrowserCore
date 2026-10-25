@@ -295,13 +295,46 @@
       font-size: 11px;
       font-weight: 600;
       color: var(--text-muted);
+      cursor: pointer;
+    }
+    .zoom-value:hover { color: #ffffff; }
+
+    /* Bookmarks Bar */
+    #bookmarks-bar {
+      height: 30px;
+      display: flex;
+      align-items: center;
+      padding: 0 10px;
+      gap: 6px;
+      background: #131316;
+      border-bottom: 1px solid var(--border-subtle);
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    #bookmarks-bar::-webkit-scrollbar { display: none; }
+
+    .bookmark-chip {
+      background: #1e1e24;
+      color: #d1d5db;
+      border: 1px solid #2e2e38;
+      border-radius: 12px;
+      padding: 2px 10px;
+      font-size: 11px;
+      font-weight: 500;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.12s ease;
+    }
+    .bookmark-chip:hover {
+      background: #2e2e38;
+      color: #ffffff;
     }
 
     /* ─── Viewport Area ──────────────────────────────────────────────── */
     #viewport-container {
       flex: 1;
       width: 100%;
-      height: calc(100vh - var(--chrome-height));
+      height: calc(100vh - 114px);
       position: relative;
       background: #000;
       display: flex;
@@ -316,6 +349,7 @@
       display: block;
       cursor: default;
       image-rendering: auto;
+      touch-action: none;
     }
 
     #connecting-modal {
@@ -384,7 +418,7 @@
           <button id="btn-back" class="nav-btn" title="Back (Alt+Left)">←</button>
           <button id="btn-fwd" class="nav-btn" title="Forward (Alt+Right)">→</button>
           <button id="btn-reload" class="nav-btn" title="Reload (F5)">↻</button>
-          <button id="btn-home" class="nav-btn" title="Home">🏠</button>
+          <button id="btn-home" class="nav-btn" title="Home (Alt+Home)">🏠</button>
         </div>
 
         <div id="omnibox-wrapper">
@@ -393,12 +427,24 @@
         </div>
 
         <div class="zoom-pill">
-          <button id="btn-zoom-out" class="zoom-btn">-</button>
-          <span id="zoom-label" class="zoom-value">100%</span>
-          <button id="btn-zoom-in" class="zoom-btn">+</button>
+          <button id="btn-zoom-out" class="zoom-btn" title="Zoom Out (Ctrl+-)">-</button>
+          <span id="zoom-label" class="zoom-value" title="Reset Zoom (Ctrl+0)">100%</span>
+          <button id="btn-zoom-in" class="zoom-btn" title="Zoom In (Ctrl++)">+</button>
         </div>
 
         <button id="btn-clear-data" class="nav-btn" title="Clear Cookies & Cache" style="font-size: 12px;">🧹</button>
+      </div>
+
+      <!-- Bookmarks Bar -->
+      <div id="bookmarks-bar">
+        <button class="bookmark-chip" data-url="https://youtube.com">YouTube</button>
+        <button class="bookmark-chip" data-url="https://reddit.com">Reddit</button>
+        <button class="bookmark-chip" data-url="https://duckduckgo.com">DuckDuckGo</button>
+        <button class="bookmark-chip" data-url="https://www.wikipedia.org">Wikipedia</button>
+        <button class="bookmark-chip" data-url="https://github.com">GitHub</button>
+        <button class="bookmark-chip" data-url="https://news.ycombinator.com">HackerNews</button>
+        <button class="bookmark-chip" data-url="https://www.rust-lang.org">Rust</button>
+        <button class="bookmark-chip" data-url="https://example.com">Example</button>
       </div>
     </header>
 
@@ -413,7 +459,7 @@
       <div id="hud-info">
         <span id="hud-fps">60 FPS</span>
         <span id="hud-res">1280×720</span>
-        <span id="hud-rtt">1 ms</span>
+        <span id="hud-audio">🔊 Audio Ready</span>
       </div>
     </main>
   </div>
@@ -445,14 +491,68 @@
       const zoomLabel = document.getElementById('zoom-label');
       const hudFps = document.getElementById('hud-fps');
       const hudRes = document.getElementById('hud-res');
+      const btnReload = document.getElementById('btn-reload');
 
       let ws = null;
       let activeTabId = 1;
       let nextTabId = 2;
       let tabs = [];
+      let tabFrames = new Map(); // tabId -> ImageData
       let zoomLevel = 1000;
       let frameWidth = 1280, frameHeight = 720;
       let frameCount = 0, lastFpsTime = performance.now();
+      let isLoading = false;
+
+      // ─── Web Audio Playback ──────────────────────────────────────────
+      let audioCtx = null;
+      let nextAudioTime = 0;
+
+      function getAudioContext() {
+        if (!audioCtx) {
+          const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+          if (AudioContextClass) {
+            audioCtx = new AudioContextClass({ sampleRate: 48000 });
+          }
+        }
+        if (audioCtx && audioCtx.state === 'suspended') {
+          audioCtx.resume().catch(() => {});
+        }
+        return audioCtx;
+      }
+
+      document.addEventListener('click', () => getAudioContext(), { once: true, passive: true });
+      document.addEventListener('keydown', () => getAudioContext(), { once: true, passive: true });
+      document.addEventListener('touchstart', () => getAudioContext(), { once: true, passive: true });
+
+      function playAudioFrame(channels, sampleRate, pcmBytes) {
+        const actx = getAudioContext();
+        if (!actx) return;
+        const numSamples = Math.floor(pcmBytes.length / (2 * channels));
+        if (numSamples <= 0) return;
+
+        const audioBuf = actx.createBuffer(channels, numSamples, sampleRate);
+        const view = new DataView(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength);
+
+        for (let ch = 0; ch < channels; ch++) {
+          const channelData = audioBuf.getChannelData(ch);
+          for (let i = 0; i < numSamples; i++) {
+            const byteOff = (i * channels + ch) * 2;
+            const sample = view.getInt16(byteOff, true);
+            channelData[i] = sample / 32768.0;
+          }
+        }
+
+        const source = actx.createBufferSource();
+        source.buffer = audioBuf;
+        source.connect(actx.destination);
+
+        const now = actx.currentTime;
+        if (nextAudioTime < now) {
+          nextAudioTime = now + 0.01;
+        }
+        source.start(nextAudioTime);
+        nextAudioTime += audioBuf.duration;
+      }
 
       // ─── Binary Protocol Codec ───────────────────────────────────────
       function writeVarint(buf, val) {
@@ -611,6 +711,7 @@
             }
             const imgData = new ImageData(pixelBytes, w, h);
             ctx.putImageData(imgData, 0, 0);
+            tabFrames.set(activeTabId, imgData);
             updateFps();
             break;
           }
@@ -645,6 +746,29 @@
             updateFps();
             break;
           }
+          case TAG.AUDIO_FRAME: {
+            const codec = dv.getUint8(8);
+            const channels = dv.getUint8(9);
+            const sampleRate = dv.getUint32(10, true);
+            const lenInfo = readVarint(dv, 14);
+            if (lenInfo) {
+              const off = 14 + lenInfo.bytesRead;
+              const pcmData = p.subarray(off, off + lenInfo.value);
+              if (codec === 0 || codec === 1) {
+                playAudioFrame(channels, sampleRate, pcmData);
+              }
+            }
+            break;
+          }
+          case TAG.LOAD_STATE: {
+            const state = dv.getUint8(0);
+            isLoading = state === 0 || state === 1 || state === 2;
+            btnReload.textContent = isLoading ? '✕' : '↻';
+            btnReload.title = isLoading ? 'Stop (Esc)' : 'Reload (F5)';
+            const tab = tabs.find(t => t.id === activeTabId);
+            if (tab) { tab.isLoading = isLoading; renderTabs(); }
+            break;
+          }
           case TAG.URL_CHANGED: {
             const url = readString(p, 0);
             if (document.activeElement !== urlInput) {
@@ -653,6 +777,8 @@
             const isHttps = url.startsWith('https://');
             securityIcon.textContent = isHttps ? '🔒' : 'ℹ️';
             securityIcon.className = isHttps ? 'secure' : '';
+            const tab = tabs.find(t => t.id === activeTabId);
+            if (tab) { tab.url = url; tab.isSecure = isHttps; renderTabs(); }
             break;
           }
           case TAG.TITLE: {
@@ -664,15 +790,28 @@
           }
           case TAG.CURSOR_STATE: {
             const shape = dv.getUint8(0);
-            const cursors = ['default', 'pointer', 'text', 'wait', 'wait', 'crosshair', 'move', 'not-allowed', 'grab', 'grabbing'];
+            const cursors = ['default', 'pointer', 'text', 'wait', 'wait', 'crosshair', 'move', 'not-allowed', 'grab', 'grabbing', 'ew-resize', 'ns-resize', 'nesw-resize', 'nwse-resize'];
             canvas.style.cursor = cursors[shape] || 'default';
             break;
           }
           case TAG.TAB_CREATED: {
             const tabId = dv.getUint32(0, true);
-            const title = readString(p, 4);
+            nextTabId = Math.max(nextTabId, tabId + 1);
+            const titleLen = readVarint(dv, 4);
+            let title = 'New Tab';
+            let url = '';
+            if (titleLen) {
+              const titleOff = 4 + titleLen.bytesRead;
+              title = new TextDecoder().decode(p.subarray(titleOff, titleOff + titleLen.value));
+              const urlOff = titleOff + titleLen.value;
+              const urlLen = readVarint(dv, urlOff);
+              if (urlLen) {
+                const urlBytesOff = urlOff + urlLen.bytesRead;
+                url = new TextDecoder().decode(p.subarray(urlBytesOff, urlBytesOff + urlLen.value));
+              }
+            }
             if (!tabs.some(t => t.id === tabId)) {
-              tabs.push({ id: tabId, title: title || 'New Tab', url: '' });
+              tabs.push({ id: tabId, title: title || 'New Tab', url, isLoading: false, isSecure: url.startsWith('https://') });
               renderTabs();
             }
             break;
@@ -680,11 +819,13 @@
           case TAG.TAB_CLOSED: {
             const tabId = dv.getUint32(0, true);
             tabs = tabs.filter(t => t.id !== tabId);
+            tabFrames.delete(tabId);
             renderTabs();
             break;
           }
           case TAG.TAB_ACTIVATED: {
             activeTabId = dv.getUint32(0, true);
+            restoreTabFrame(activeTabId);
             renderTabs();
             break;
           }
@@ -693,6 +834,22 @@
             const title = readString(p, 4);
             const t = tabs.find(tb => tb.id === tabId);
             if (t) { t.title = title; renderTabs(); }
+            break;
+          }
+          case TAG.TAB_URL: {
+            const tabId = dv.getUint32(0, true);
+            const url = readString(p, 4);
+            const t = tabs.find(tb => tb.id === tabId);
+            if (t) {
+              t.url = url;
+              t.isSecure = url.startsWith('https://');
+            }
+            if (activeTabId === tabId && document.activeElement !== urlInput) {
+              urlInput.value = url;
+              securityIcon.textContent = url.startsWith('https://') ? '🔒' : 'ℹ️';
+              securityIcon.className = url.startsWith('https://') ? 'secure' : '';
+            }
+            renderTabs();
             break;
           }
         }
@@ -716,17 +873,39 @@
         }
       }
 
+      function restoreTabFrame(tabId) {
+        if (tabFrames.has(tabId)) {
+          const img = tabFrames.get(tabId);
+          if (canvas.width !== img.width || canvas.height !== img.height) {
+            canvas.width = img.width;
+            canvas.height = img.height;
+          }
+          ctx.putImageData(img, 0, 0);
+        } else {
+          ctx.fillStyle = "#000000";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+        }
+      }
+
       // ─── Tab Strip Rendering ─────────────────────────────────────────
       function renderTabs() {
         tabsList.innerHTML = '';
         tabs.forEach(tab => {
           const el = document.createElement('div');
           el.className = `tab-item ${tab.id === activeTabId ? 'active' : ''}`;
+          const icon = tab.isLoading ? '⏳' : tab.isSecure ? '●' : '○';
           el.innerHTML = `
-            <span style="font-size:10px;">●</span>
+            <span style="font-size:10px;">${icon}</span>
             <span class="tab-title">${escapeHtml(tab.title || 'New Tab')}</span>
-            <span class="tab-close-btn" title="Close Tab">×</span>
+            <span class="tab-close-btn" title="Close Tab (Ctrl+W)">×</span>
           `;
+          el.onmousedown = (e) => {
+            if (e.button === 1) { // Middle click to close tab
+              e.preventDefault();
+              e.stopPropagation();
+              closeTab(tab.id);
+            }
+          };
           el.onclick = (e) => {
             if (e.target.classList.contains('tab-close-btn')) {
               e.stopPropagation();
@@ -744,9 +923,13 @@
       }
 
       function createTab(url = 'https://duckduckgo.com') {
+        if (canvas.width > 0 && canvas.height > 0) {
+          tabFrames.set(activeTabId, ctx.getImageData(0, 0, canvas.width, canvas.height));
+        }
         const newId = nextTabId++;
-        tabs.push({ id: newId, title: 'New Tab', url });
+        tabs.push({ id: newId, title: 'New Tab', url, isLoading: false, isSecure: true });
         activeTabId = newId;
+        restoreTabFrame(newId);
         renderTabs();
         const urlBytes = new TextEncoder().encode(url);
         const header = [];
@@ -765,6 +948,7 @@
         sendMsg(TAG.CLOSE_TAB, b);
         const idx = tabs.findIndex(t => t.id === tabId);
         tabs = tabs.filter(t => t.id !== tabId);
+        tabFrames.delete(tabId);
         if (activeTabId === tabId && tabs.length > 0) {
           const newActive = tabs[Math.max(0, idx - 1)].id;
           switchTab(newActive);
@@ -773,7 +957,17 @@
       }
 
       function switchTab(tabId) {
+        if (activeTabId === tabId) return;
+        if (canvas.width > 0 && canvas.height > 0) {
+          tabFrames.set(activeTabId, ctx.getImageData(0, 0, canvas.width, canvas.height));
+        }
         activeTabId = tabId;
+        restoreTabFrame(tabId);
+        const t = tabs.find(tb => tb.id === tabId);
+        if (t && t.url) {
+          urlInput.value = t.url;
+          securityIcon.textContent = t.isSecure ? '🔒' : 'ℹ️';
+        }
         renderTabs();
         const b = new Uint8Array(4);
         new DataView(b.buffer).setUint32(0, tabId, true);
@@ -783,12 +977,21 @@
       // ─── Input & Event Dispatch ──────────────────────────────────────
       function getCanvasCoords(e) {
         const rect = canvas.getBoundingClientRect();
-        const scaleX = frameWidth / rect.width;
-        const scaleY = frameHeight / rect.height;
+        const scaleX = frameWidth / Math.max(1, rect.width);
+        const scaleY = frameHeight / Math.max(1, rect.height);
         return {
           x: Math.round((e.clientX - rect.left) * scaleX),
           y: Math.round((e.clientY - rect.top) * scaleY)
         };
+      }
+
+      function getEventModifiers(e) {
+        let mods = 0;
+        if (e.ctrlKey)  mods |= 1 << 0;
+        if (e.shiftKey) mods |= 1 << 1;
+        if (e.altKey)   mods |= 1 << 2;
+        if (e.metaKey)  mods |= 1 << 3;
+        return mods;
       }
 
       let lastMotion = 0;
@@ -797,12 +1000,16 @@
         if (now - lastMotion < 8) return;
         lastMotion = now;
         const { x, y } = getCanvasCoords(e);
+        let mods = getEventModifiers(e);
+        if (e.buttons & 1) mods |= 1 << 20;
+        if (e.buttons & 4) mods |= 1 << 21;
+        if (e.buttons & 2) mods |= 1 << 22;
         const b = new Uint8Array(8 + 4 + 4 + 4);
         const dv = new DataView(b.buffer);
         dv.setBigUint64(0, BigInt(Math.round(performance.now() * 1000)), true);
         dv.setInt32(8, x, true);
         dv.setInt32(12, y, true);
-        dv.setUint32(16, 0, true);
+        dv.setUint32(16, mods, true);
         sendMsg(TAG.INPUT_POINTER, b);
       });
 
@@ -810,6 +1017,7 @@
         canvas.focus();
         const { x, y } = getCanvasCoords(e);
         const btn = e.button === 0 ? 1 : e.button === 1 ? 2 : 3;
+        const mods = (1 << (20 + btn - 1)) | getEventModifiers(e);
         const b = new Uint8Array(8 + 4 + 4 + 4 + 1 + 4);
         const dv = new DataView(b.buffer);
         dv.setBigUint64(0, BigInt(Math.round(performance.now() * 1000)), true);
@@ -817,13 +1025,14 @@
         dv.setInt32(12, y, true);
         dv.setUint32(16, btn, true);
         dv.setUint8(20, 1); // pressed
-        dv.setUint32(21, 1 << (20 + btn - 1), true);
+        dv.setUint32(21, mods, true);
         sendMsg(TAG.INPUT_BUTTON, b);
       });
 
       canvas.addEventListener('mouseup', (e) => {
         const { x, y } = getCanvasCoords(e);
         const btn = e.button === 0 ? 1 : e.button === 1 ? 2 : 3;
+        const mods = getEventModifiers(e);
         const b = new Uint8Array(8 + 4 + 4 + 4 + 1 + 4);
         const dv = new DataView(b.buffer);
         dv.setBigUint64(0, BigInt(Math.round(performance.now() * 1000)), true);
@@ -831,11 +1040,58 @@
         dv.setInt32(12, y, true);
         dv.setUint32(16, btn, true);
         dv.setUint8(20, 0); // released
-        dv.setUint32(21, 0, true);
+        dv.setUint32(21, mods, true);
         sendMsg(TAG.INPUT_BUTTON, b);
       });
 
       canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+      // Touch events for mobile/tablet
+      canvas.addEventListener('touchstart', (e) => {
+        if (e.touches.length === 1) {
+          const touch = e.touches[0];
+          const { x, y } = getCanvasCoords(touch);
+          const b = new Uint8Array(8 + 4 + 4 + 4 + 1 + 4);
+          const dv = new DataView(b.buffer);
+          dv.setBigUint64(0, BigInt(Math.round(performance.now() * 1000)), true);
+          dv.setInt32(8, x, true);
+          dv.setInt32(12, y, true);
+          dv.setUint32(16, 1, true);
+          dv.setUint8(20, 1);
+          dv.setUint32(21, 1 << 20, true);
+          sendMsg(TAG.INPUT_BUTTON, b);
+        }
+      }, { passive: true });
+
+      canvas.addEventListener('touchmove', (e) => {
+        if (e.touches.length === 1) {
+          const touch = e.touches[0];
+          const { x, y } = getCanvasCoords(touch);
+          const b = new Uint8Array(8 + 4 + 4 + 4);
+          const dv = new DataView(b.buffer);
+          dv.setBigUint64(0, BigInt(Math.round(performance.now() * 1000)), true);
+          dv.setInt32(8, x, true);
+          dv.setInt32(12, y, true);
+          dv.setUint32(16, 1 << 20, true);
+          sendMsg(TAG.INPUT_POINTER, b);
+        }
+      }, { passive: true });
+
+      canvas.addEventListener('touchend', (e) => {
+        const touch = e.changedTouches[0];
+        if (touch) {
+          const { x, y } = getCanvasCoords(touch);
+          const b = new Uint8Array(8 + 4 + 4 + 4 + 1 + 4);
+          const dv = new DataView(b.buffer);
+          dv.setBigUint64(0, BigInt(Math.round(performance.now() * 1000)), true);
+          dv.setInt32(8, x, true);
+          dv.setInt32(12, y, true);
+          dv.setUint32(16, 1, true);
+          dv.setUint8(20, 0);
+          dv.setUint32(21, 0, true);
+          sendMsg(TAG.INPUT_BUTTON, b);
+        }
+      }, { passive: true });
 
       canvas.addEventListener('wheel', (e) => {
         e.preventDefault();
@@ -868,21 +1124,95 @@
           }
           return;
         }
+
+        // Tab shortcuts
         if (e.ctrlKey && e.key.toLowerCase() === 't') { e.preventDefault(); createTab(); return; }
-        if (e.ctrlKey && e.key.toLowerCase() === 'w') { e.preventDefault(); closeTab(activeTabId); return; }
-        if (e.ctrlKey && e.key.toLowerCase() === 'l') { e.preventDefault(); urlInput.focus(); urlInput.select(); return; }
+        if (e.ctrlKey && (e.key.toLowerCase() === 'w' || e.key === 'F4')) { e.preventDefault(); closeTab(activeTabId); return; }
+        if ((e.ctrlKey && e.key === 'Tab' && !e.shiftKey) || (e.ctrlKey && e.key === 'PageDown')) {
+          e.preventDefault();
+          const idx = tabs.findIndex(t => t.id === activeTabId);
+          if (tabs.length > 1) {
+            const nextIdx = (idx + 1) % tabs.length;
+            switchTab(tabs[nextIdx].id);
+          }
+          return;
+        }
+        if ((e.ctrlKey && e.key === 'Tab' && e.shiftKey) || (e.ctrlKey && e.key === 'PageUp')) {
+          e.preventDefault();
+          const idx = tabs.findIndex(t => t.id === activeTabId);
+          if (tabs.length > 1) {
+            const prevIdx = idx > 0 ? idx - 1 : tabs.length - 1;
+            switchTab(tabs[prevIdx].id);
+          }
+          return;
+        }
+
+        // Ctrl+1..9
+        if (e.ctrlKey && e.key >= '1' && e.key <= '9') {
+          const targetIdx = parseInt(e.key, 10) - 1;
+          if (targetIdx < tabs.length) {
+            e.preventDefault();
+            switchTab(tabs[targetIdx].id);
+            return;
+          }
+        }
+
+        // URL focus
+        if ((e.ctrlKey && e.key.toLowerCase() === 'l') || e.key === 'F6' || (e.altKey && e.key.toLowerCase() === 'd')) {
+          e.preventDefault();
+          urlInput.focus();
+          urlInput.select();
+          return;
+        }
+
+        // Reload / Stop
         if (e.key === 'F5' || (e.ctrlKey && e.key.toLowerCase() === 'r')) {
           e.preventDefault();
           sendNavAction(2);
           return;
         }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          sendMsg(TAG.STOP, new Uint8Array(0));
+          return;
+        }
+
+        // Back / Forward / Home
+        if (e.altKey && e.key === 'ArrowLeft') { e.preventDefault(); sendNavAction(0); return; }
+        if (e.altKey && e.key === 'ArrowRight') { e.preventDefault(); sendNavAction(1); return; }
+        if (e.altKey && e.key === 'Home') { e.preventDefault(); navigate('https://duckduckgo.com'); return; }
+
+        // Zoom shortcuts
+        if (e.ctrlKey && (e.key === '+' || e.key === '=')) {
+          e.preventDefault();
+          zoomLevel = Math.min(5000, zoomLevel + 100);
+          zoomLabel.textContent = `${Math.round(zoomLevel / 10)}%`;
+          const b = new Uint8Array(4);
+          new DataView(b.buffer).setUint32(0, zoomLevel, true);
+          sendMsg(TAG.SET_ZOOM, b);
+          return;
+        }
+        if (e.ctrlKey && e.key === '-') {
+          e.preventDefault();
+          zoomLevel = Math.max(250, zoomLevel - 100);
+          zoomLabel.textContent = `${Math.round(zoomLevel / 10)}%`;
+          const b = new Uint8Array(4);
+          new DataView(b.buffer).setUint32(0, zoomLevel, true);
+          sendMsg(TAG.SET_ZOOM, b);
+          return;
+        }
+        if (e.ctrlKey && e.key === '0') {
+          e.preventDefault();
+          zoomLevel = 1000;
+          zoomLabel.textContent = '100%';
+          const b = new Uint8Array(4);
+          new DataView(b.buffer).setUint32(0, zoomLevel, true);
+          sendMsg(TAG.SET_ZOOM, b);
+          return;
+        }
 
         const keycode = mapJsKeyToKeysym(e);
-        let mods = 0;
-        if (e.ctrlKey)  mods |= 1 << 0;
-        if (e.shiftKey) mods |= 1 << 1;
-        if (e.altKey)   mods |= 1 << 2;
-        if (e.metaKey)  mods |= 1 << 3;
+        const mods = getEventModifiers(e);
 
         const b = new Uint8Array(8 + 4 + 4 + 1);
         const dv = new DataView(b.buffer);
@@ -896,11 +1226,7 @@
       window.addEventListener('keyup', (e) => {
         if (document.activeElement === urlInput) return;
         const keycode = mapJsKeyToKeysym(e);
-        let mods = 0;
-        if (e.ctrlKey)  mods |= 1 << 0;
-        if (e.shiftKey) mods |= 1 << 1;
-        if (e.altKey)   mods |= 1 << 2;
-        if (e.metaKey)  mods |= 1 << 3;
+        const mods = getEventModifiers(e);
 
         const b = new Uint8Array(8 + 4 + 4 + 1);
         const dv = new DataView(b.buffer);
@@ -946,7 +1272,13 @@
       // ─── Button Handlers ─────────────────────────────────────────────
       document.getElementById('btn-back').onclick = () => sendNavAction(0);
       document.getElementById('btn-fwd').onclick = () => sendNavAction(1);
-      document.getElementById('btn-reload').onclick = () => sendNavAction(2);
+      btnReload.onclick = () => {
+        if (isLoading) {
+          sendMsg(TAG.STOP, new Uint8Array(0));
+        } else {
+          sendNavAction(2);
+        }
+      };
       document.getElementById('btn-home').onclick = () => navigate('https://duckduckgo.com');
       document.getElementById('btn-add-tab').onclick = () => createTab();
       document.getElementById('btn-fullscreen').onclick = () => {
@@ -961,6 +1293,13 @@
       };
 
       // Zoom
+      zoomLabel.onclick = () => {
+        zoomLevel = 1000;
+        zoomLabel.textContent = '100%';
+        const b = new Uint8Array(4);
+        new DataView(b.buffer).setUint32(0, zoomLevel, true);
+        sendMsg(TAG.SET_ZOOM, b);
+      };
       document.getElementById('btn-zoom-in').onclick = () => {
         zoomLevel = Math.min(5000, zoomLevel + 100);
         zoomLabel.textContent = `${Math.round(zoomLevel / 10)}%`;
@@ -993,8 +1332,16 @@
       });
       resizeObserver.observe(viewportContainer);
 
+      // Bookmark Chips
+      document.querySelectorAll('.bookmark-chip').forEach(chip => {
+        chip.onclick = () => {
+          const url = chip.dataset.url;
+          if (url) navigate(url);
+        };
+      });
+
       // Start connection
-      tabs.push({ id: 1, title: 'DuckDuckGo', url: 'https://duckduckgo.com' });
+      tabs.push({ id: 1, title: 'DuckDuckGo', url: 'https://duckduckgo.com', isLoading: false, isSecure: true });
       renderTabs();
       connect();
     })();

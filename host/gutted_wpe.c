@@ -27,6 +27,7 @@ typedef struct {
     struct wpe_view_backend_exportable_fdo *exportable;
     WebKitWebView *view;
     int32_t cur_w, cur_h;
+    int32_t last_cursor_shape;
 } tab_t;
 
 typedef struct instance_t {
@@ -42,6 +43,11 @@ static gsize g_wpe_init_once = 0;
 static gboolean g_wpe_init_ok = FALSE;
 static gboolean wpe_process_init(void) {
     if (g_once_init_enter(&g_wpe_init_once)) {
+        setenv("LIBGL_ALWAYS_SOFTWARE", "1", 0);
+        setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "0", 0);
+        setenv("WEBKIT_GST_DMABUF_SINK_ENABLED", "0", 0);
+        setenv("WEBKIT_GST_MAX_AVC1_RESOLUTION", "720P", 0);
+        setenv("GST_PLUGIN_FEATURE_RANK", "vah264dec:NONE,vaav1dec:NONE,vavp9dec:NONE,nvdec:NONE,openh264dec:NONE,avdec_h264:MAX", 0);
         wpe_loader_init("libWPEBackend-fdo-1.0.so");
         g_wpe_init_ok = wpe_fdo_initialize_shm() ? TRUE : FALSE;
         g_once_init_leave(&g_wpe_init_once, 1);
@@ -51,41 +57,67 @@ static gboolean wpe_process_init(void) {
 
 static const char *k_media_lifecycle_script =
     "(function(){\n"
-    "  function stopOtherMedia(activeEl) {\n"
-    "    try {\n"
-    "      var media = document.querySelectorAll('video, audio');\n"
-    "      for (var i = 0; i < media.length; i++) {\n"
-    "        var m = media[i];\n"
-    "        if (m !== activeEl && !m.paused) {\n"
-    "          m.pause();\n"
-    "          m.muted = true;\n"
+    "  try {\n"
+    "    if (window.MediaSource && window.MediaSource.isTypeSupported && !window.__gt_mse_patched) {\n"
+    "      window.__gt_mse_patched = true;\n"
+    "      var origSup = window.MediaSource.isTypeSupported.bind(window.MediaSource);\n"
+    "      window.MediaSource.isTypeSupported = function(mime) {\n"
+    "        if (typeof mime === 'string' && (mime.indexOf('vp09') !== -1 || mime.indexOf('vp9') !== -1 || mime.indexOf('av01') !== -1)) {\n"
+    "          return false;\n"
     "        }\n"
+    "        return origSup(mime);\n"
+    "      };\n"
+    "    }\n"
+    "    if (location.hostname.indexOf('youtube.com') !== -1 || location.hostname.indexOf('google.') !== -1) {\n"
+    "      document.cookie = 'SOCS=CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjMwODI5LjA3X3AxGgJlbiACGgYIgJnPpwY; domain=.youtube.com; path=/; max-age=31536000; SameSite=Lax';\n"
+    "      document.cookie = 'CONSENT=YES+cb.20230531-04-p0.en+FX+905; domain=.youtube.com; path=/; max-age=31536000; SameSite=Lax';\n"
+    "    }\n"
+    "    var injectYouTubeOpt = function() {\n"
+    "      if (!document.getElementById('__gt_yt_style') && (document.head || document.documentElement)) {\n"
+    "        var st = document.createElement('style');\n"
+    "        st.id = '__gt_yt_style';\n"
+    "        st.textContent = '#cinematics, #cinematics canvas, ytd-watch-flexy #cinematics, .ytp-cinematics-container, ytd-consent-bump-v2-lightbox, tp-yt-iron-overlay-backdrop, .ytd-consent-bump-v2-lightbox, ytd-enforcement-message-view-model { display: none !important; visibility: hidden !important; opacity: 0 !important; pointer-events: none !important; } * { scroll-behavior: auto !important; }';\n"
+    "        (document.head || document.documentElement).appendChild(st);\n"
     "      }\n"
-    "    } catch(e) {}\n"
-    "  }\n"
-    "\n"
-    "  var origPlay = HTMLMediaElement.prototype.play;\n"
-    "  HTMLMediaElement.prototype.play = function() {\n"
-    "    stopOtherMedia(this);\n"
-    "    return origPlay.apply(this, arguments);\n"
-    "  };\n"
-    "\n"
-    "  document.addEventListener('play', function(e) {\n"
-    "    if (e.target && (e.target.tagName === 'VIDEO' || e.target.tagName === 'AUDIO')) {\n"
-    "      stopOtherMedia(e.target);\n"
-    "    }\n"
-    "  }, { capture: true, passive: true });\n"
-    "\n"
-    "  document.addEventListener('playing', function(e) {\n"
-    "    if (e.target && (e.target.tagName === 'VIDEO' || e.target.tagName === 'AUDIO')) {\n"
-    "      stopOtherMedia(e.target);\n"
-    "    }\n"
-    "  }, { capture: true, passive: true });\n"
-    "\n"
-    "  window.addEventListener('popstate', function() { stopOtherMedia(null); }, { passive: true });\n"
-    "  window.addEventListener('hashchange', function() { stopOtherMedia(null); }, { passive: true });\n"
-    "  document.addEventListener('yt-navigate-start', function() { stopOtherMedia(null); }, { capture: true, passive: true });\n"
-    "\n"
+    "      var dismissConsent = function() {\n"
+    "        var dlg = document.querySelector('ytd-consent-bump-v2-lightbox, #consent-bump');\n"
+    "        if (dlg) {\n"
+    "          var btns = dlg.querySelectorAll('button, ytd-button-renderer a, tp-yt-paper-button');\n"
+    "          for (var i = 0; i < btns.length; i++) {\n"
+    "            var txt = (btns[i].textContent || '').toLowerCase();\n"
+    "            if (txt.indexOf('reject') !== -1 || txt.indexOf('accept') !== -1 || txt.indexOf('elutas') !== -1 || txt.indexOf('elfogad') !== -1) {\n"
+    "              btns[i].click();\n"
+    "              break;\n"
+    "            }\n"
+    "          }\n"
+    "          dlg.remove();\n"
+    "        }\n"
+    "        var v = document.querySelector('video.html5-main-video, video');\n"
+    "        if (v) {\n"
+    "          if (!v.__gt_hooked) {\n"
+    "            v.__gt_hooked = true;\n"
+    "            v.addEventListener('click', function() { window.__gt_user_paused = !v.paused; });\n"
+    "          }\n"
+    "          if (v.paused && !window.__gt_user_paused && location.pathname === '/watch' && v.readyState >= 2) {\n"
+    "            v.muted = false;\n"
+    "            v.play().catch(function(){});\n"
+    "          }\n"
+    "        }\n"
+    "        var player = document.getElementById('movie_player');\n"
+    "        if (player && player.setPlaybackQualityRange && !window.__gt_q_set) {\n"
+    "          window.__gt_q_set = true;\n"
+    "          try { player.setPlaybackQualityRange('large', 'hd720'); } catch(e) {}\n"
+    "        }\n"
+    "      };\n"
+    "      dismissConsent();\n"
+    "      if (!window.__gt_yt_timer && location.hostname.indexOf('youtube.com') !== -1) {\n"
+    "        window.__gt_yt_timer = setInterval(dismissConsent, 750);\n"
+    "      }\n"
+    "    };\n"
+    "    if (document.head || document.documentElement) injectYouTubeOpt();\n"
+    "    document.addEventListener('DOMContentLoaded', injectYouTubeOpt, { once: true });\n"
+    "    window.addEventListener('yt-navigate-finish', injectYouTubeOpt);\n"
+    "  } catch(e) {}\n"
     "  var resumeAC = function() {\n"
     "    if (window.AudioContext || window.webkitAudioContext) {\n"
     "      var ac = window.__gt_ac || new (window.AudioContext || window.webkitAudioContext)();\n"
@@ -95,6 +127,7 @@ static const char *k_media_lifecycle_script =
     "  };\n"
     "  document.addEventListener('click', resumeAC, { capture: true, passive: true });\n"
     "  document.addEventListener('keydown', resumeAC, { capture: true, passive: true });\n"
+    "  document.addEventListener('touchstart', resumeAC, { capture: true, passive: true });\n"
     "})();\n";
 
 static void on_shm_buffer(void *data, struct wpe_fdo_shm_exported_buffer *buf) {
@@ -299,7 +332,10 @@ static void on_mouse_target_changed(WebKitWebView *v, WebKitHitTestResult *hit, 
     } else if (webkit_hit_test_result_context_is_editable(hit)) {
         shape = 2; // I-beam / text
     }
-    tab->inst->cb.on_cursor(tab->inst->userdata, tab->tab_id, shape);
+    if (tab->last_cursor_shape != shape) {
+        tab->last_cursor_shape = shape;
+        tab->inst->cb.on_cursor(tab->inst->userdata, tab->tab_id, shape);
+    }
 }
 
 static void on_notify_title(GObject *obj, GParamSpec *pspec, gpointer user_data) {
@@ -318,6 +354,16 @@ static void on_notify_uri(GObject *obj, GParamSpec *pspec, gpointer user_data) {
     if (uri) tab->inst->cb.on_url(tab->inst->userdata, tab->tab_id, uri);
 }
 
+static gboolean on_enter_fullscreen(WebKitWebView *v, gpointer user_data) {
+    (void)v; (void)user_data;
+    return FALSE; // Allow WebKit to enter fullscreen mode within the viewport
+}
+
+static gboolean on_leave_fullscreen(WebKitWebView *v, gpointer user_data) {
+    (void)v; (void)user_data;
+    return FALSE; // Allow WebKit to leave fullscreen mode
+}
+
 static tab_t *create_tab_internal(instance_t *inst, uint32_t tab_id, const char *url) {
     if (!inst) return NULL;
     tab_t *tab = g_new0(tab_t, 1);
@@ -325,6 +371,7 @@ static tab_t *create_tab_internal(instance_t *inst, uint32_t tab_id, const char 
     tab->inst = inst;
     tab->cur_w = inst->def_w > 0 ? inst->def_w : 1280;
     tab->cur_h = inst->def_h > 0 ? inst->def_h : 720;
+    tab->last_cursor_shape = -1;
 
     static const struct wpe_view_backend_exportable_fdo_client client_vtable = {
         .export_buffer_resource = NULL,
@@ -354,6 +401,7 @@ static tab_t *create_tab_internal(instance_t *inst, uint32_t tab_id, const char 
     webkit_settings_set_enable_mediasource(settings, TRUE);
     webkit_settings_set_enable_encrypted_media(settings, TRUE);
     webkit_settings_set_enable_webaudio(settings, TRUE);
+    webkit_settings_set_enable_fullscreen(settings, TRUE);
     webkit_settings_set_media_playback_allows_inline(settings, TRUE);
     webkit_settings_set_media_playback_requires_user_gesture(settings, FALSE);
     webkit_settings_set_user_agent(settings,
@@ -396,8 +444,16 @@ static tab_t *create_tab_internal(instance_t *inst, uint32_t tab_id, const char 
     g_signal_connect(tab->view, "script-dialog", G_CALLBACK(on_script_dialog), tab);
     g_signal_connect(tab->view, "create", G_CALLBACK(on_create_web_view), tab);
     g_signal_connect(tab->view, "mouse-target-changed", G_CALLBACK(on_mouse_target_changed), tab);
+    g_signal_connect(tab->view, "enter-fullscreen", G_CALLBACK(on_enter_fullscreen), tab);
+    g_signal_connect(tab->view, "leave-fullscreen", G_CALLBACK(on_leave_fullscreen), tab);
     g_signal_connect(tab->view, "notify::title", G_CALLBACK(on_notify_title), tab);
     g_signal_connect(tab->view, "notify::uri",   G_CALLBACK(on_notify_uri),   tab);
+
+    struct wpe_view_backend *wpe_vb =
+        wpe_view_backend_exportable_fdo_get_view_backend(tab->exportable);
+    if (wpe_vb) {
+        wpe_view_backend_dispatch_set_size(wpe_vb, tab->cur_w, tab->cur_h);
+    }
 
     if (url && url[0]) webkit_web_view_load_uri(tab->view, url);
 
@@ -568,7 +624,7 @@ static gboolean idle_resize(gpointer p) {
             g_hash_table_iter_init(&iter, r->inst->tabs);
             while (g_hash_table_iter_next(&iter, &key, &value)) {
                 tab_t *tab = (tab_t *)value;
-                if (tab && tab->exportable) {
+                if (tab && tab->exportable && (tab->cur_w != (int32_t)r->w || tab->cur_h != (int32_t)r->h)) {
                     tab->cur_w = r->w;
                     tab->cur_h = r->h;
                     struct wpe_view_backend *vb =
@@ -578,7 +634,7 @@ static gboolean idle_resize(gpointer p) {
             }
         } else {
             tab_t *tab = g_hash_table_lookup(r->inst->tabs, GUINT_TO_POINTER(r->tab_id));
-            if (tab && tab->exportable) {
+            if (tab && tab->exportable && (tab->cur_w != (int32_t)r->w || tab->cur_h != (int32_t)r->h)) {
                 tab->cur_w = r->w;
                 tab->cur_h = r->h;
                 struct wpe_view_backend *vb =

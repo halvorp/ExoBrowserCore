@@ -24,6 +24,7 @@ pub async fn run_web_server(addr: SocketAddr, host_state: HostState) -> Result<(
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
+                let _ = stream.set_nodelay(true);
                 let host_state = host_state.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_http_connection(stream, peer, host_state).await {
@@ -61,10 +62,27 @@ async fn handle_http_connection(mut stream: TcpStream, peer: SocketAddr, host_st
     let mut discard = vec![0u8; 4096];
     let _ = stream.read(&mut discard).await?;
 
+    let is_favicon = first_line.contains("/favicon.ico");
     let is_get = first_line.starts_with("GET /") || first_line.starts_with("GET ");
     let is_head = first_line.starts_with("HEAD /") || first_line.starts_with("HEAD ");
 
-    if is_get || is_head {
+    if is_favicon {
+        let svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>";
+        let header = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: image/svg+xml\r\n\
+             Content-Length: {}\r\n\
+             Cache-Control: public, max-age=86400\r\n\
+             Connection: close\r\n\
+             \r\n",
+            svg.len()
+        );
+        stream.write_all(header.as_bytes()).await?;
+        if is_get {
+            stream.write_all(svg.as_bytes()).await?;
+        }
+        stream.flush().await?;
+    } else if is_get || is_head {
         let html = include_str!("web_app.html");
         let header = format!(
             "HTTP/1.1 200 OK\r\n\
@@ -97,17 +115,13 @@ async fn handle_websocket(
     info!(%peer, "WebSocket client connected");
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
-    let mut bus_sub = host_state.bus.subscribe();
-
     // ─── Initial Handshake over WebSocket ─────────────────────────────────────
     let (ws_out_tx, mut ws_out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
     // Initial snapshot of active tab
-    if let Some(snap) = host_state.bus.snapshot().await {
-        let raw_snap = convert_to_raw_frame(&snap);
-        let mut buf = Vec::new();
-        raw_snap.encode(&mut buf);
-        let _ = ws_out_tx.send(buf);
+    let mut bus_sub = host_state.bus.subscribe();
+    if let Some(snap) = host_state.bus.snapshot() {
+        let _ = ws_out_tx.send(encode_ws_item(&snap));
     }
 
     // Current URL & Title
@@ -133,40 +147,68 @@ async fn handle_websocket(
         }
     }
 
-    // Task 1: Forward bus messages to WebSocket client
-    let ws_out_tx_clone = ws_out_tx.clone();
-    let forward_task = tokio::spawn(async move {
-        while let Ok(msg) = bus_sub.recv().await {
-            let msg_to_send = convert_to_raw_frame(&msg);
-            let mut buf = Vec::new();
-            msg_to_send.encode(&mut buf);
-            if ws_out_tx_clone.send(buf).is_err() {
-                break;
-            }
-        }
-    });
-
-    // Task 2: WebSocket writer loop
+    // Task 1: Forward bus messages + replies directly to WebSocket sender with backpressure coalescing
+    let host_state_bus = host_state.clone();
     let writer_task = tokio::spawn(async move {
-        while let Some(bytes) = ws_out_rx.recv().await {
-            if ws_sender.send(WsMessage::Binary(bytes.into())).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                Some(bytes) = ws_out_rx.recv() => {
+                    if ws_sender.send(WsMessage::Binary(bytes)).await.is_err() {
+                        break;
+                    }
+                }
+                res = bus_sub.recv() => match res {
+                    Ok(mut item) => {
+                        while let Ok(newer) = bus_sub.try_recv() {
+                            match (&*item.msg, &*newer.msg) {
+                                (Message::RawFrame { .. } | Message::Subframe { .. }, Message::RawFrame { .. }) => {
+                                    item = newer;
+                                }
+                                (
+                                    Message::Subframe { x: x1, y: y1, w: w1, h: h1, .. },
+                                    Message::Subframe { x: x2, y: y2, w: w2, h: h2, .. },
+                                ) if *x2 <= *x1
+                                    && *y2 <= *y1
+                                    && (*x2 as u32 + *w2 as u32) >= (*x1 as u32 + *w1 as u32)
+                                    && (*y2 as u32 + *h2 as u32) >= (*y1 as u32 + *h1 as u32) =>
+                                {
+                                    item = newer;
+                                }
+                                _ => {
+                                    if ws_sender.send(WsMessage::Binary(encode_ws_item(&item))).await.is_err() {
+                                        return;
+                                    }
+                                    item = newer;
+                                }
+                            }
+                        }
+                        if ws_sender.send(WsMessage::Binary(encode_ws_item(&item))).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        if let Some(snap_item) = host_state_bus.bus.snapshot() {
+                            if ws_sender.send(WsMessage::Binary(encode_ws_item(&snap_item))).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
         }
     });
 
     // Task 3: Inbound WebSocket reader loop
     let host_state_clone = host_state.clone();
+    let mut last_pointer: (i32, i32) = (0, 0);
     while let Some(msg_result) = ws_receiver.next().await {
         match msg_result {
             Ok(WsMessage::Binary(data)) => {
                 let mut cur = &data[..];
                 while let Ok(Some(msg)) = Message::decode(&mut cur) {
-                    handle_client_msg(msg, &host_state_clone, &ws_out_tx).await;
+                    handle_client_msg(msg, &host_state_clone, &ws_out_tx, &mut last_pointer).await;
                 }
-            }
-            Ok(WsMessage::Ping(p)) => {
-                let _ = ws_out_tx.send(p.to_vec());
             }
             Ok(WsMessage::Close(_)) => break,
             Err(e) => {
@@ -177,40 +219,59 @@ async fn handle_websocket(
         }
     }
 
-    forward_task.abort();
     writer_task.abort();
     info!(%peer, "WebSocket client disconnected");
     Ok(())
 }
 
-/// Convert ZSTD-compressed frames to uncompressed RAW frames for fast HTML5 Canvas rendering.
-fn convert_to_raw_frame(m: &Message) -> Message {
-    match m {
+fn write_varint(out: &mut Vec<u8>, mut v: u32) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// Encode a `BusItem` for the WebSocket client without cloning pixel buffers.
+/// Frame payloads are emitted uncompressed (`compression::RAW`) for zero-overhead
+/// HTML5 Canvas blitting in JS.
+fn encode_ws_item(item: &crate::BusItem) -> Vec<u8> {
+    match &*item.msg {
         Message::RawFrame { ts_us, width, height, stride, format, pixels, .. } => {
-            Message::RawFrame {
-                ts_us: *ts_us,
-                width: *width,
-                height: *height,
-                stride: *stride,
-                format: *format,
-                compression: gutted_proto::compression::RAW,
-                pixels: pixels.clone(),
-            }
+            let payload_len = 21 + pixels.len();
+            let mut out = Vec::with_capacity(8 + payload_len);
+            write_varint(&mut out, gutted_proto::tag::RAW_FRAME);
+            write_varint(&mut out, payload_len as u32);
+            out.extend_from_slice(&ts_us.to_le_bytes());
+            out.extend_from_slice(&width.to_le_bytes());
+            out.extend_from_slice(&height.to_le_bytes());
+            out.extend_from_slice(&stride.to_le_bytes());
+            out.extend_from_slice(&format.to_le_bytes());
+            out.push(gutted_proto::compression::RAW);
+            out.extend_from_slice(pixels);
+            out
         }
         Message::Subframe { ts_us, x, y, w, h, stride, format, pixels, .. } => {
-            Message::Subframe {
-                ts_us: *ts_us,
-                x: *x,
-                y: *y,
-                w: *w,
-                h: *h,
-                stride: *stride,
-                format: *format,
-                compression: gutted_proto::compression::RAW,
-                pixels: pixels.clone(),
-            }
+            let payload_len = 25 + pixels.len();
+            let mut out = Vec::with_capacity(8 + payload_len);
+            write_varint(&mut out, gutted_proto::tag::SUBFRAME);
+            write_varint(&mut out, payload_len as u32);
+            out.extend_from_slice(&ts_us.to_le_bytes());
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+            out.extend_from_slice(&w.to_le_bytes());
+            out.extend_from_slice(&h.to_le_bytes());
+            out.extend_from_slice(&stride.to_le_bytes());
+            out.extend_from_slice(&format.to_le_bytes());
+            out.push(gutted_proto::compression::RAW);
+            out.extend_from_slice(pixels);
+            out
         }
-        other => other.clone(),
+        _ => item.wire_quic.to_vec(),
     }
 }
 
@@ -218,6 +279,7 @@ async fn handle_client_msg(
     msg: Message,
     host_state: &HostState,
     ws_out_tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    last_pointer: &mut (i32, i32),
 ) {
     match msg {
         Message::Hello { viewport_w, viewport_h, .. } => {
@@ -285,9 +347,11 @@ async fn handle_client_msg(
             host_state.clear_data(clear_cookies, clear_cache, clear_storage);
         }
         Message::InputPointer { x, y, modifiers, .. } => {
+            *last_pointer = (x, y);
             host_state.inject_pointer_motion(x, y, modifiers).await;
         }
         Message::InputButton { x, y, button, pressed, modifiers, .. } => {
+            *last_pointer = (x, y);
             host_state.inject_pointer_button(x, y, button, pressed, modifiers).await;
         }
         Message::InputKey { keycode, mods, down, .. } => {
@@ -296,7 +360,8 @@ async fn handle_client_msg(
         Message::InputScroll { dx_units, dy_units, .. } => {
             let dx = dx_units as f64 * 40.0;
             let dy = dy_units as f64 * 40.0;
-            host_state.inject_axis(0, 0, dx, dy, 0).await;
+            let (px, py) = *last_pointer;
+            host_state.inject_axis(px, py, dx, dy, 0).await;
         }
         _ => {}
     }

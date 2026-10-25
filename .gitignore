@@ -29,3 +29,6 @@ host/run*.log
 .aider.tags.cache.v*/
 .aider.llm.history
 .aider*
+
+# Python
+__pycache__/
