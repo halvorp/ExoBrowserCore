@@ -37,7 +37,7 @@ LOG=/tmp/gutted-host.log
 : > "$LOG"
 GBROWSER_URL="$URL" GBROWSER_LISTEN="0.0.0.0:$PORT" ./target/release/gutted-host >"$LOG" 2>&1 &
 HPID=$!
-trap 'kill $HPID 2>/dev/null; wait $HPID 2>/dev/null; exit' INT TERM EXIT
+trap 'rc=$?; kill $HPID 2>/dev/null || true; wait $HPID 2>/dev/null || true; exit $rc' INT TERM EXIT
 
 # Wait for the pin to appear in the log (host prints it on stdout).
 # 40 × 0.1s = 4s max — enough for the QUIC bind + rustls provider install.

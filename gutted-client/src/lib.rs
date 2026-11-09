@@ -27,10 +27,11 @@ extern crate alloc;
 
 pub mod render;
 
+pub use gutted_proto::FrameDecoder;
 pub use render::{
-    canonicalize_url, AVClock, AudioChunk, BrowserCore, DamageRect, FontRenderer, GfxFrame,
-    GfxSubframe, InputEvent, RenderEvent, TabBuffer, TabInfo, BOOKMARKS, BOOKMARK_BAR_H, CHROME_H,
-    NAV_BAR_H, TAB_BAR_H,
+    canonicalize_url, urls_equivalent, AVClock, AudioChunk, BrowserCore, DamageRect, FontRenderer,
+    GfxFrame, GfxSubframe, InputEvent, RenderEvent, TabBuffer, TabInfo, BOOKMARKS, BOOKMARK_BAR_H,
+    CHROME_H, NAV_BAR_H, TAB_BAR_H,
 };
 
 #[cfg(feature = "std")]
@@ -168,8 +169,21 @@ pub fn net_main(
 
     log_info("gutted_client", &format!("dialing gutted-host server={server}"));
     let t_conn = Instant::now();
-    let mut stream = TcpStream::connect_timeout(&server, Duration::from_secs(10))
-        .map_err(|e| format!("TCP connect to {server}: {e}"))?;
+    let mut stream = {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match TcpStream::connect_timeout(&server, Duration::from_secs(5)) {
+                Ok(s) => break s,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::ConnectionRefused
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(e) => return Err(format!("TCP connect to {server}: {e}").into()),
+            }
+        }
+    };
     let _ = stream.set_nodelay(true);
     let conn_rtt = t_conn.elapsed();
     log_info(
@@ -193,9 +207,9 @@ pub fn net_main(
     log_info("gutted_client", &format!("HELLO sent bytes={}", out.len()));
 
     // ── WELCOME ──────────────────────────────────────────────────────────
-    let mut inbuf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut decoder = FrameDecoder::with_capacity(64 * 1024);
     let mut chunk = vec![0u8; 32 * 1024];
-    let welcome = read_next_stream(&mut stream, &mut inbuf, &mut chunk)?
+    let welcome = read_next_stream(&mut stream, &mut decoder, &mut chunk)?
         .ok_or("stream closed before WELCOME")?;
     let welcome_rtt_us = t_send.elapsed().as_micros() as u64;
     let Message::Welcome {
@@ -215,14 +229,15 @@ pub fn net_main(
         ),
     );
     if !current_url.is_empty() {
-        let _ = frames_tx.send(RenderEvent::InitialUrl(current_url));
+        let _ = frames_tx.send(RenderEvent::InitialUrl(current_url.clone()));
     }
 
     if let Ok(url) = std::env::var("GBROWSER_NAV") {
-        if !url.is_empty() {
-            log_info("gutted_client", &format!("NAV sent (from env) url={url}"));
+        let canonical = canonicalize_url(&url);
+        if !canonical.is_empty() && !urls_equivalent(&canonical, &current_url) {
+            log_info("gutted_client", &format!("NAV sent (from env) url={canonical}"));
             let mut nav_buf = Vec::with_capacity(64);
-            Message::Nav { url }.encode(&mut nav_buf);
+            Message::Nav { url: canonical }.encode(&mut nav_buf);
             stream.write_all(&nav_buf)?;
         }
     }
@@ -246,18 +261,36 @@ pub fn net_main(
     std::thread::Builder::new()
         .name("gutted-input".into())
         .spawn(move || {
-            let mut buf = Vec::with_capacity(64);
+            let mut buf = Vec::with_capacity(256);
+            let mut batch: Vec<InputEvent> = Vec::with_capacity(16);
             while !stop_writer.load(Ordering::Relaxed) {
-                let Ok(ev) = input_rx.recv() else {
+                let Ok(first) = input_rx.recv() else {
                     break;
                 };
+                batch.clear();
+                batch.push(first);
+                while let Ok(next) = input_rx.try_recv() {
+                    match (&mut batch.last_mut(), &next) {
+                        (Some(InputEvent::Motion { x, y, mods }), InputEvent::Motion { x: nx, y: ny, mods: nmods }) => {
+                            *x = *nx;
+                            *y = *ny;
+                            *mods = *nmods;
+                        }
+                        (Some(InputEvent::Scroll { dx, dy }), InputEvent::Scroll { dx: ndx, dy: ndy }) => {
+                            *dx += *ndx;
+                            *dy += *ndy;
+                        }
+                        _ => batch.push(next),
+                    }
+                }
                 let ts_us = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_micros() as u64;
-                let msg = ev.into_proto_message(ts_us);
                 buf.clear();
-                msg.encode(&mut buf);
+                for ev in batch.drain(..) {
+                    ev.into_proto_message(ts_us).encode(&mut buf);
+                }
                 if write_stream.write_all(&buf).is_err() {
                     break;
                 }
@@ -268,111 +301,100 @@ pub fn net_main(
     let mut frames_full = 0u64;
     let mut frames_sub = 0u64;
     let mut total_bytes = 0u64;
-    let mut wire_bytes = inbuf.len() as u64;
+    let mut wire_bytes = decoder.buffered_len() as u64;
     let mut last_report = Instant::now();
     let mut last_wire = 0u64;
     let mut last_frames = 0u64;
 
     loop {
-        {
-            let mut cur = inbuf.as_slice();
-            loop {
-                match Message::decode(&mut cur) {
-                    Ok(Some(msg)) => match msg {
-                        Message::RawFrame {
-                            ts_us,
-                            width,
-                            height,
-                            stride,
-                            format,
-                            pixels,
-                            ..
-                        } => {
-                            frames_full += 1;
-                            let received = frames_full + frames_sub;
-                            let now_us = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_micros() as u64;
-                            let one_way_us = now_us.saturating_sub(ts_us);
-                            total_bytes += pixels.len() as u64;
-                            if received <= 3 || received.is_multiple_of(30) {
-                                log_info(
-                                    "gutted_client",
-                                    &format!(
-                                        "RAW_FRAME received frame={received} frames_full={frames_full} frames_sub={frames_sub} size=\"{width}x{height}\" stride={stride} fmt=\"0x{format:08x}\" bytes={} cum_bytes={wire_bytes} one_way_us={one_way_us}",
-                                        pixels.len()
-                                    ),
-                                );
-                            }
-                            let _ = frames_tx.send(RenderEvent::Frame(GfxFrame {
-                                width: width as u32,
-                                height: height as u32,
-                                stride,
-                                pixels,
-                            }));
+        loop {
+            match decoder.next_message() {
+                Ok(Some(msg)) => match msg {
+                    Message::RawFrame {
+                        ts_us,
+                        width,
+                        height,
+                        stride,
+                        format,
+                        pixels,
+                        ..
+                    } => {
+                        frames_full += 1;
+                        let received = frames_full + frames_sub;
+                        let now_us = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_micros() as u64;
+                        let one_way_us = now_us.saturating_sub(ts_us);
+                        total_bytes += pixels.len() as u64;
+                        if received <= 3 || received.is_multiple_of(30) {
+                            log_info(
+                                "gutted_client",
+                                &format!(
+                                    "RAW_FRAME received frame={received} frames_full={frames_full} frames_sub={frames_sub} size=\"{width}x{height}\" stride={stride} fmt=\"0x{format:08x}\" bytes={} cum_bytes={wire_bytes} one_way_us={one_way_us}",
+                                    pixels.len()
+                                ),
+                            );
                         }
-                        Message::Subframe {
-                            ts_us,
-                            x,
-                            y,
-                            w,
-                            h,
+                        let _ = frames_tx.send(RenderEvent::Frame(GfxFrame {
+                            width: width as u32,
+                            height: height as u32,
                             stride,
                             pixels,
-                            ..
-                        } => {
-                            frames_sub += 1;
-                            let received = frames_full + frames_sub;
-                            let now_us = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_micros() as u64;
-                            let one_way_us = now_us.saturating_sub(ts_us);
-                            total_bytes += pixels.len() as u64;
-                            if received <= 5 || received.is_multiple_of(30) {
-                                log_info(
-                                    "gutted_client",
-                                    &format!(
-                                        "SUBFRAME received frame={received} frames_full={frames_full} frames_sub={frames_sub} at=\"({x},{y})\" size=\"{w}x{h}\" bytes={} cum_bytes={wire_bytes} one_way_us={one_way_us}",
-                                        pixels.len()
-                                    ),
-                                );
-                            }
-                            let _ = frames_tx.send(RenderEvent::Subframe(GfxSubframe {
-                                x: x as u32,
-                                y: y as u32,
-                                w: w as u32,
-                                h: h as u32,
-                                stride,
-                                pixels,
-                            }));
-                        }
-                        other => {
-                            if let Some(rev) = RenderEvent::from_proto_message(other) {
-                                let _ = frames_tx.send(rev);
-                            }
-                        }
-                    },
-                    Ok(None) => break,
-                    Err(e) => {
-                        log_warn(
-                            "gutted_client",
-                            &format!(
-                                "Message::decode error: {e:?} cur_len={} head={:02x?}",
-                                cur.len(),
-                                &cur[..cur.len().min(32)]
-                            ),
-                        );
-                        break;
+                        }));
                     }
-                }
-            }
-            let consumed = inbuf.len() - cur.len();
-            if consumed > 0 {
-                inbuf.drain(..consumed);
-                if inbuf.is_empty() && inbuf.capacity() > 128 * 1024 {
-                    inbuf.shrink_to(64 * 1024);
+                    Message::Subframe {
+                        ts_us,
+                        x,
+                        y,
+                        w,
+                        h,
+                        stride,
+                        pixels,
+                        ..
+                    } => {
+                        frames_sub += 1;
+                        let received = frames_full + frames_sub;
+                        let now_us = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_micros() as u64;
+                        let one_way_us = now_us.saturating_sub(ts_us);
+                        total_bytes += pixels.len() as u64;
+                        if received <= 5 || received.is_multiple_of(30) {
+                            log_info(
+                                "gutted_client",
+                                &format!(
+                                    "SUBFRAME received frame={received} frames_full={frames_full} frames_sub={frames_sub} at=\"({x},{y})\" size=\"{w}x{h}\" bytes={} cum_bytes={wire_bytes} one_way_us={one_way_us}",
+                                    pixels.len()
+                                ),
+                            );
+                        }
+                        let _ = frames_tx.send(RenderEvent::Subframe(GfxSubframe {
+                            x: x as u32,
+                            y: y as u32,
+                            w: w as u32,
+                            h: h as u32,
+                            stride,
+                            pixels,
+                        }));
+                    }
+                    other => {
+                        if let Some(rev) = RenderEvent::from_proto_message(other) {
+                            let _ = frames_tx.send(rev);
+                        }
+                    }
+                },
+                Ok(None) => break,
+                Err(e) => {
+                    log_warn(
+                        "gutted_client",
+                        &format!(
+                            "Message::decode error: {e:?} buffered={}",
+                            decoder.buffered_len()
+                        ),
+                    );
+                    break;
                 }
             }
         }
@@ -384,7 +406,7 @@ pub fn net_main(
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
-                inbuf.extend_from_slice(&chunk[..n]);
+                decoder.push(&chunk[..n]);
                 wire_bytes += n as u64;
             }
             Err(_) => break,
@@ -426,31 +448,24 @@ pub fn net_main(
 #[cfg(feature = "std")]
 fn read_next_stream<R: Read>(
     recv: &mut R,
-    inbuf: &mut Vec<u8>,
+    decoder: &mut FrameDecoder,
     chunk: &mut [u8],
 ) -> Result<Option<Message>> {
     loop {
-        {
-            let mut cur = inbuf.as_slice();
-            match Message::decode(&mut cur) {
-                Ok(Some(msg)) => {
-                    let consumed = inbuf.len() - cur.len();
-                    inbuf.drain(..consumed);
-                    return Ok(Some(msg));
-                }
-                Ok(None) => {}
-                Err(e) => return Err(format!("decode error: {e:?}").into()),
-            }
+        match decoder.next_message() {
+            Ok(Some(msg)) => return Ok(Some(msg)),
+            Ok(None) => {}
+            Err(e) => return Err(format!("decode error: {e:?}").into()),
         }
         match recv.read(chunk)? {
             0 => {
-                return if inbuf.is_empty() {
+                return if decoder.buffered_len() == 0 {
                     Ok(None)
                 } else {
                     Err("stream ended mid-frame".into())
                 }
             }
-            n => inbuf.extend_from_slice(&chunk[..n]),
+            n => decoder.push(&chunk[..n]),
         }
     }
 }

@@ -432,6 +432,8 @@
           <button id="btn-zoom-in" class="zoom-btn" title="Zoom In (Ctrl++)">+</button>
         </div>
 
+        <button id="btn-upload" class="nav-btn" title="Upload File to Page (or Drag & Drop onto viewport)" style="font-size: 13px;">📤</button>
+        <input type="file" id="file-picker" style="display: none;">
         <button id="btn-clear-data" class="nav-btn" title="Clear Cookies & Cache" style="font-size: 12px;">🧹</button>
       </div>
 
@@ -475,7 +477,7 @@
         RAW_FRAME: 0x40, SUBFRAME: 0x41, AUDIO_FRAME: 0x48,
         CREATE_TAB: 0x70, CLOSE_TAB: 0x71, SWITCH_TAB: 0x72,
         TAB_CREATED: 0x73, TAB_CLOSED: 0x74, TAB_ACTIVATED: 0x75, TAB_TITLE: 0x76, TAB_URL: 0x77,
-        CLEAR_DATA: 0x80
+        CLEAR_DATA: 0x80, CLIPBOARD: 0x81, FILE_CHOOSER_PROMPT: 0x82, FILE_UPLOAD: 0x83, FILE_DOWNLOAD: 0x84
       };
 
       // ─── UI State & Elements ─────────────────────────────────────────
@@ -511,7 +513,7 @@
         if (!audioCtx) {
           const AudioContextClass = window.AudioContext || window.webkitAudioContext;
           if (AudioContextClass) {
-            audioCtx = new AudioContextClass({ sampleRate: 48000 });
+            audioCtx = new AudioContextClass({ sampleRate: 48000, latencyHint: 'interactive' });
           }
         }
         if (audioCtx && audioCtx.state === 'suspended') {
@@ -531,14 +533,23 @@
         if (numSamples <= 0) return;
 
         const audioBuf = actx.createBuffer(channels, numSamples, sampleRate);
-        const view = new DataView(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength);
-
-        for (let ch = 0; ch < channels; ch++) {
-          const channelData = audioBuf.getChannelData(ch);
-          for (let i = 0; i < numSamples; i++) {
-            const byteOff = (i * channels + ch) * 2;
-            const sample = view.getInt16(byteOff, true);
-            channelData[i] = sample / 32768.0;
+        const inv = 1.0 / 32768.0;
+        if (channels === 2 && (pcmBytes.byteOffset & 1) === 0) {
+          const i16 = new Int16Array(pcmBytes.buffer, pcmBytes.byteOffset, numSamples * 2);
+          const ch0 = audioBuf.getChannelData(0);
+          const ch1 = audioBuf.getChannelData(1);
+          for (let i = 0, j = 0; i < numSamples; i++, j += 2) {
+            ch0[i] = i16[j] * inv;
+            ch1[i] = i16[j + 1] * inv;
+          }
+        } else {
+          const view = new DataView(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength);
+          for (let ch = 0; ch < channels; ch++) {
+            const channelData = audioBuf.getChannelData(ch);
+            for (let i = 0; i < numSamples; i++) {
+              const byteOff = (i * channels + ch) * 2;
+              channelData[i] = view.getInt16(byteOff, true) * inv;
+            }
           }
         }
 
@@ -548,7 +559,10 @@
 
         const now = actx.currentTime;
         if (nextAudioTime < now) {
-          nextAudioTime = now + 0.01;
+          nextAudioTime = now + 0.008;
+        } else if (nextAudioTime > now + 0.09) {
+          // Clamp excessive drift/buffering so audio stays tightly synced to video & games
+          nextAudioTime = now + 0.015;
         }
         source.start(nextAudioTime);
         nextAudioTime += audioBuf.duration;
@@ -675,6 +689,99 @@
         }
       }
 
+      function lz4Decode(src) {
+        if (src.length < 4) return new Uint8Array(0);
+        const uncompLen = (src[0] | (src[1] << 8) | (src[2] << 16) | (src[3] << 24)) >>> 0;
+        const out = new Uint8Array(uncompLen);
+        let sp = 4, dp = 0;
+        while (sp < src.length) {
+          const token = src[sp++];
+          let litLen = token >>> 4;
+          if (litLen === 15) {
+            let b;
+            do { b = src[sp++]; litLen += b; } while (b === 255 && sp < src.length);
+          }
+          out.set(src.subarray(sp, sp + litLen), dp);
+          sp += litLen;
+          dp += litLen;
+          if (sp >= src.length) break;
+          const offset = src[sp] | (src[sp + 1] << 8);
+          sp += 2;
+          let matchLen = (token & 0x0f) + 4;
+          if ((token & 0x0f) === 15) {
+            let b;
+            do { b = src[sp++]; matchLen += b; } while (b === 255 && sp < src.length);
+          }
+          let mpos = dp - offset;
+          if (offset >= matchLen) {
+            out.copyWithin(dp, mpos, mpos + matchLen);
+            dp += matchLen;
+          } else {
+            for (let i = 0; i < matchLen; i++) out[dp++] = out[mpos++];
+          }
+        }
+        return out;
+      }
+
+      function spatialUnfilterSubInPlace(buf) {
+        for (let i = 4; i < buf.length; i += 4) {
+          buf[i]     = (buf[i]     + buf[i - 4]) & 0xff;
+          buf[i + 1] = (buf[i + 1] + buf[i - 3]) & 0xff;
+          buf[i + 2] = (buf[i + 2] + buf[i - 2]) & 0xff;
+          buf[i + 3] = (buf[i + 3] + buf[i - 1]) & 0xff;
+        }
+      }
+
+      function decodeFramePayload(comp, w, h, stride, raw) {
+        let decoded = raw;
+        if (comp === 1) {
+          decoded = lz4Decode(raw);
+        } else if (comp === 2) {
+          decoded = lz4Decode(lz4Decode(raw));
+          spatialUnfilterSubInPlace(decoded);
+        } else if (comp === 3) {
+          const qw = (w + 1) >> 1, qh = (h + 1) >> 1;
+          const qbuf = lz4Decode(raw);
+          spatialUnfilterSubInPlace(qbuf);
+          const out = new Uint8ClampedArray(w * h * 4);
+          for (let y = 0; y < h; y++) {
+            const qy0 = Math.min(y >> 1, qh - 1);
+            const qy1 = Math.min(qy0 + (y & 1), qh - 1);
+            const row0 = qy0 * qw * 4;
+            const row1 = qy1 * qw * 4;
+            for (let x = 0; x < w; x++) {
+              const qx0 = Math.min(x >> 1, qw - 1);
+              const qx1 = Math.min(qx0 + (x & 1), qw - 1);
+              const s00 = row0 + qx0 * 4, s10 = row0 + qx1 * 4;
+              const s01 = row1 + qx0 * 4, s11 = row1 + qx1 * 4;
+              const dOff = (y * w + x) * 4;
+              out[dOff]     = (qbuf[s00 + 2] + qbuf[s10 + 2] + qbuf[s01 + 2] + qbuf[s11 + 2] + 2) >> 2;
+              out[dOff + 1] = (qbuf[s00 + 1] + qbuf[s10 + 1] + qbuf[s01 + 1] + qbuf[s11 + 1] + 2) >> 2;
+              out[dOff + 2] = (qbuf[s00]     + qbuf[s10]     + qbuf[s01]     + qbuf[s11]     + 2) >> 2;
+              out[dOff + 3] = 255;
+            }
+          }
+          return out;
+        }
+        const pixelBytes = new Uint8ClampedArray(w * h * 4);
+        const rowLen = w * 4;
+        if (stride === rowLen) {
+          pixelBytes.set(decoded.subarray(0, w * h * 4));
+        } else {
+          for (let row = 0; row < h; row++) {
+            const srcOff = row * stride;
+            const dstOff = row * rowLen;
+            pixelBytes.set(decoded.subarray(srcOff, srcOff + rowLen), dstOff);
+          }
+        }
+        const u32 = new Uint32Array(pixelBytes.buffer);
+        for (let i = 0; i < u32.length; i++) {
+          const val = u32[i];
+          u32[i] = (val & 0xFF00FF00) | ((val >> 16) & 0xFF) | ((val & 0xFF) << 16) | 0xFF000000;
+        }
+        return pixelBytes;
+      }
+
       function handlePayload(tag, p) {
         const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
         switch (tag) {
@@ -682,6 +789,7 @@
             const w = dv.getUint16(8, true);
             const h = dv.getUint16(10, true);
             const stride = dv.getUint32(12, true);
+            const comp = dv.getUint8(20);
             const raw = p.subarray(21);
             if (canvas.width !== w || canvas.height !== h) {
               canvas.width = w;
@@ -691,24 +799,7 @@
               hudRes.textContent = `${w}×${h}`;
             }
 
-            const pixelBytes = new Uint8ClampedArray(w * h * 4);
-            const rowLen = w * 4;
-            if (stride === rowLen) {
-              pixelBytes.set(raw.subarray(0, w * h * 4));
-            } else {
-              for (let row = 0; row < h; row++) {
-                const srcOff = row * stride;
-                const dstOff = row * rowLen;
-                pixelBytes.set(raw.subarray(srcOff, srcOff + rowLen), dstOff);
-              }
-            }
-
-            // Fast BGRA -> RGBA in-place swap
-            const u32 = new Uint32Array(pixelBytes.buffer);
-            for (let i = 0; i < u32.length; i++) {
-              const val = u32[i];
-              u32[i] = (val & 0xFF00FF00) | ((val >> 16) & 0xFF) | ((val & 0xFF) << 16) | 0xFF000000;
-            }
+            const pixelBytes = decodeFramePayload(comp, w, h, stride, raw);
             const imgData = new ImageData(pixelBytes, w, h);
             ctx.putImageData(imgData, 0, 0);
             tabFrames.set(activeTabId, imgData);
@@ -721,26 +812,10 @@
             const w = dv.getUint16(12, true);
             const h = dv.getUint16(14, true);
             const stride = dv.getUint32(16, true);
+            const comp = dv.getUint8(24);
             const raw = p.subarray(25);
 
-            const pixelBytes = new Uint8ClampedArray(w * h * 4);
-            const rowLen = w * 4;
-            if (stride === rowLen) {
-              pixelBytes.set(raw.subarray(0, w * h * 4));
-            } else {
-              for (let row = 0; row < h; row++) {
-                const srcOff = row * stride;
-                const dstOff = row * rowLen;
-                pixelBytes.set(raw.subarray(srcOff, srcOff + rowLen), dstOff);
-              }
-            }
-
-            // Fast BGRA -> RGBA in-place swap
-            const u32 = new Uint32Array(pixelBytes.buffer);
-            for (let i = 0; i < u32.length; i++) {
-              const val = u32[i];
-              u32[i] = (val & 0xFF00FF00) | ((val >> 16) & 0xFF) | ((val & 0xFF) << 16) | 0xFF000000;
-            }
+            const pixelBytes = decodeFramePayload(comp, w, h, stride, raw);
             const imgData = new ImageData(pixelBytes, w, h);
             ctx.putImageData(imgData, x, y);
             updateFps();
@@ -824,7 +899,11 @@
             break;
           }
           case TAG.TAB_ACTIVATED: {
-            activeTabId = dv.getUint32(0, true);
+            const newTabId = dv.getUint32(0, true);
+            if (activeTabId !== newTabId && canvas.width > 0 && canvas.height > 0) {
+              tabFrames.set(activeTabId, ctx.getImageData(0, 0, canvas.width, canvas.height));
+            }
+            activeTabId = newTabId;
             restoreTabFrame(activeTabId);
             renderTabs();
             break;
@@ -852,7 +931,65 @@
             renderTabs();
             break;
           }
+          case TAG.FILE_CHOOSER_PROMPT: {
+            const tabId = dv.getUint32(0, true);
+            const multiple = dv.getUint8(4) !== 0;
+            const accept = readString(p, 5);
+            const picker = document.getElementById('file-picker');
+            picker.dataset.tabId = String(tabId || activeTabId);
+            picker.multiple = multiple;
+            picker.accept = accept || '';
+            picker.value = '';
+            picker.click();
+            break;
+          }
+          case TAG.FILE_DOWNLOAD: {
+            const nameInfo = readVarint(dv, 0);
+            if (nameInfo) {
+              const nameOff = nameInfo.bytesRead;
+              const filename = new TextDecoder().decode(p.subarray(nameOff, nameOff + nameInfo.value)) || 'download.bin';
+              const dataOff = nameOff + nameInfo.value;
+              const dataInfo = readVarint(dv, dataOff);
+              if (dataInfo) {
+                const bytesOff = dataOff + dataInfo.bytesRead;
+                const fileBytes = p.subarray(bytesOff, bytesOff + dataInfo.value);
+                const blob = new Blob([fileBytes], { type: 'application/octet-stream' });
+                const dlUrl = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = dlUrl;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                setTimeout(() => URL.revokeObjectURL(dlUrl), 15000);
+              }
+            }
+            break;
+          }
         }
+      }
+
+      async function sendFileUpload(file, targetTabId) {
+        if (!file) return;
+        const ab = await file.arrayBuffer();
+        const data = new Uint8Array(ab);
+        const nameBytes = new TextEncoder().encode(file.name || 'upload.bin');
+        const mimeBytes = new TextEncoder().encode(file.type || 'application/octet-stream');
+        const h1 = [], h2 = [], h3 = [];
+        writeVarint(h1, nameBytes.length);
+        writeVarint(h2, mimeBytes.length);
+        writeVarint(h3, data.length);
+        const total = 4 + h1.length + nameBytes.length + h2.length + mimeBytes.length + h3.length + data.length;
+        const payload = new Uint8Array(total);
+        new DataView(payload.buffer).setUint32(0, targetTabId || activeTabId, true);
+        let off = 4;
+        payload.set(h1, off); off += h1.length;
+        payload.set(nameBytes, off); off += nameBytes.length;
+        payload.set(h2, off); off += h2.length;
+        payload.set(mimeBytes, off); off += mimeBytes.length;
+        payload.set(h3, off); off += h3.length;
+        payload.set(data, off);
+        sendMsg(TAG.FILE_UPLOAD, payload);
       }
 
       function readString(p, off) {
@@ -995,18 +1132,31 @@
       }
 
       let lastMotion = 0;
+      let virtualX = 640, virtualY = 360;
       canvas.addEventListener('mousemove', (e) => {
         const now = performance.now();
-        if (now - lastMotion < 8) return;
+        if (now - lastMotion < 4) return;
         lastMotion = now;
-        const { x, y } = getCanvasCoords(e);
+        let x, y;
+        if (document.pointerLockElement === canvas) {
+          virtualX = Math.max(0, Math.min(frameWidth - 1, virtualX + Math.round(e.movementX)));
+          virtualY = Math.max(0, Math.min(frameHeight - 1, virtualY + Math.round(e.movementY)));
+          x = virtualX;
+          y = virtualY;
+        } else {
+          const coords = getCanvasCoords(e);
+          x = coords.x;
+          y = coords.y;
+          virtualX = x;
+          virtualY = y;
+        }
         let mods = getEventModifiers(e);
         if (e.buttons & 1) mods |= 1 << 20;
         if (e.buttons & 4) mods |= 1 << 21;
         if (e.buttons & 2) mods |= 1 << 22;
         const b = new Uint8Array(8 + 4 + 4 + 4);
         const dv = new DataView(b.buffer);
-        dv.setBigUint64(0, BigInt(Math.round(performance.now() * 1000)), true);
+        dv.setBigUint64(0, BigInt(Math.round(now * 1000)), true);
         dv.setInt32(8, x, true);
         dv.setInt32(12, y, true);
         dv.setUint32(16, mods, true);
@@ -1171,7 +1321,7 @@
           sendNavAction(2);
           return;
         }
-        if (e.key === 'Escape') {
+        if (e.key === 'Escape' && isLoading) {
           e.preventDefault();
           sendMsg(TAG.STOP, new Uint8Array(0));
           return;
@@ -1212,6 +1362,10 @@
         }
 
         const keycode = mapJsKeyToKeysym(e);
+        if (keycode === 0) return;
+        if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' ', 'Tab'].includes(e.key)) {
+          e.preventDefault();
+        }
         const mods = getEventModifiers(e);
 
         const b = new Uint8Array(8 + 4 + 4 + 1);
@@ -1226,6 +1380,7 @@
       window.addEventListener('keyup', (e) => {
         if (document.activeElement === urlInput) return;
         const keycode = mapJsKeyToKeysym(e);
+        if (keycode === 0) return;
         const mods = getEventModifiers(e);
 
         const b = new Uint8Array(8 + 4 + 4 + 1);
@@ -1240,8 +1395,10 @@
       function mapJsKeyToKeysym(e) {
         const map = {
           'Enter': 0xFF0D, 'Backspace': 0xFF08, 'Tab': 0xFF09, 'Escape': 0xFF1B,
-          'Delete': 0xFFFF, 'ArrowLeft': 0xFF51, 'ArrowUp': 0xFF52, 'ArrowRight': 0xFF53, 'ArrowDown': 0xFF54,
+          'Delete': 0xFFFF, 'Insert': 0xFF63,
+          'ArrowLeft': 0xFF51, 'ArrowUp': 0xFF52, 'ArrowRight': 0xFF53, 'ArrowDown': 0xFF54,
           'PageUp': 0xFF55, 'PageDown': 0xFF56, 'Home': 0xFF50, 'End': 0xFF57,
+          'Shift': 0xFFE1, 'Control': 0xFFE3, 'Alt': 0xFFE9, 'Meta': 0xFFEB, 'CapsLock': 0xFFE5,
           'F1': 0xFFBE, 'F2': 0xFFBF, 'F3': 0xFFC0, 'F4': 0xFFC1, 'F5': 0xFFC2, 'F6': 0xFFC3,
           'F7': 0xFFC4, 'F8': 0xFFC5, 'F9': 0xFFC6, 'F10': 0xFFC7, 'F11': 0xFFC8, 'F12': 0xFFC9
         };
@@ -1291,6 +1448,41 @@
           sendMsg(TAG.CLEAR_DATA, b);
         }
       };
+
+      const filePicker = document.getElementById('file-picker');
+      document.getElementById('btn-upload').onclick = () => {
+        filePicker.dataset.tabId = String(activeTabId);
+        filePicker.value = '';
+        filePicker.click();
+      };
+      filePicker.onchange = async () => {
+        const targetTab = parseInt(filePicker.dataset.tabId || String(activeTabId), 10) || activeTabId;
+        if (filePicker.files && filePicker.files.length > 0) {
+          await sendFileUpload(filePicker.files[0], targetTab);
+        }
+      };
+
+      // Drag & Drop File Upload onto Canvas
+      canvas.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'copy';
+      });
+      canvas.addEventListener('drop', async (e) => {
+        e.preventDefault();
+        if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+          await sendFileUpload(e.dataTransfer.files[0], activeTabId);
+        }
+      });
+
+      // Clipboard Paste into Remote Page
+      window.addEventListener('paste', (e) => {
+        if (document.activeElement === urlInput) return;
+        const text = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
+        if (text) {
+          e.preventDefault();
+          sendMsg(TAG.CLIPBOARD, encodeString(text));
+        }
+      });
 
       // Zoom
       zoomLabel.onclick = () => {

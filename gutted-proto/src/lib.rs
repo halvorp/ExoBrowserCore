@@ -16,7 +16,6 @@
 extern crate alloc;
 
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 
 // ─── Tags ─────────────────────────────────────────────────────────────────
@@ -86,8 +85,12 @@ pub mod tag {
     pub const TAB_TITLE:      u32 = 0x76;
     pub const TAB_URL:        u32 = 0x77;
 
-    // Cookie & Data management
-    pub const CLEAR_DATA:     u32 = 0x80;
+    // Cookie, Clipboard & File Transfer management
+    pub const CLEAR_DATA:          u32 = 0x80;
+    pub const CLIPBOARD:           u32 = 0x81;
+    pub const FILE_CHOOSER_PROMPT: u32 = 0x82;
+    pub const FILE_UPLOAD:         u32 = 0x83;
+    pub const FILE_DOWNLOAD:       u32 = 0x84;
 
     // Remote Auth
     pub const AUTH_CHALLENGE: u32 = 0x90;
@@ -451,6 +454,28 @@ pub enum Message {
         clear_cache: bool,
         clear_storage: bool,
     },
+    /// Bidirectional clipboard text synchronization (copy/cut/paste between client & webpage)
+    Clipboard {
+        text: String,
+    },
+    /// Host → client: webpage opened an `<input type="file">` chooser
+    FileChooserPrompt {
+        tab_id: u32,
+        multiple: bool,
+        accept_mimes: String,
+    },
+    /// Client → host: upload a selected or dragged-and-dropped file into the webpage
+    FileUpload {
+        tab_id: u32,
+        filename: String,
+        mime_type: String,
+        data: Vec<u8>,
+    },
+    /// Host → client: deliver a downloaded file to the client
+    FileDownload {
+        filename: String,
+        data: Vec<u8>,
+    },
     /// Host → client: cryptographic auth challenge nonce
     AuthChallenge {
         nonce: [u8; 32],
@@ -571,13 +596,67 @@ pub const PROTO_VERSION: u32 = 1;
 // ─── Encode ──────────────────────────────────────────────────────────────-
 
 impl Message {
-    /// Encode as a single wire frame: tag | len | payload.
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    /// Encode a `RawFrame` directly from a pixel slice without allocating an owned `Message`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_raw_frame_from_slice(
+        out: &mut Vec<u8>,
+        ts_us: u64,
+        width: u16,
+        height: u16,
+        stride: u32,
+        format: u32,
+        compression: u8,
+        pixels: &[u8],
+    ) {
+        Self::encode_with_tag_and_payload(out, tag::RAW_FRAME, |out| {
+            write_u64(out, ts_us);
+            write_u16(out, width);
+            write_u16(out, height);
+            write_u32(out, stride);
+            write_u32(out, format);
+            write_u8_(out, compression);
+            write_payload_geom(out, compression, width, height, pixels);
+        });
+    }
+
+    /// Encode a `Subframe` directly from a pixel slice without allocating an owned `Message`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_subframe_from_slice(
+        out: &mut Vec<u8>,
+        ts_us: u64,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        stride: u32,
+        format: u32,
+        compression: u8,
+        pixels: &[u8],
+    ) {
+        Self::encode_with_tag_and_payload(out, tag::SUBFRAME, |out| {
+            write_u64(out, ts_us);
+            write_u16(out, x);
+            write_u16(out, y);
+            write_u16(out, w);
+            write_u16(out, h);
+            write_u32(out, stride);
+            write_u32(out, format);
+            write_u8_(out, compression);
+            write_payload_geom(out, compression, w, h, pixels);
+        });
+    }
+
+    #[inline]
+    fn encode_with_tag_and_payload<F: FnOnce(&mut Vec<u8>)>(
+        out: &mut Vec<u8>,
+        tag_val: u32,
+        f: F,
+    ) {
         let start = out.len();
-        write_varint(out, self.tag());
+        write_varint(out, tag_val);
         let len_pos = out.len();
         out.push(0); // optimistic 1-byte varint placeholder (<128 B payload)
-        self.encode_payload(out);
+        f(out);
         let payload_len = out.len() - (len_pos + 1);
         if payload_len < 0x80 {
             out[len_pos] = payload_len as u8;
@@ -602,6 +681,11 @@ impl Message {
             out[len_pos..len_pos + n].copy_from_slice(&len_buf[..n]);
         }
         debug_assert!(out.len() > start);
+    }
+
+    /// Encode as a single wire frame: tag | len | payload.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        Self::encode_with_tag_and_payload(out, self.tag(), |out| self.encode_payload(out));
     }
 
     fn tag(&self) -> u32 {
@@ -643,6 +727,10 @@ impl Message {
             Message::TabTitle { .. }     => tag::TAB_TITLE,
             Message::TabUrl { .. }       => tag::TAB_URL,
             Message::ClearData { .. }    => tag::CLEAR_DATA,
+            Message::Clipboard { .. }    => tag::CLIPBOARD,
+            Message::FileChooserPrompt { .. } => tag::FILE_CHOOSER_PROMPT,
+            Message::FileUpload { .. }   => tag::FILE_UPLOAD,
+            Message::FileDownload { .. } => tag::FILE_DOWNLOAD,
             Message::AuthChallenge { .. } => tag::AUTH_CHALLENGE,
             Message::AuthResponse { .. } => tag::AUTH_RESPONSE,
             Message::AuthSuccess { .. }  => tag::AUTH_SUCCESS,
@@ -835,6 +923,26 @@ impl Message {
                 write_u8_(out, if *clear_cookies { 1 } else { 0 });
                 write_u8_(out, if *clear_cache { 1 } else { 0 });
                 write_u8_(out, if *clear_storage { 1 } else { 0 });
+            }
+            Message::Clipboard { text } => {
+                write_str(out, text);
+            }
+            Message::FileChooserPrompt { tab_id, multiple, accept_mimes } => {
+                write_u32(out, *tab_id);
+                write_u8_(out, if *multiple { 1 } else { 0 });
+                write_str(out, accept_mimes);
+            }
+            Message::FileUpload { tab_id, filename, mime_type, data } => {
+                write_u32(out, *tab_id);
+                write_str(out, filename);
+                write_str(out, mime_type);
+                write_varint(out, data.len() as u32);
+                out.extend_from_slice(data);
+            }
+            Message::FileDownload { filename, data } => {
+                write_str(out, filename);
+                write_varint(out, data.len() as u32);
+                out.extend_from_slice(data);
             }
             Message::AuthChallenge { nonce } => {
                 out.extend_from_slice(nonce);
@@ -1089,6 +1197,32 @@ impl Message {
                 let clear_storage = read_u8_(p)? != 0;
                 Message::ClearData { clear_cookies, clear_cache, clear_storage }
             }
+            tag::CLIPBOARD => {
+                let text = read_str(p)?;
+                Message::Clipboard { text }
+            }
+            tag::FILE_CHOOSER_PROMPT => {
+                let tab_id = read_u32(p)?;
+                let multiple = read_u8_(p)? != 0;
+                let accept_mimes = read_str(p)?;
+                Message::FileChooserPrompt { tab_id, multiple, accept_mimes }
+            }
+            tag::FILE_UPLOAD => {
+                let tab_id = read_u32(p)?;
+                let filename = read_str(p)?;
+                let mime_type = read_str(p)?;
+                let len = read_varint(p)? as usize;
+                let data = p.get(..len).ok_or(Error::LengthOverflow)?.to_vec();
+                *p = &p[len..];
+                Message::FileUpload { tab_id, filename, mime_type, data }
+            }
+            tag::FILE_DOWNLOAD => {
+                let filename = read_str(p)?;
+                let len = read_varint(p)? as usize;
+                let data = p.get(..len).ok_or(Error::LengthOverflow)?.to_vec();
+                *p = &p[len..];
+                Message::FileDownload { filename, data }
+            }
             tag::AUTH_CHALLENGE => {
                 let bytes = p.get(..32).ok_or(Error::UnexpectedEof)?;
                 let mut nonce = [0u8; 32];
@@ -1223,62 +1357,132 @@ pub mod compression {
     pub const LZ4_DELTA_Q2: u8 = 3;
 }
 
+#[inline(always)]
+fn avg_bgra_u32(a: u32, b: u32) -> u32 {
+    (a & b).wrapping_add(((a ^ b) & 0xFEFE_FEFE) >> 1)
+}
+
 /// Downsample a tightly-packed `w * h * 4` BGRA8 buffer by 2x horizontally and vertically
-/// (`qw = w.div_ceil(2)`, `qh = h.div_ceil(2)`) using 2x2 box-averaging.
+/// (`qw = w.div_ceil(2)`, `qh = h.div_ceil(2)`) using 2x2 SWAR box-averaging.
 pub fn downsample_2x2_bgra(src: &[u8], w: usize, h: usize, out: &mut Vec<u8>) {
     let qw = w.div_ceil(2);
     let qh = h.div_ceil(2);
-    out.clear();
-    out.reserve(qw * qh * 4);
+    if w == 0 || h == 0 || src.len() < w * h * 4 {
+        out.clear();
+        return;
+    }
+    out.resize(qw * qh * 4, 0);
+    let (dst_chunks, _) = out.as_chunks_mut::<4>();
     let stride = w * 4;
     for qy in 0..qh {
         let y0 = qy * 2;
-        let y1 = (y0 + 1).min(h.saturating_sub(1));
-        let row0 = &src[y0 * stride..y0 * stride + stride];
-        let row1 = &src[y1 * stride..y1 * stride + stride];
-        for qx in 0..qw {
+        let y1 = (y0 + 1).min(h - 1);
+        let (row0, _) = src[y0 * stride..y0 * stride + stride].as_chunks::<4>();
+        let (row1, _) = src[y1 * stride..y1 * stride + stride].as_chunks::<4>();
+        let dst_row = &mut dst_chunks[qy * qw..(qy + 1) * qw];
+        for (qx, dst) in dst_row.iter_mut().enumerate() {
             let x0 = qx * 2;
-            let x1 = (x0 + 1).min(w.saturating_sub(1));
-            let p00 = &row0[x0 * 4..x0 * 4 + 4];
-            let p10 = &row0[x1 * 4..x1 * 4 + 4];
-            let p01 = &row1[x0 * 4..x0 * 4 + 4];
-            let p11 = &row1[x1 * 4..x1 * 4 + 4];
-            out.push(((p00[0] as u16 + p10[0] as u16 + p01[0] as u16 + p11[0] as u16 + 2) >> 2) as u8);
-            out.push(((p00[1] as u16 + p10[1] as u16 + p01[1] as u16 + p11[1] as u16 + 2) >> 2) as u8);
-            out.push(((p00[2] as u16 + p10[2] as u16 + p01[2] as u16 + p11[2] as u16 + 2) >> 2) as u8);
-            out.push(0xFF);
+            let x1 = (x0 + 1).min(w - 1);
+            let p00 = u32::from_le_bytes(row0[x0]);
+            let p10 = u32::from_le_bytes(row0[x1]);
+            let p01 = u32::from_le_bytes(row1[x0]);
+            let p11 = u32::from_le_bytes(row1[x1]);
+            let avg = avg_bgra_u32(avg_bgra_u32(p00, p10), avg_bgra_u32(p01, p11)) | 0xFF00_0000;
+            *dst = avg.to_le_bytes();
         }
     }
 }
 
-/// Upsample a `qw * qh * 4` BGRA8 buffer back to `w * h * 4` (`stride = w * 4`) using fast bilinear interpolation.
+/// Fused single-pass 2x2 SWAR box-downsampling + horizontal spatial-delta filtering.
+/// Eliminates the intermediate downsampled buffer allocation and second memory pass on `LZ4_DELTA_Q2`.
+pub fn downsample_and_delta_2x2_bgra(src: &[u8], w: usize, h: usize, out: &mut Vec<u8>) {
+    let qw = w.div_ceil(2);
+    let qh = h.div_ceil(2);
+    if w == 0 || h == 0 || src.len() < w * h * 4 {
+        out.clear();
+        return;
+    }
+    out.resize(qw * qh * 4, 0);
+    let (dst_chunks, _) = out.as_chunks_mut::<4>();
+    let stride = w * 4;
+    let mut prev = [0u8; 4];
+    for qy in 0..qh {
+        let y0 = qy * 2;
+        let y1 = (y0 + 1).min(h - 1);
+        let (row0, _) = src[y0 * stride..y0 * stride + stride].as_chunks::<4>();
+        let (row1, _) = src[y1 * stride..y1 * stride + stride].as_chunks::<4>();
+        let dst_row = &mut dst_chunks[qy * qw..(qy + 1) * qw];
+        for (qx, dst) in dst_row.iter_mut().enumerate() {
+            let x0 = qx * 2;
+            let x1 = (x0 + 1).min(w - 1);
+            let p00 = u32::from_le_bytes(row0[x0]);
+            let p10 = u32::from_le_bytes(row0[x1]);
+            let p01 = u32::from_le_bytes(row1[x0]);
+            let p11 = u32::from_le_bytes(row1[x1]);
+            let avg = avg_bgra_u32(avg_bgra_u32(p00, p10), avg_bgra_u32(p01, p11)) | 0xFF00_0000;
+            let curr = avg.to_le_bytes();
+            *dst = [
+                curr[0].wrapping_sub(prev[0]),
+                curr[1].wrapping_sub(prev[1]),
+                curr[2].wrapping_sub(prev[2]),
+                curr[3].wrapping_sub(prev[3]),
+            ];
+            prev = curr;
+        }
+    }
+}
+
+/// Upsample a `qw * qh * 4` BGRA8 buffer back to `w * h * 4` (`stride = w * 4`) using fast SWAR bilinear interpolation.
+/// Processes horizontal 2-pixel pairs without per-pixel `(x & 1)` branches and reuses vertical averages across pairs.
 pub fn upsample_2x2_bgra(qsrc: &[u8], w: usize, h: usize) -> Vec<u8> {
     let qw = w.div_ceil(2);
     let qh = h.div_ceil(2);
-    let mut out = vec![0u8; w * h * 4];
+    let total = w.saturating_mul(h).saturating_mul(4);
+    let mut out = alloc::vec![0u8; total];
     if qw == 0 || qh == 0 || qsrc.len() < qw * qh * 4 {
         return out;
     }
+    let (dst_chunks, _) = out.as_chunks_mut::<4>();
     let qstride = qw * 4;
-    let dstride = w * 4;
+    let pairs = w / 2;
     for y in 0..h {
         let qy0 = (y / 2).min(qh - 1);
         let qy1 = (qy0 + (y & 1)).min(qh - 1);
-        let qrow0 = &qsrc[qy0 * qstride..qy0 * qstride + qstride];
-        let qrow1 = &qsrc[qy1 * qstride..qy1 * qstride + qstride];
-        let drow = &mut out[y * dstride..y * dstride + dstride];
-        for x in 0..w {
-            let qx0 = (x / 2).min(qw - 1);
-            let qx1 = (qx0 + (x & 1)).min(qw - 1);
-            let p00 = &qrow0[qx0 * 4..qx0 * 4 + 4];
-            let p10 = &qrow0[qx1 * 4..qx1 * 4 + 4];
-            let p01 = &qrow1[qx0 * 4..qx0 * 4 + 4];
-            let p11 = &qrow1[qx1 * 4..qx1 * 4 + 4];
-            let dst = &mut drow[x * 4..x * 4 + 4];
-            dst[0] = ((p00[0] as u16 + p10[0] as u16 + p01[0] as u16 + p11[0] as u16 + 2) >> 2) as u8;
-            dst[1] = ((p00[1] as u16 + p10[1] as u16 + p01[1] as u16 + p11[1] as u16 + 2) >> 2) as u8;
-            dst[2] = ((p00[2] as u16 + p10[2] as u16 + p01[2] as u16 + p11[2] as u16 + 2) >> 2) as u8;
-            dst[3] = 0xFF;
+        let (qrow0, _) = qsrc[qy0 * qstride..qy0 * qstride + qstride].as_chunks::<4>();
+        let (qrow1, _) = qsrc[qy1 * qstride..qy1 * qstride + qstride].as_chunks::<4>();
+        let dst_row = &mut dst_chunks[y * w..(y + 1) * w];
+        let (dst_pairs, dst_rem) = dst_row[..pairs * 2].as_chunks_mut::<2>();
+        debug_assert!(dst_rem.is_empty());
+        if (y & 1) == 0 {
+            let mut p00 = u32::from_le_bytes(qrow0[0]) | 0xFF00_0000;
+            for (qx, pair) in dst_pairs.iter_mut().enumerate() {
+                let qx1 = (qx + 1).min(qw - 1);
+                let p10 = u32::from_le_bytes(qrow0[qx1]) | 0xFF00_0000;
+                pair[0] = p00.to_le_bytes();
+                pair[1] = (avg_bgra_u32(p00, p10) | 0xFF00_0000).to_le_bytes();
+                p00 = p10;
+            }
+            if (w & 1) != 0 {
+                dst_row[w - 1] = p00.to_le_bytes();
+            }
+        } else {
+            let mut v0 = avg_bgra_u32(
+                u32::from_le_bytes(qrow0[0]),
+                u32::from_le_bytes(qrow1[0]),
+            ) | 0xFF00_0000;
+            for (qx, pair) in dst_pairs.iter_mut().enumerate() {
+                let qx1 = (qx + 1).min(qw - 1);
+                let v1 = avg_bgra_u32(
+                    u32::from_le_bytes(qrow0[qx1]),
+                    u32::from_le_bytes(qrow1[qx1]),
+                ) | 0xFF00_0000;
+                pair[0] = v0.to_le_bytes();
+                pair[1] = (avg_bgra_u32(v0, v1) | 0xFF00_0000).to_le_bytes();
+                v0 = v1;
+            }
+            if (w & 1) != 0 {
+                dst_row[w - 1] = v0.to_le_bytes();
+            }
         }
     }
     out
@@ -1296,11 +1500,9 @@ fn write_payload_geom(out: &mut Vec<u8>, compression: u8, w: u16, h: u16, pixels
             lz4_encode_into(&stage1, out);
         }
         3 => {
-            let mut down = Vec::new();
-            downsample_2x2_bgra(pixels, w as usize, h as usize, &mut down);
-            let mut filtered = Vec::with_capacity(down.len());
-            spatial_filter_sub_into(&down, &mut filtered);
-            lz4_encode_into(&filtered, out);
+            let mut filtered_down = Vec::new();
+            downsample_and_delta_2x2_bgra(pixels, w as usize, h as usize, &mut filtered_down);
+            lz4_encode_into(&filtered_down, out);
         }
         other => panic!("gutted-proto: unknown compression {other} on encode"),
     }
@@ -1341,18 +1543,20 @@ fn read_payload_geom(
 }
 
 fn spatial_filter_sub_into(pixels: &[u8], out: &mut Vec<u8>) {
-    out.resize(pixels.len(), 0);
     let (src_chunks, _) = pixels.as_chunks::<4>();
+    out.resize(src_chunks.len() * 4, 0);
+    if src_chunks.is_empty() {
+        return;
+    }
     let (dst_chunks, _) = out.as_chunks_mut::<4>();
-    if src_chunks.is_empty() { return; }
     dst_chunks[0] = src_chunks[0];
-    let mut prev = src_chunks[0];
-    for (&curr, dst) in src_chunks[1..].iter().zip(&mut dst_chunks[1..]) {
-        dst[0] = curr[0].wrapping_sub(prev[0]);
-        dst[1] = curr[1].wrapping_sub(prev[1]);
-        dst[2] = curr[2].wrapping_sub(prev[2]);
-        dst[3] = curr[3].wrapping_sub(prev[3]);
-        prev = curr;
+    for ((&prev, &curr), dst) in src_chunks.iter().zip(&src_chunks[1..]).zip(&mut dst_chunks[1..]) {
+        *dst = [
+            curr[0].wrapping_sub(prev[0]),
+            curr[1].wrapping_sub(prev[1]),
+            curr[2].wrapping_sub(prev[2]),
+            curr[3].wrapping_sub(prev[3]),
+        ];
     }
 }
 
@@ -1546,18 +1750,18 @@ pub fn lz4_decode(src: &[u8], expected_len: Option<usize>) -> Result<Vec<u8>> {
             out.resize(out.len() + match_len, b);
         } else if offset == 4 {
             let pat = [out[start], out[start + 1], out[start + 2], out[start + 3]];
-            let full_words = match_len / 4;
-            let rem = match_len % 4;
-            out.reserve(match_len);
-            for _ in 0..full_words {
-                out.extend_from_slice(&pat);
-            }
-            out.extend_from_slice(&pat[..rem]);
+            let old_len = out.len();
+            out.resize(old_len + match_len, 0);
+            let (chunks, tail) = out[old_len..].as_chunks_mut::<4>();
+            chunks.fill(pat);
+            tail.copy_from_slice(&pat[..tail.len()]);
         } else {
             out.reserve(match_len);
-            for i in 0..match_len {
-                let b = out[start + i];
-                out.push(b);
+            let mut rem = match_len;
+            while rem > 0 {
+                let copy_len = rem.min(out.len() - start);
+                out.extend_from_within(start..start + copy_len);
+                rem -= copy_len;
             }
         }
     }
@@ -1566,6 +1770,85 @@ pub fn lz4_decode(src: &[u8], expected_len: Option<usize>) -> Result<Vec<u8>> {
         return Err(Error::InvalidValue);
     }
     Ok(out)
+}
+
+// ─── Zero-Copy Cursor Streaming FrameDecoder (no_std + alloc) ─────────────
+
+const COMPACT_THRESHOLD: usize = 64 * 1024;
+
+/// Streaming frame decoder with an internal cursor that avoids quadratic
+/// `Vec::drain(..consumed)` copies when partial frames arrive over a byte stream.
+#[derive(Debug, Default)]
+pub struct FrameDecoder {
+    buf: Vec<u8>,
+    cursor: usize,
+}
+
+impl FrameDecoder {
+    pub fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(64 * 1024),
+            cursor: 0,
+        }
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(cap),
+            cursor: 0,
+        }
+    }
+
+    /// Append raw bytes received from the transport (TCP, QUIC, IPC ring buffer, etc.).
+    #[inline]
+    pub fn push(&mut self, data: &[u8]) {
+        if self.cursor > 0 && self.cursor == self.buf.len() {
+            self.buf.clear();
+            self.cursor = 0;
+        }
+        self.buf.extend_from_slice(data);
+    }
+
+    /// Decode the next complete `Message` from the internal buffer, or `Ok(None)` if
+    /// more bytes are needed.
+    pub fn next_message(&mut self) -> Result<Option<Message>> {
+        let unparsed = &self.buf[self.cursor..];
+        if unparsed.is_empty() {
+            self.buf.clear();
+            self.cursor = 0;
+            return Ok(None);
+        }
+        let mut slice = unparsed;
+        match Message::decode(&mut slice)? {
+            Some(msg) => {
+                let consumed = unparsed.len() - slice.len();
+                self.cursor += consumed;
+                if self.cursor == self.buf.len() {
+                    self.buf.clear();
+                    self.cursor = 0;
+                } else if self.cursor >= COMPACT_THRESHOLD && self.cursor * 2 >= self.buf.len() {
+                    self.buf.copy_within(self.cursor.., 0);
+                    self.buf.truncate(self.buf.len() - self.cursor);
+                    self.cursor = 0;
+                }
+                Ok(Some(msg))
+            }
+            None => {
+                if self.cursor >= COMPACT_THRESHOLD {
+                    self.buf.copy_within(self.cursor.., 0);
+                    self.buf.truncate(self.buf.len() - self.cursor);
+                    self.cursor = 0;
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Unparsed bytes currently buffered.
+    #[inline]
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len() - self.cursor
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────
@@ -2036,5 +2319,29 @@ mod tests {
             }
             _ => panic!("expected Subframe"),
         }
+    }
+
+    #[test]
+    fn frame_decoder_partial_and_compaction() {
+        let mut wire = Vec::new();
+        let msgs = vec![
+            Message::Heartbeat { ts_us: 10 },
+            Message::Nav { url: "https://gutted.example/test".into() },
+            Message::TabTitle { tab_id: 1, title: "Title".into() },
+        ];
+        for m in &msgs {
+            m.encode(&mut wire);
+        }
+
+        let mut dec = FrameDecoder::new();
+        let mut decoded = Vec::new();
+        for &b in &wire {
+            dec.push(&[b]);
+            while let Some(m) = dec.next_message().unwrap() {
+                decoded.push(m);
+            }
+        }
+        assert_eq!(decoded, msgs);
+        assert_eq!(dec.buffered_len(), 0);
     }
 }

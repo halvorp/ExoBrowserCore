@@ -25,18 +25,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 use tracing::{error, info, warn};
 
+#[derive(Clone, Copy, Debug)]
+pub enum BusMeta {
+    RawFrame,
+    Subframe { x: u16, y: u16, w: u16, h: u16 },
+    Other,
+}
+
 #[derive(Clone)]
 pub struct BusItem {
-    pub msg: Arc<Message>,
+    pub meta: BusMeta,
     pub wire_quic: Bytes,
 }
 
 /// Fan-out for WPE frames.
 ///
-/// Pre-encodes each published message once into `wire_quic` so multiple QUIC
-/// subscribers write directly without re-running spatial filtering or ZSTD
-/// compression. `snapshot()` always reads the active tab's latest full
-/// framebuffer from `last_frames`.
+/// Pre-encodes each published message once into `wire_quic` so multiple QUIC,
+/// TCP, and WebSocket subscribers write directly without re-running spatial
+/// filtering or LZ4 compression, and without retaining multi-megabyte raw
+/// pixel buffers in the broadcast ring.
 #[derive(Clone)]
 pub struct FrameBus {
     last_frames: Arc<StdMutex<HashMap<u32, wpe::Frame>>>,
@@ -53,22 +60,101 @@ impl FrameBus {
         Self { last_frames, active_tab_id, tx }
     }
 
-    fn encode_item(msg: Arc<Message>) -> BusItem {
-        let cap = match &*msg {
-            Message::RawFrame { pixels, .. } | Message::Subframe { pixels, .. } => 32 + pixels.len() / 2,
-            _ => 64,
+    fn encode_msg(msg: &Message) -> BusItem {
+        let meta = match msg {
+            Message::RawFrame { .. } => BusMeta::RawFrame,
+            Message::Subframe { x, y, w, h, .. } => BusMeta::Subframe {
+                x: *x,
+                y: *y,
+                w: *w,
+                h: *h,
+            },
+            _ => BusMeta::Other,
         };
-        let mut buf = Vec::with_capacity(cap);
+        let mut buf = Vec::with_capacity(64);
         msg.encode(&mut buf);
-        BusItem { msg, wire_quic: Bytes::from(buf) }
+        BusItem {
+            meta,
+            wire_quic: Bytes::from(buf),
+        }
     }
 
     fn publish(&self, msg: Arc<Message>) {
         if self.tx.receiver_count() == 0 {
             return;
         }
-        let item = Self::encode_item(msg);
-        let _ = self.tx.send(item);
+        let _ = self.tx.send(Self::encode_msg(&msg));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_raw_frame(
+        &self,
+        ts_us: u64,
+        width: u16,
+        height: u16,
+        stride: u32,
+        format: u32,
+        compression: u8,
+        pixels: &[u8],
+    ) {
+        if self.tx.receiver_count() == 0 {
+            return;
+        }
+        let mut buf = Vec::with_capacity(64 + pixels.len() / 8);
+        Message::encode_raw_frame_from_slice(
+            &mut buf,
+            ts_us,
+            width,
+            height,
+            stride,
+            format,
+            compression,
+            pixels,
+        );
+        let _ = self.tx.send(BusItem {
+            meta: BusMeta::RawFrame,
+            wire_quic: Bytes::from(buf),
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_subframe(
+        &self,
+        ts_us: u64,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        stride: u32,
+        format: u32,
+        compression: u8,
+        pixels: &[u8],
+    ) {
+        if self.tx.receiver_count() == 0 {
+            return;
+        }
+        let mut buf = Vec::with_capacity(64 + pixels.len() / 4);
+        Message::encode_subframe_from_slice(
+            &mut buf,
+            ts_us,
+            x,
+            y,
+            w,
+            h,
+            stride,
+            format,
+            compression,
+            pixels,
+        );
+        let _ = self.tx.send(BusItem {
+            meta: BusMeta::Subframe { x, y, w, h },
+            wire_quic: Bytes::from(buf),
+        });
+    }
+
+    #[inline]
+    pub fn has_subscribers(&self) -> bool {
+        self.tx.receiver_count() > 0
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<BusItem> {
@@ -82,17 +168,69 @@ impl FrameBus {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64;
-        let msg = Arc::new(Message::RawFrame {
+        let mut buf = Vec::with_capacity(64 + f.pixels.len() / 8);
+        Message::encode_raw_frame_from_slice(
+            &mut buf,
             ts_us,
-            width: f.width as u16,
-            height: f.height as u16,
-            stride: f.stride as u32,
-            format: f.format,
-            compression: gutted_proto::compression::ZSTD,
-            pixels: f.pixels,
-        });
-        Some(Self::encode_item(msg))
+            f.width as u16,
+            f.height as u16,
+            f.stride as u32,
+            f.format,
+            gutted_proto::compression::ZSTD,
+            &f.pixels,
+        );
+        Some(BusItem {
+            meta: BusMeta::RawFrame,
+            wire_quic: Bytes::from(buf),
+        })
     }
+}
+
+/// Drain all immediately available items from `rx` and coalesce superseded
+/// `RawFrame`/`Subframe` updates across the entire batch (even when `AudioFrame`
+/// or control messages are interleaved between video frames).
+pub fn coalesce_bus_batch(
+    first: BusItem,
+    rx: &mut broadcast::Receiver<BusItem>,
+) -> Vec<BusItem> {
+    let mut batch = Vec::with_capacity(8);
+    batch.push(first);
+    while let Ok(newer) = rx.try_recv() {
+        match newer.meta {
+            BusMeta::RawFrame => {
+                batch.retain(|old| !matches!(old.meta, BusMeta::RawFrame | BusMeta::Subframe { .. }));
+            }
+            BusMeta::Subframe {
+                x: x2,
+                y: y2,
+                w: w2,
+                h: h2,
+            } => {
+                let nx0 = x2 as u32;
+                let ny0 = y2 as u32;
+                let nx1 = nx0 + (w2 as u32);
+                let ny1 = ny0 + (h2 as u32);
+                batch.retain(|old| match old.meta {
+                    BusMeta::Subframe {
+                        x: x1,
+                        y: y1,
+                        w: w1,
+                        h: h1,
+                    } => {
+                        let ox0 = x1 as u32;
+                        let oy0 = y1 as u32;
+                        let ox1 = ox0 + (w1 as u32);
+                        let oy1 = oy0 + (h1 as u32);
+                        !(nx0 <= ox0 && ny0 <= oy0 && nx1 >= ox1 && ny1 >= oy1)
+                    }
+                    _ => true,
+                });
+            }
+            BusMeta::Other => {}
+        }
+        batch.push(newer);
+    }
+    batch
 }
 
 const ALPN: &[u8] = b"gbrowser/1";
@@ -120,20 +258,20 @@ async fn main() -> Result<()> {
 
     let (server_cfg, cert_der) = make_self_signed_config()?;
     let pin_hex = hex_sha256(&cert_der);
-    println!("GBROWSER_CERT_SHA256={pin_hex}");
-    info!(GBROWSER_CERT_SHA256 = %pin_hex, "cert pin (pass to client)");
 
     let endpoint = Endpoint::server(server_cfg, addr).context("bind quic endpoint")?;
-    info!(listen = %addr, "gutted-host listening");
+    let tcp_listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .context("bind tcp listener")?;
 
     let initial_url = std::env::var("GBROWSER_URL").unwrap_or_else(|_| "https://example.com".into());
     let host_state = HostState::new(&initial_url).await;
 
     // Spawn built-in Web Client Server (HTTP + WebSocket)
-    let http_addr: SocketAddr = std::env::var("GBROWSER_HTTP_LISTEN")
-        .unwrap_or_else(|_| DEFAULT_HTTP_ADDR.into())
-        .parse()
-        .context("parse http listen addr")?;
+    let http_addr_raw = std::env::var("GBROWSER_HTTP_LISTEN")
+        .or_else(|_| std::env::var("GBROWSER_WEB_LISTEN"))
+        .unwrap_or_else(|_| DEFAULT_HTTP_ADDR.into());
+    let http_addr: SocketAddr = http_addr_raw.parse().context("parse http listen addr")?;
     let host_state_web = host_state.clone();
     tokio::spawn(async move {
         if let Err(e) = web::run_web_server(http_addr, host_state_web).await {
@@ -142,9 +280,6 @@ async fn main() -> Result<()> {
     });
 
     // Spawn C-free Pure-Rust Framed TCP listener on the same port (TCP :4433 alongside UDP :4433 QUIC)
-    let tcp_listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .context("bind tcp listener")?;
     info!(listen = %addr, "gutted-host TCP stream listener ready (Redox/relibc & C-free clients)");
     let host_state_tcp = host_state.clone();
     tokio::spawn(async move {
@@ -157,6 +292,11 @@ async fn main() -> Result<()> {
             });
         }
     });
+
+    // Print readiness token AFTER WPE WebKit, QUIC, and TCP listeners are bound and ready
+    println!("GBROWSER_CERT_SHA256={pin_hex}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    info!(GBROWSER_CERT_SHA256 = %pin_hex, listen = %addr, "gutted-host listening");
 
     while let Some(incoming) = endpoint.accept().await {
         let host_state = host_state.clone();
@@ -193,8 +333,19 @@ struct HostState {
 impl HostState {
     async fn new(initial_url: &str) -> Self {
         init_pulse_null_sink();
-        let (runner, wpe::WpeChannels { mut frames, mut loads, mut cursors, mut titles, mut urls }) =
-            wpe::WpeRunner::start(initial_url, 1280, 648);
+        let active_tab_id = Arc::new(AtomicU32::new(1));
+        let (
+            runner,
+            wpe::WpeChannels {
+                mut frames,
+                mut loads,
+                mut cursors,
+                mut titles,
+                mut urls,
+                mut file_choosers,
+                mut downloads,
+            },
+        ) = wpe::WpeRunner::start(initial_url, 1280, 648, active_tab_id.clone());
         let runner = Arc::new(runner);
 
         for _ in 0..200 {
@@ -212,7 +363,6 @@ impl HostState {
         }
 
         let last_frames = Arc::new(StdMutex::new(HashMap::new()));
-        let active_tab_id = Arc::new(AtomicU32::new(1));
         let viewport_w = Arc::new(AtomicU32::new(1280));
         let viewport_h = Arc::new(AtomicU32::new(648));
         let bus = FrameBus::new(last_frames.clone(), active_tab_id.clone());
@@ -225,8 +375,34 @@ impl HostState {
 
         tokio::spawn(async move {
             let mut force_full: HashSet<u32> = HashSet::new();
+            let mut q2_dirty_since: HashMap<u32, std::time::Instant> = HashMap::new();
+            let mut refine_tick = tokio::time::interval(std::time::Duration::from_millis(60));
+            refine_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
+                    _ = refine_tick.tick(), if !q2_dirty_since.is_empty() => {
+                        let active = active_atomic.load(Ordering::Relaxed);
+                        if let Some(&since) = q2_dirty_since.get(&active) {
+                            if since.elapsed() >= std::time::Duration::from_millis(140) {
+                                q2_dirty_since.remove(&active);
+                                if bus_clone.has_subscribers() {
+                                    if let Some(f) = last_frames_ref.lock().ok().and_then(|g| g.get(&active).cloned()) {
+                                        let ts_us = SystemTime::now().duration_since(UNIX_EPOCH)
+                                            .unwrap_or_default().as_micros() as u64;
+                                        bus_clone.publish_raw_frame(
+                                            ts_us,
+                                            f.width as u16,
+                                            f.height as u16,
+                                            f.stride as u32,
+                                            f.format,
+                                            gutted_proto::compression::ZSTD,
+                                            &f.pixels,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                     Some(first_f) = frames.recv() => {
                         let mut batch: HashMap<u32, wpe::Frame> = HashMap::new();
                         batch.insert(first_f.tab_id, first_f);
@@ -236,26 +412,28 @@ impl HostState {
 
                         for (this_tab_id, f) in batch {
                             let active = active_atomic.load(Ordering::Relaxed);
-                            if active == this_tab_id {
+                            if active == this_tab_id && bus_clone.has_subscribers() {
                                 let ts_us = SystemTime::now().duration_since(UNIX_EPOCH)
                                     .unwrap_or_default().as_micros() as u64;
                                 let must_full = force_full.remove(&this_tab_id);
-                                let prev = last_frames_ref.lock().ok().and_then(|mut g| g.remove(&this_tab_id));
+                                let prev = last_frames_ref.lock().ok().and_then(|g| g.get(&this_tab_id).cloned());
                                 let same_geom = !must_full && prev.as_ref().is_some_and(|l|
                                     l.width == f.width && l.height == f.height && l.stride == f.stride);
 
                                 if !same_geom {
-                                    let msg = Arc::new(Message::RawFrame {
+                                    q2_dirty_since.remove(&this_tab_id);
+                                    bus_clone.publish_raw_frame(
                                         ts_us,
-                                        width: f.width as u16, height: f.height as u16,
-                                        stride: f.stride as u32, format: f.format,
-                                        compression: gutted_proto::compression::ZSTD,
-                                        pixels: f.pixels.clone(),
-                                    });
+                                        f.width as u16,
+                                        f.height as u16,
+                                        f.stride as u32,
+                                        f.format,
+                                        gutted_proto::compression::ZSTD,
+                                        &f.pixels,
+                                    );
                                     if let Ok(mut g) = last_frames_ref.lock() {
                                         g.insert(this_tab_id, f);
                                     }
-                                    bus_clone.publish(msg);
                                 } else {
                                     let prev_f = prev.unwrap();
                                     let regions = diff_regions(&prev_f.pixels, &f.pixels, f.width, f.height, f.stride);
@@ -263,42 +441,70 @@ impl HostState {
                                         let total_px: u64 = regions.iter().map(|(_, _, w, h)| (*w as u64) * (*h as u64)).sum();
                                         let full_px = (f.width as u64) * (f.height as u64);
                                         if total_px * 10 >= full_px * 8 || regions.len() > 16 {
-                                            let msg = Arc::new(Message::RawFrame {
+                                            let comp = if f.stride == f.width * 4 {
+                                                q2_dirty_since.insert(this_tab_id, std::time::Instant::now());
+                                                gutted_proto::compression::LZ4_DELTA_Q2
+                                            } else {
+                                                q2_dirty_since.remove(&this_tab_id);
+                                                gutted_proto::compression::ZSTD
+                                            };
+                                            bus_clone.publish_raw_frame(
                                                 ts_us,
-                                                width: f.width as u16, height: f.height as u16,
-                                                stride: f.stride as u32, format: f.format,
-                                                compression: gutted_proto::compression::ZSTD,
-                                                pixels: f.pixels.clone(),
-                                            });
+                                                f.width as u16,
+                                                f.height as u16,
+                                                f.stride as u32,
+                                                f.format,
+                                                comp,
+                                                &f.pixels,
+                                            );
                                             if let Ok(mut g) = last_frames_ref.lock() {
                                                 g.insert(this_tab_id, f);
                                             }
-                                            bus_clone.publish(msg);
                                         } else {
                                             let fmt = f.format;
                                             let stride = f.stride;
-                                            let sub_msgs: Vec<Arc<Message>> = regions.iter().map(|&(x, y, w, h)| {
-                                                let sub = extract_subrect(&f.pixels, stride, x, y, w, h);
+                                            let s_usize = stride as usize;
+                                            for &(x, y, w, h) in &regions {
                                                 let area = (w as usize) * (h as usize);
                                                 let comp = if area >= 96_000 {
+                                                    q2_dirty_since.insert(this_tab_id, std::time::Instant::now());
                                                     gutted_proto::compression::LZ4_DELTA_Q2
                                                 } else if area >= 32_000 {
                                                     gutted_proto::compression::ZSTD
                                                 } else {
                                                     gutted_proto::compression::ZSTD_DELTA
                                                 };
-                                                Arc::new(Message::Subframe {
-                                                    ts_us, x, y, w, h,
-                                                    stride: (w as u32) * 4, format: fmt,
-                                                    compression: comp,
-                                                    pixels: sub,
-                                                })
-                                            }).collect();
+                                                if x == 0 && (w as i32) * 4 == stride {
+                                                    let start = (y as usize) * s_usize;
+                                                    let end = start + (h as usize) * s_usize;
+                                                    bus_clone.publish_subframe(
+                                                        ts_us,
+                                                        x,
+                                                        y,
+                                                        w,
+                                                        h,
+                                                        (w as u32) * 4,
+                                                        fmt,
+                                                        comp,
+                                                        &f.pixels[start..end],
+                                                    );
+                                                } else {
+                                                    let sub = extract_subrect(&f.pixels, stride, x, y, w, h);
+                                                    bus_clone.publish_subframe(
+                                                        ts_us,
+                                                        x,
+                                                        y,
+                                                        w,
+                                                        h,
+                                                        (w as u32) * 4,
+                                                        fmt,
+                                                        comp,
+                                                        &sub,
+                                                    );
+                                                }
+                                            }
                                             if let Ok(mut g) = last_frames_ref.lock() {
                                                 g.insert(this_tab_id, f);
-                                            }
-                                            for m in sub_msgs {
-                                                bus_clone.publish(m);
                                             }
                                         }
                                     } else if let Ok(mut g) = last_frames_ref.lock() {
@@ -358,6 +564,26 @@ impl HostState {
                             bus_clone.publish(Arc::new(Message::CursorState { shape, hotspot_x: 0, hotspot_y: 0, image_ref: 0 }));
                         }
                     }
+                    Some((this_tab_id, multiple, accept_mimes)) = file_choosers.recv() => {
+                        info!(tab_id = this_tab_id, multiple, %accept_mimes, "WPE requested file chooser");
+                        bus_clone.publish(Arc::new(Message::FileChooserPrompt {
+                            tab_id: this_tab_id,
+                            multiple,
+                            accept_mimes,
+                        }));
+                    }
+                    Some((filename, local_path)) = downloads.recv() => {
+                        if let Ok(meta) = std::fs::metadata(&local_path) {
+                            if meta.len() <= 12 * 1024 * 1024 {
+                                if let Ok(data) = std::fs::read(&local_path) {
+                                    info!(%filename, bytes = data.len(), "delivering finished download to clients");
+                                    bus_clone.publish(Arc::new(Message::FileDownload { filename, data }));
+                                }
+                            } else {
+                                warn!(%filename, bytes = meta.len(), "download exceeds 12 MiB wire limit; saved on host at {}", local_path);
+                            }
+                        }
+                    }
                     else => break,
                 }
             }
@@ -383,25 +609,35 @@ impl HostState {
             });
         }
         self.runner.create_tab(tab_id, url);
+        self.bus.publish(Arc::new(Message::TabCreated {
+            tab_id,
+            title: "New Tab".to_string(),
+            url: url.to_string(),
+        }));
         if make_active {
             self.switch_tab(tab_id).await;
+        } else {
+            let active = self.active_tab_id.load(Ordering::Relaxed);
+            self.runner.set_active_tab(active);
         }
     }
 
     async fn switch_tab(&self, tab_id: u32) {
         self.active_tab_id.store(tab_id, Ordering::Relaxed);
+        self.runner.set_active_tab(tab_id);
         let tabs = self.tabs.lock().await;
         if let Some(tab) = tabs.get(&tab_id) {
             if let Some(f) = self.last_frames.lock().ok().and_then(|g| g.get(&tab_id).cloned()) {
                 let ts_us = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
-                let msg = Arc::new(Message::RawFrame {
+                self.bus.publish_raw_frame(
                     ts_us,
-                    width: f.width as u16, height: f.height as u16,
-                    stride: f.stride as u32, format: f.format,
-                    compression: gutted_proto::compression::ZSTD,
-                    pixels: f.pixels,
-                });
-                self.bus.publish(msg);
+                    f.width as u16,
+                    f.height as u16,
+                    f.stride as u32,
+                    f.format,
+                    gutted_proto::compression::ZSTD,
+                    &f.pixels,
+                );
             }
             self.bus.publish(Arc::new(Message::Title { title: tab.title.clone() }));
             self.bus.publish(Arc::new(Message::UrlChanged { url: tab.url.clone() }));
@@ -418,6 +654,7 @@ impl HostState {
             g.remove(&tab_id);
         }
         self.runner.close_tab(tab_id);
+        self.bus.publish(Arc::new(Message::TabClosed { tab_id }));
     }
 
     async fn load_uri(&self, url: &str) {
@@ -478,6 +715,43 @@ impl HostState {
 
     fn clear_data(&self, cookies: bool, cache: bool, storage: bool) {
         self.runner.clear_data(cookies, cache, storage);
+    }
+
+    fn paste_text(&self, text: &str) {
+        let active = self.active_tab_id.load(Ordering::Relaxed);
+        self.runner.paste_text(active, text);
+    }
+
+    fn handle_file_upload(&self, tab_id: u32, filename: &str, mime_type: &str, data: &[u8]) {
+        let target_tab = if tab_id == 0 {
+            self.active_tab_id.load(Ordering::Relaxed)
+        } else {
+            tab_id
+        };
+        let safe_name: String = filename
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
+            .collect();
+        let safe_name = if safe_name.is_empty() {
+            "upload.bin".to_string()
+        } else {
+            safe_name
+        };
+        let dir = "/tmp/gutted-uploads";
+        let _ = std::fs::create_dir_all(dir);
+        let local_path = format!("{dir}/{target_tab}_{safe_name}");
+        if let Err(e) = std::fs::write(&local_path, data) {
+            warn!(error = %e, %local_path, "failed to write uploaded file");
+            return;
+        }
+        let b64 = if data.len() <= 2 * 1024 * 1024 {
+            base64_encode(data)
+        } else {
+            String::new()
+        };
+        info!(tab_id = target_tab, %safe_name, bytes = data.len(), "completing file upload");
+        self.runner
+            .complete_file_chooser(target_tab, &local_path, &safe_name, mime_type, &b64);
     }
 
     async fn current_url(&self) -> String {
@@ -569,6 +843,12 @@ async fn handle_input_stream(mut recv: quinn::RecvStream, host_state: HostState)
                                 host_state.inject_axis(px, py, dx, dy, 0).await;
                                 info!(px, py, dx, dy, "axis injected");
                             }
+                            Message::Clipboard { text } => {
+                                host_state.paste_text(&text);
+                            }
+                            Message::FileUpload { tab_id, filename, mime_type, data } => {
+                                host_state.handle_file_upload(tab_id, &filename, &mime_type, &data);
+                            }
                             other => warn!(?other, "unexpected input msg"),
                         }
                     }
@@ -632,8 +912,23 @@ async fn handle_ctrl_stream(
         current_url: host_state.current_url().await,
     };
     let _ = send.set_priority(20); // High priority for control & navigation messages
-    let mut out = Vec::with_capacity(64);
+    let mut out = Vec::with_capacity(128);
     welcome.encode(&mut out);
+    {
+        let tabs = host_state.tabs.lock().await;
+        let mut sorted: Vec<_> = tabs.iter().collect();
+        sorted.sort_by_key(|(id, _)| **id);
+        for (&tid, tab) in sorted {
+            Message::TabCreated {
+                tab_id: tid,
+                title: tab.title.clone(),
+                url: tab.url.clone(),
+            }
+            .encode(&mut out);
+        }
+        let active = host_state.active_tab_id.load(Ordering::Relaxed);
+        Message::TabActivated { tab_id: active }.encode(&mut out);
+    }
     send.write_all(&out).await?;
     info!(session_id = format!("0x{session_id:016x}"), "WELCOME sent");
 
@@ -666,49 +961,21 @@ async fn handle_ctrl_stream(
         loop {
             tokio::select! {
                 res = stream_rx.recv() => match res {
-                    Ok(mut item) => {
-                        while let Ok(newer) = stream_rx.try_recv() {
-                            match (&*item.msg, &*newer.msg) {
-                                (Message::RawFrame { .. } | Message::Subframe { .. }, Message::RawFrame { .. }) => {
-                                    item = newer;
-                                }
-                                (
-                                    Message::Subframe { x: x1, y: y1, w: w1, h: h1, .. },
-                                    Message::Subframe { x: x2, y: y2, w: w2, h: h2, .. },
-                                ) if *x2 <= *x1
-                                    && *y2 <= *y1
-                                    && (*x2 as u32 + *w2 as u32) >= (*x1 as u32 + *w1 as u32)
-                                    && (*y2 as u32 + *h2 as u32) >= (*y1 as u32 + *h1 as u32) =>
-                                {
-                                    item = newer;
-                                }
-                                _ => {
-                                    let n = item.wire_quic.len();
-                                    if vs.write_all(&item.wire_quic).await.is_err() {
-                                        return;
-                                    }
-                                    published += 1;
-                                    cum_bytes += n as u64;
-                                    match &*item.msg {
-                                        Message::RawFrame { .. } => cum_full += n as u64,
-                                        Message::Subframe { .. } => cum_sub  += n as u64,
-                                        _ => {}
-                                    }
-                                    item = newer;
-                                }
+                    Ok(first) => {
+                        let batch = coalesce_bus_batch(first, &mut stream_rx);
+                        for item in batch {
+                            let n = item.wire_quic.len();
+                            if let Err(e) = vs.write_all(&item.wire_quic).await {
+                                warn!(error = %e, "video write");
+                                return;
                             }
-                        }
-                        let n = item.wire_quic.len();
-                        if let Err(e) = vs.write_all(&item.wire_quic).await {
-                            warn!(error = %e, "video write");
-                            break;
-                        }
-                        published += 1;
-                        cum_bytes += n as u64;
-                        match &*item.msg {
-                            Message::RawFrame { .. } => cum_full += n as u64,
-                            Message::Subframe { .. } => cum_sub  += n as u64,
-                            _ => {}
+                            published += 1;
+                            cum_bytes += n as u64;
+                            match item.meta {
+                                BusMeta::RawFrame => cum_full += n as u64,
+                                BusMeta::Subframe { .. } => cum_sub += n as u64,
+                                BusMeta::Other => {}
+                            }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -794,6 +1061,12 @@ async fn handle_ctrl_stream(
                 let mut buf = Vec::with_capacity(16);
                 resp.encode(&mut buf);
                 let _ = send.write_all(&buf).await;
+            }
+            Message::Clipboard { text } => {
+                host_state.paste_text(&text);
+            }
+            Message::FileUpload { tab_id, filename, mime_type, data } => {
+                host_state.handle_file_upload(tab_id, &filename, &mime_type, &data);
             }
             other => info!(?other, "ctrl msg (unhandled yet)"),
         }
@@ -924,8 +1197,23 @@ async fn handle_tcp_connection(
         cursor_track_id: 0,
         current_url: host_state.current_url().await,
     };
-    let mut out = Vec::with_capacity(64);
+    let mut out = Vec::with_capacity(128);
     welcome.encode(&mut out);
+    {
+        let tabs = host_state.tabs.lock().await;
+        let mut sorted: Vec<_> = tabs.iter().collect();
+        sorted.sort_by_key(|(id, _)| **id);
+        for (&tid, tab) in sorted {
+            Message::TabCreated {
+                tab_id: tid,
+                title: tab.title.clone(),
+                url: tab.url.clone(),
+            }
+            .encode(&mut out);
+        }
+        let active = host_state.active_tab_id.load(Ordering::Relaxed);
+        Message::TabActivated { tab_id: active }.encode(&mut out);
+    }
     send.write_all(&out).await?;
 
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
@@ -945,35 +1233,12 @@ async fn handle_tcp_connection(
                     }
                 }
                 res = stream_rx.recv() => match res {
-                    Ok(mut item) => {
-                        while let Ok(newer) = stream_rx.try_recv() {
-                            match (&*item.msg, &*newer.msg) {
-                                // A new RawFrame supersedes any older RawFrame or Subframe
-                                (Message::RawFrame { .. } | Message::Subframe { .. }, Message::RawFrame { .. }) => {
-                                    item = newer;
-                                }
-                                // If a newer Subframe covers the older Subframe (e.g. consecutive video frames),
-                                // drop the older Subframe directly without triggering a full-frame snapshot.
-                                (
-                                    Message::Subframe { x: x1, y: y1, w: w1, h: h1, .. },
-                                    Message::Subframe { x: x2, y: y2, w: w2, h: h2, .. },
-                                ) if *x2 <= *x1
-                                    && *y2 <= *y1
-                                    && (*x2 as u32 + *w2 as u32) >= (*x1 as u32 + *w1 as u32)
-                                    && (*y2 as u32 + *h2 as u32) >= (*y1 as u32 + *h1 as u32) =>
-                                {
-                                    item = newer;
-                                }
-                                _ => {
-                                    if send.write_all(&item.wire_quic).await.is_err() {
-                                        return;
-                                    }
-                                    item = newer;
-                                }
+                    Ok(first) => {
+                        let batch = coalesce_bus_batch(first, &mut stream_rx);
+                        for item in batch {
+                            if send.write_all(&item.wire_quic).await.is_err() {
+                                return;
                             }
-                        }
-                        if send.write_all(&item.wire_quic).await.is_err() {
-                            break;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -1059,12 +1324,42 @@ async fn handle_tcp_connection(
                     .inject_axis(px, py, dx_units as f64 * 40.0, dy_units as f64 * 40.0, 0)
                     .await;
             }
+            Message::Clipboard { text } => {
+                host_state.paste_text(&text);
+            }
+            Message::FileUpload { tab_id, filename, mime_type, data } => {
+                host_state.handle_file_upload(tab_id, &filename, &mime_type, &data);
+            }
             _ => {}
         }
     }
     writer_task.abort();
     info!(%peer, "TCP client disconnected");
     Ok(())
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((n >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(n & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 fn rand64() -> u64 {
@@ -1115,6 +1410,51 @@ fn hex_sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+#[inline]
+fn first_diff_u32(a: &[u32], b: &[u32]) -> Option<usize> {
+    let n = a.len().min(b.len());
+    let mut i = 0usize;
+    while i + 8 <= n {
+        if a[i..i + 8] != b[i..i + 8] {
+            for j in i..i + 8 {
+                if a[j] != b[j] {
+                    return Some(j);
+                }
+            }
+        }
+        i += 8;
+    }
+    while i < n {
+        if a[i] != b[i] {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+#[inline]
+fn last_diff_u32(a: &[u32], b: &[u32]) -> Option<usize> {
+    let mut i = a.len().min(b.len());
+    while i >= 8 {
+        if a[i - 8..i] != b[i - 8..i] {
+            for j in (i - 8..i).rev() {
+                if a[j] != b[j] {
+                    return Some(j);
+                }
+            }
+        }
+        i -= 8;
+    }
+    while i > 0 {
+        i -= 1;
+        if a[i] != b[i] {
+            return Some(i);
+        }
+    }
+    None
+}
+
 /// Update horizontal dirty bounds `[left, right]` for a known-dirty row `(ra, rb)`.
 /// Only scans outside the existing `[left, right]` interval once initialized!
 #[inline]
@@ -1124,18 +1464,19 @@ fn update_row_bounds(ra: &[u8], rb: &[u8], w: usize, left: &mut usize, right: &m
     }
     if let (Some(sa), Some(sb)) = (align_slice_u32(ra), align_slice_u32(rb)) {
         if *left > *right {
-            if let Some(lx) = sa.iter().zip(sb.iter()).position(|(pa, pb)| pa != pb) {
+            if let Some(lx) = first_diff_u32(sa, sb) {
                 *left = lx;
-                *right = sa.iter().zip(sb.iter()).rposition(|(pa, pb)| pa != pb).unwrap_or(lx);
+                *right = last_diff_u32(&sa[lx + 1..], &sb[lx + 1..])
+                    .map_or(lx, |rx| lx + 1 + rx);
             }
         } else {
-            if *left > 0 && sa[..*left] != sb[..*left] {
-                if let Some(lx) = sa[..*left].iter().zip(sb[..*left].iter()).position(|(pa, pb)| pa != pb) {
+            if *left > 0 {
+                if let Some(lx) = first_diff_u32(&sa[..*left], &sb[..*left]) {
                     *left = lx;
                 }
             }
-            if *right + 1 < w && sa[*right + 1..] != sb[*right + 1..] {
-                if let Some(rx) = sa[*right + 1..].iter().zip(sb[*right + 1..].iter()).rposition(|(pa, pb)| pa != pb) {
+            if *right + 1 < w {
+                if let Some(rx) = last_diff_u32(&sa[*right + 1..], &sb[*right + 1..]) {
                     *right = *right + 1 + rx;
                 }
             }
@@ -1146,15 +1487,19 @@ fn update_row_bounds(ra: &[u8], rb: &[u8], w: usize, left: &mut usize, right: &m
         if *left > *right {
             if let Some(lx) = ca.iter().zip(cb.iter()).position(|(pa, pb)| pa != pb) {
                 *left = lx;
-                *right = ca.iter().zip(cb.iter()).rposition(|(pa, pb)| pa != pb).unwrap_or(lx);
+                *right = ca[lx + 1..]
+                    .iter()
+                    .zip(cb[lx + 1..].iter())
+                    .rposition(|(pa, pb)| pa != pb)
+                    .map_or(lx, |rx| lx + 1 + rx);
             }
         } else {
-            if *left > 0 && ca[..*left] != cb[..*left] {
+            if *left > 0 {
                 if let Some(lx) = ca[..*left].iter().zip(cb[..*left].iter()).position(|(pa, pb)| pa != pb) {
                     *left = lx;
                 }
             }
-            if *right + 1 < w && ca[*right + 1..] != cb[*right + 1..] {
+            if *right + 1 < w {
                 if let Some(rx) = ca[*right + 1..].iter().zip(cb[*right + 1..].iter()).rposition(|(pa, pb)| pa != pb) {
                     *right = *right + 1 + rx;
                 }
@@ -1196,30 +1541,9 @@ fn diff_regions(
         return Vec::new();
     }
 
-    // Fast-path: if >25% of the screen rows changed (e.g. video or scrolling),
-    // compute tight horizontal bounds across the dirty rows.
-    if dirty_count * 4 >= h {
-        let mut min_left = w;
-        let mut max_right = 0usize;
-        for (yy, &is_d) in dirty.iter().enumerate().take(last_dirty + 1).skip(first_dirty) {
-            if !is_d { continue; }
-            let ra = &a[yy * s .. yy * s + row_bytes];
-            let rb = &b[yy * s .. yy * s + row_bytes];
-            update_row_bounds(ra, rb, w, &mut min_left, &mut max_right);
-            if min_left == 0 && max_right + 1 >= w {
-                break;
-            }
-        }
-        if max_right >= min_left {
-            return vec![(min_left as u16, first_dirty as u16, (max_right - min_left + 1) as u16, (last_dirty - first_dirty + 1) as u16)];
-        } else {
-            return vec![(0, first_dirty as u16, w as u16, (last_dirty - first_dirty + 1) as u16)];
-        }
-    }
-
     // 2) coalesce into runs; tolerate up to `gap` clean rows so we don't
     //    over-fragment when a shape has interior whitespace lines.
-    let gap: usize = 4;
+    let gap: usize = 8;
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut y = first_dirty;
     while y <= last_dirty {
@@ -1241,6 +1565,27 @@ fn diff_regions(
             }
         }
         runs.push((start, end));
+    }
+
+    // Fast-path: if >50% of screen rows changed or >8 disjoint runs,
+    // compute a single tight horizontal bounding box across all dirty rows.
+    if dirty_count * 2 >= h || runs.len() > 8 {
+        let mut min_left = w;
+        let mut max_right = 0usize;
+        for (yy, &is_d) in dirty.iter().enumerate().take(last_dirty + 1).skip(first_dirty) {
+            if !is_d { continue; }
+            let ra = &a[yy * s .. yy * s + row_bytes];
+            let rb = &b[yy * s .. yy * s + row_bytes];
+            update_row_bounds(ra, rb, w, &mut min_left, &mut max_right);
+            if min_left == 0 && max_right + 1 >= w {
+                break;
+            }
+        }
+        if max_right >= min_left {
+            return vec![(min_left as u16, first_dirty as u16, (max_right - min_left + 1) as u16, (last_dirty - first_dirty + 1) as u16)];
+        } else {
+            return vec![(0, first_dirty as u16, w as u16, (last_dirty - first_dirty + 1) as u16)];
+        }
     }
     // 3) for each run, compute col bbox.
     let mut out = Vec::with_capacity(runs.len());
@@ -1323,7 +1668,7 @@ fn spawn_audio_capture(bus: FrameBus) {
                     "--rate=48000",
                     "--channels=2",
                     "--raw",
-                    "--latency-msec=20",
+                    "--latency-msec=10",
                 ])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -1332,14 +1677,21 @@ fn spawn_audio_capture(bus: FrameBus) {
                 return;
             };
             let Some(mut stdout) = child.stdout.take() else { return; };
-            // 20ms of 48kHz stereo S16LE = 960 frames * 4 bytes = 3840 bytes
-            let mut buf = [0u8; 3840];
+            // 10ms of 48kHz stereo S16LE = 480 frames * 4 bytes = 1920 bytes
+            let mut buf = [0u8; 1920];
             loop {
                 if stdout.read_exact(&mut buf).is_err() {
                     break;
                 }
-                // Skip completely silent chunks so idle pages consume 0 audio bandwidth
-                if buf.iter().all(|&b| b == 0) {
+                if !bus.has_subscribers() {
+                    continue;
+                }
+                // Skip silent/dither-only chunks (<= 2 LSBs) so idle pages consume 0 audio bandwidth
+                let (samples, _) = buf.as_chunks::<2>();
+                if samples
+                    .iter()
+                    .all(|&s| (-2..=2).contains(&i16::from_le_bytes(s)))
+                {
                     continue;
                 }
                 let pts_us = SystemTime::now()

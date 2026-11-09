@@ -16,12 +16,12 @@ required-features = ["std"]
 
 [features]
 default = ["std"]
-std = ["gutted-proto/std", "dep:ab_glyph", "dep:x11rb"]
+std = ["gutted-proto/std", "ttf", "dep:x11rb"]
+ttf = ["dep:ab_glyph"]
 
 [dependencies]
 gutted-proto = { path = "../gutted-proto", default-features = false }
-font8x8 = { version = "0.3", default-features = false, features = ["unicode"] }
-ab_glyph = { version = "0.2", optional = true }
+ab_glyph = { version = "0.2", default-features = false, features = ["libm"], optional = true }
 
 [target.'cfg(all(unix, not(target_os = "redox")))'.dependencies]
 x11rb = { version = "0.13", default-features = false, optional = true }

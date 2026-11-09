@@ -26,6 +26,7 @@ typedef struct {
     struct instance_t *inst;
     struct wpe_view_backend_exportable_fdo *exportable;
     WebKitWebView *view;
+    WebKitFileChooserRequest *pending_chooser;
     int32_t cur_w, cur_h;
     int32_t last_cursor_shape;
 } tab_t;
@@ -37,6 +38,11 @@ typedef struct instance_t {
     GMainLoop *loop;
     GHashTable *tabs; // uint32_t tab_id -> tab_t*
     int32_t def_w, def_h;
+    GMutex motion_lock;
+    bool motion_queued;
+    uint32_t motion_tab_id;
+    int32_t motion_x, motion_y;
+    uint32_t motion_mods;
 } instance_t;
 
 static gsize g_wpe_init_once = 0;
@@ -44,6 +50,8 @@ static gboolean g_wpe_init_ok = FALSE;
 static gboolean wpe_process_init(void) {
     if (g_once_init_enter(&g_wpe_init_once)) {
         setenv("LIBGL_ALWAYS_SOFTWARE", "1", 0);
+        setenv("LP_NUM_THREADS", "4", 0);
+        setenv("PULSE_LATENCY_MSEC", "15", 0);
         setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "0", 0);
         setenv("WEBKIT_GST_DMABUF_SINK_ENABLED", "0", 0);
         setenv("WEBKIT_GST_MAX_AVC1_RESOLUTION", "720P", 0);
@@ -58,6 +66,27 @@ static gboolean wpe_process_init(void) {
 static const char *k_media_lifecycle_script =
     "(function(){\n"
     "  try {\n"
+    "    if (!window.__gt_gaming_patched) {\n"
+    "      window.__gt_gaming_patched = true;\n"
+    "      var lockEl = null;\n"
+    "      try {\n"
+    "        Object.defineProperty(Document.prototype, 'pointerLockElement', {\n"
+    "          get: function() { return lockEl; }, configurable: true\n"
+    "        });\n"
+    "        Element.prototype.requestPointerLock = function() {\n"
+    "          lockEl = this;\n"
+    "          document.dispatchEvent(new Event('pointerlockchange'));\n"
+    "          return Promise.resolve();\n"
+    "        };\n"
+    "        Document.prototype.exitPointerLock = function() {\n"
+    "          lockEl = null;\n"
+    "          document.dispatchEvent(new Event('pointerlockchange'));\n"
+    "        };\n"
+    "      } catch(e) {}\n"
+    "      if (!navigator.getGamepads) {\n"
+    "        navigator.getGamepads = function() { return [null, null, null, null]; };\n"
+    "      }\n"
+    "    }\n"
     "    if (window.MediaSource && window.MediaSource.isTypeSupported && !window.__gt_mse_patched) {\n"
     "      window.__gt_mse_patched = true;\n"
     "      var origSup = window.MediaSource.isTypeSupported.bind(window.MediaSource);\n"
@@ -68,62 +97,72 @@ static const char *k_media_lifecycle_script =
     "        return origSup(mime);\n"
     "      };\n"
     "    }\n"
-    "    if (location.hostname.indexOf('youtube.com') !== -1 || location.hostname.indexOf('google.') !== -1) {\n"
+    "    var host = location.hostname || '';\n"
+    "    var isYT = host.indexOf('youtube.com') !== -1 || host.indexOf('youtu.be') !== -1;\n"
+    "    if (isYT || host.indexOf('google.') !== -1) {\n"
     "      document.cookie = 'SOCS=CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjMwODI5LjA3X3AxGgJlbiACGgYIgJnPpwY; domain=.youtube.com; path=/; max-age=31536000; SameSite=Lax';\n"
     "      document.cookie = 'CONSENT=YES+cb.20230531-04-p0.en+FX+905; domain=.youtube.com; path=/; max-age=31536000; SameSite=Lax';\n"
     "    }\n"
-    "    var injectYouTubeOpt = function() {\n"
-    "      if (!document.getElementById('__gt_yt_style') && (document.head || document.documentElement)) {\n"
-    "        var st = document.createElement('style');\n"
-    "        st.id = '__gt_yt_style';\n"
-    "        st.textContent = '#cinematics, #cinematics canvas, ytd-watch-flexy #cinematics, .ytp-cinematics-container, ytd-consent-bump-v2-lightbox, tp-yt-iron-overlay-backdrop, .ytd-consent-bump-v2-lightbox, ytd-enforcement-message-view-model { display: none !important; visibility: hidden !important; opacity: 0 !important; pointer-events: none !important; } * { scroll-behavior: auto !important; }';\n"
-    "        (document.head || document.documentElement).appendChild(st);\n"
-    "      }\n"
-    "      var dismissConsent = function() {\n"
-    "        var dlg = document.querySelector('ytd-consent-bump-v2-lightbox, #consent-bump');\n"
-    "        if (dlg) {\n"
-    "          var btns = dlg.querySelectorAll('button, ytd-button-renderer a, tp-yt-paper-button');\n"
-    "          for (var i = 0; i < btns.length; i++) {\n"
-    "            var txt = (btns[i].textContent || '').toLowerCase();\n"
-    "            if (txt.indexOf('reject') !== -1 || txt.indexOf('accept') !== -1 || txt.indexOf('elutas') !== -1 || txt.indexOf('elfogad') !== -1) {\n"
-    "              btns[i].click();\n"
-    "              break;\n"
+    "    if (isYT) {\n"
+    "      var injectYouTubeOpt = function() {\n"
+    "        if (!document.getElementById('__gt_yt_style') && (document.head || document.documentElement)) {\n"
+    "          var st = document.createElement('style');\n"
+    "          st.id = '__gt_yt_style';\n"
+    "          st.textContent = '#cinematics, #cinematics canvas, ytd-watch-flexy #cinematics, .ytp-cinematics-container, ytd-consent-bump-v2-lightbox, tp-yt-iron-overlay-backdrop, .ytd-consent-bump-v2-lightbox, ytd-enforcement-message-view-model { display: none !important; visibility: hidden !important; opacity: 0 !important; pointer-events: none !important; } * { scroll-behavior: auto !important; }';\n"
+    "          (document.head || document.documentElement).appendChild(st);\n"
+    "        }\n"
+    "        var dismissConsent = function() {\n"
+    "          var dlg = document.querySelector('ytd-consent-bump-v2-lightbox, #consent-bump');\n"
+    "          if (dlg) {\n"
+    "            var btns = dlg.querySelectorAll('button, ytd-button-renderer a, tp-yt-paper-button');\n"
+    "            for (var i = 0; i < btns.length; i++) {\n"
+    "              var txt = (btns[i].textContent || '').toLowerCase();\n"
+    "              if (txt.indexOf('reject') !== -1 || txt.indexOf('accept') !== -1 || txt.indexOf('elutas') !== -1 || txt.indexOf('elfogad') !== -1) {\n"
+    "                btns[i].click();\n"
+    "                break;\n"
+    "              }\n"
+    "            }\n"
+    "            dlg.remove();\n"
+    "          }\n"
+    "          var v = document.querySelector('video.html5-main-video, video');\n"
+    "          if (v) {\n"
+    "            if (!v.__gt_hooked) {\n"
+    "              v.__gt_hooked = true;\n"
+    "              v.addEventListener('click', function() { window.__gt_user_paused = !v.paused; });\n"
+    "            }\n"
+    "            if (v.paused && !window.__gt_user_paused && location.pathname === '/watch' && v.readyState >= 2) {\n"
+    "              v.muted = false;\n"
+    "              v.play().catch(function(){});\n"
     "            }\n"
     "          }\n"
-    "          dlg.remove();\n"
-    "        }\n"
-    "        var v = document.querySelector('video.html5-main-video, video');\n"
-    "        if (v) {\n"
-    "          if (!v.__gt_hooked) {\n"
-    "            v.__gt_hooked = true;\n"
-    "            v.addEventListener('click', function() { window.__gt_user_paused = !v.paused; });\n"
+    "          var player = document.getElementById('movie_player');\n"
+    "          if (player && player.setPlaybackQualityRange && !window.__gt_q_set) {\n"
+    "            window.__gt_q_set = true;\n"
+    "            try { player.setPlaybackQualityRange('large', 'hd720'); } catch(e) {}\n"
     "          }\n"
-    "          if (v.paused && !window.__gt_user_paused && location.pathname === '/watch' && v.readyState >= 2) {\n"
-    "            v.muted = false;\n"
-    "            v.play().catch(function(){});\n"
-    "          }\n"
-    "        }\n"
-    "        var player = document.getElementById('movie_player');\n"
-    "        if (player && player.setPlaybackQualityRange && !window.__gt_q_set) {\n"
-    "          window.__gt_q_set = true;\n"
-    "          try { player.setPlaybackQualityRange('large', 'hd720'); } catch(e) {}\n"
+    "        };\n"
+    "        dismissConsent();\n"
+    "        if (!window.__gt_yt_timer) {\n"
+    "          window.__gt_yt_timer = setInterval(dismissConsent, 750);\n"
     "        }\n"
     "      };\n"
-    "      dismissConsent();\n"
-    "      if (!window.__gt_yt_timer && location.hostname.indexOf('youtube.com') !== -1) {\n"
-    "        window.__gt_yt_timer = setInterval(dismissConsent, 750);\n"
-    "      }\n"
-    "    };\n"
-    "    if (document.head || document.documentElement) injectYouTubeOpt();\n"
-    "    document.addEventListener('DOMContentLoaded', injectYouTubeOpt, { once: true });\n"
-    "    window.addEventListener('yt-navigate-finish', injectYouTubeOpt);\n"
+    "      if (document.head || document.documentElement) injectYouTubeOpt();\n"
+    "      document.addEventListener('DOMContentLoaded', injectYouTubeOpt, { once: true });\n"
+    "      window.addEventListener('yt-navigate-finish', injectYouTubeOpt);\n"
+    "    }\n"
     "  } catch(e) {}\n"
     "  var resumeAC = function() {\n"
-    "    if (window.AudioContext || window.webkitAudioContext) {\n"
-    "      var ac = window.__gt_ac || new (window.AudioContext || window.webkitAudioContext)();\n"
-    "      window.__gt_ac = ac;\n"
-    "      if (ac.state === 'suspended') ac.resume();\n"
-    "    }\n"
+    "    try {\n"
+    "      if (window.AudioContext || window.webkitAudioContext) {\n"
+    "        var ac = window.__gt_ac || new (window.AudioContext || window.webkitAudioContext)();\n"
+    "        window.__gt_ac = ac;\n"
+    "        if (ac.state === 'suspended') ac.resume();\n"
+    "      }\n"
+    "      var media = document.querySelectorAll('video, audio');\n"
+    "      for (var i = 0; i < media.length; i++) {\n"
+    "        if (media[i].paused && media[i].autoplay) media[i].play().catch(function(){});\n"
+    "      }\n"
+    "    } catch(e) {}\n"
     "  };\n"
     "  document.addEventListener('click', resumeAC, { capture: true, passive: true });\n"
     "  document.addEventListener('keydown', resumeAC, { capture: true, passive: true });\n"
@@ -154,7 +193,26 @@ static void on_shm_buffer(void *data, struct wpe_fdo_shm_exported_buffer *buf) {
 static gboolean on_decide_policy(WebKitWebView *v, WebKitPolicyDecision *decision,
                                 WebKitPolicyDecisionType type, gpointer user_data)
 {
-    (void)v; (void)type; (void)user_data;
+    (void)user_data;
+    if (type == WEBKIT_POLICY_DECISION_TYPE_RESPONSE) {
+        WebKitResponsePolicyDecision *res_dec = WEBKIT_RESPONSE_POLICY_DECISION(decision);
+        if (!webkit_response_policy_decision_is_mime_type_supported(res_dec)) {
+            webkit_policy_decision_download(decision);
+            return TRUE;
+        }
+        return FALSE;
+    }
+    if (type == WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION) {
+        WebKitNavigationPolicyDecision *nav_dec = WEBKIT_NAVIGATION_POLICY_DECISION(decision);
+        WebKitNavigationAction *action = webkit_navigation_policy_decision_get_navigation_action(nav_dec);
+        WebKitURIRequest *req = action ? webkit_navigation_action_get_request(action) : NULL;
+        const gchar *uri = req ? webkit_uri_request_get_uri(req) : NULL;
+        if (uri && uri[0]) {
+            webkit_web_view_load_uri(v, uri);
+        }
+        webkit_policy_decision_ignore(decision);
+        return TRUE;
+    }
     WebKitWebsitePolicies *policies = webkit_website_policies_new_with_policies(
         "autoplay", WEBKIT_AUTOPLAY_ALLOW,
         NULL);
@@ -186,20 +244,6 @@ static void on_load_changed(WebKitWebView *v, WebKitLoadEvent e, gpointer user_d
         if (title && tab->inst->cb.on_title) {
             tab->inst->cb.on_title(tab->inst->userdata, tab->tab_id, title);
         }
-        const char *audio_unlock_js =
-            "(function(){\n"
-            "  try {\n"
-            "    var resumeAudio = function() {\n"
-            "      var media = document.querySelectorAll('video, audio');\n"
-            "      for (var i = 0; i < media.length; i++) {\n"
-            "        if (media[i].paused && media[i].autoplay) media[i].play().catch(function(){});\n"
-            "      }\n"
-            "    };\n"
-            "    document.addEventListener('click', resumeAudio, { capture: true, passive: true });\n"
-            "    document.addEventListener('keydown', resumeAudio, { capture: true, passive: true });\n"
-            "  } catch(e) {}\n"
-            "})();";
-        webkit_web_view_run_javascript(v, audio_unlock_js, NULL, NULL, NULL);
     }
 }
 
@@ -364,6 +408,58 @@ static gboolean on_leave_fullscreen(WebKitWebView *v, gpointer user_data) {
     return FALSE; // Allow WebKit to leave fullscreen mode
 }
 
+static gboolean on_run_file_chooser(WebKitWebView *v, WebKitFileChooserRequest *req, gpointer user_data) {
+    (void)v;
+    tab_t *tab = (tab_t *)user_data;
+    if (!tab || !tab->inst || !req) return FALSE;
+    if (tab->pending_chooser) {
+        webkit_file_chooser_request_cancel(tab->pending_chooser);
+        g_object_unref(tab->pending_chooser);
+    }
+    tab->pending_chooser = g_object_ref(req);
+    bool multiple = webkit_file_chooser_request_get_select_multiple(req) ? true : false;
+    const gchar * const *mimes = webkit_file_chooser_request_get_mime_types(req);
+    gchar *accept = mimes ? g_strjoinv(",", (gchar **)mimes) : g_strdup("");
+    if (tab->inst->cb.on_file_chooser) {
+        tab->inst->cb.on_file_chooser(tab->inst->userdata, tab->tab_id, multiple, accept);
+    }
+    g_free(accept);
+    return TRUE;
+}
+
+static gboolean on_download_decide_destination(WebKitDownload *download, const gchar *suggested_filename, gpointer user_data) {
+    (void)user_data;
+    const char *base = (suggested_filename && suggested_filename[0]) ? suggested_filename : "download.bin";
+    gchar *safe_name = g_path_get_basename(base);
+    g_mkdir_with_parents("/tmp/gutted-downloads", 0700);
+    gchar *dest_path = g_build_filename("/tmp/gutted-downloads", safe_name, NULL);
+    gchar *dest_uri = g_filename_to_uri(dest_path, NULL, NULL);
+    webkit_download_set_allow_overwrite(download, TRUE);
+    if (dest_uri) {
+        webkit_download_set_destination(download, dest_uri);
+        g_free(dest_uri);
+    }
+    g_object_set_data_full(G_OBJECT(download), "gt-filename", safe_name, g_free);
+    g_object_set_data_full(G_OBJECT(download), "gt-path", dest_path, g_free);
+    return TRUE;
+}
+
+static void on_download_finished(WebKitDownload *download, gpointer user_data) {
+    instance_t *inst = (instance_t *)user_data;
+    if (!inst || !inst->cb.on_download) return;
+    const char *fname = (const char *)g_object_get_data(G_OBJECT(download), "gt-filename");
+    const char *fpath = (const char *)g_object_get_data(G_OBJECT(download), "gt-path");
+    if (fname && fpath) {
+        inst->cb.on_download(inst->userdata, fname, fpath);
+    }
+}
+
+static void on_download_started(WebKitWebContext *ctx, WebKitDownload *download, gpointer user_data) {
+    (void)ctx;
+    g_signal_connect(download, "decide-destination", G_CALLBACK(on_download_decide_destination), user_data);
+    g_signal_connect(download, "finished", G_CALLBACK(on_download_finished), user_data);
+}
+
 static tab_t *create_tab_internal(instance_t *inst, uint32_t tab_id, const char *url) {
     if (!inst) return NULL;
     tab_t *tab = g_new0(tab_t, 1);
@@ -392,7 +488,7 @@ static tab_t *create_tab_internal(instance_t *inst, uint32_t tab_id, const char 
     webkit_settings_set_enable_html5_database(settings, TRUE);
     webkit_settings_set_enable_webgl(settings, TRUE);
     webkit_settings_set_enable_smooth_scrolling(settings, FALSE);
-    webkit_settings_set_enable_developer_extras(settings, TRUE);
+    webkit_settings_set_enable_developer_extras(settings, getenv("GBROWSER_DEVTOOLS") != NULL);
     webkit_settings_set_enable_resizable_text_areas(settings, TRUE);
     webkit_settings_set_enable_page_cache(settings, TRUE);
     webkit_settings_set_enable_site_specific_quirks(settings, TRUE);
@@ -414,7 +510,7 @@ static tab_t *create_tab_internal(instance_t *inst, uint32_t tab_id, const char 
     WebKitUserContentManager *ucm = webkit_user_content_manager_new();
     WebKitUserScript *us = webkit_user_script_new(
         k_media_lifecycle_script,
-        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
         WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
         NULL, NULL);
     webkit_user_content_manager_add_script(ucm, us);
@@ -446,6 +542,7 @@ static tab_t *create_tab_internal(instance_t *inst, uint32_t tab_id, const char 
     g_signal_connect(tab->view, "mouse-target-changed", G_CALLBACK(on_mouse_target_changed), tab);
     g_signal_connect(tab->view, "enter-fullscreen", G_CALLBACK(on_enter_fullscreen), tab);
     g_signal_connect(tab->view, "leave-fullscreen", G_CALLBACK(on_leave_fullscreen), tab);
+    g_signal_connect(tab->view, "run-file-chooser", G_CALLBACK(on_run_file_chooser), tab);
     g_signal_connect(tab->view, "notify::title", G_CALLBACK(on_notify_title), tab);
     g_signal_connect(tab->view, "notify::uri",   G_CALLBACK(on_notify_uri),   tab);
 
@@ -453,6 +550,11 @@ static tab_t *create_tab_internal(instance_t *inst, uint32_t tab_id, const char 
         wpe_view_backend_exportable_fdo_get_view_backend(tab->exportable);
     if (wpe_vb) {
         wpe_view_backend_dispatch_set_size(wpe_vb, tab->cur_w, tab->cur_h);
+        wpe_view_backend_add_activity_state(
+            wpe_vb,
+            wpe_view_activity_state_visible
+            | wpe_view_activity_state_focused
+            | wpe_view_activity_state_in_window);
     }
 
     if (url && url[0]) webkit_web_view_load_uri(tab->view, url);
@@ -464,13 +566,20 @@ static tab_t *create_tab_internal(instance_t *inst, uint32_t tab_id, const char 
 static void free_tab(gpointer p) {
     tab_t *tab = (tab_t *)p;
     if (!tab) return;
+    if (tab->pending_chooser) {
+        webkit_file_chooser_request_cancel(tab->pending_chooser);
+        g_object_unref(tab->pending_chooser);
+        tab->pending_chooser = NULL;
+    }
+    if (tab->view) {
+        g_signal_handlers_disconnect_by_data(tab->view, tab);
+        webkit_web_view_stop_loading(tab->view);
+        g_object_unref(tab->view);
+        tab->view = NULL;
+    }
     if (tab->exportable) {
         wpe_view_backend_exportable_fdo_destroy(tab->exportable);
         tab->exportable = NULL;
-    }
-    if (tab->view) {
-        g_object_unref(tab->view);
-        tab->view = NULL;
     }
     g_free(tab);
 }
@@ -486,6 +595,7 @@ int gutted_wpe_run(
     if (!wpe_process_init())  return -2;
 
     instance_t *inst = g_new0(instance_t, 1);
+    g_mutex_init(&inst->motion_lock);
     inst->cb        = *cb;
     inst->userdata  = userdata;
     inst->def_w     = viewport_w;
@@ -517,6 +627,7 @@ int gutted_wpe_run(
         }
         g_once_init_leave(&web_ctx_init, 1);
     }
+    g_signal_connect(webkit_web_context_get_default(), "download-started", G_CALLBACK(on_download_started), inst);
 
     // Create initial tab (tab_id = 1)
     create_tab_internal(inst, 1, initial_url ? initial_url : "https://duckduckgo.com");
@@ -527,6 +638,7 @@ int gutted_wpe_run(
 
     g_hash_table_destroy(inst->tabs);
     g_main_loop_unref(inst->loop);
+    g_mutex_clear(&inst->motion_lock);
     g_free(inst);
     return 0;
 }
@@ -589,12 +701,63 @@ void gutted_wpe_close_tab(gutted_wpe_handle h, uint32_t tab_id) {
     g_main_context_invoke(inst->ctx, idle_close_tab, o);
 }
 
+static gboolean idle_set_active_tab(gpointer p) {
+    idle_tab_op_t *o = p;
+    if (o->inst) {
+        GHashTableIter iter;
+        gpointer key, value;
+        g_hash_table_iter_init(&iter, o->inst->tabs);
+        while (g_hash_table_iter_next(&iter, &key, &value)) {
+            tab_t *tab = (tab_t *)value;
+            if (!tab || !tab->exportable) continue;
+            struct wpe_view_backend *vb =
+                wpe_view_backend_exportable_fdo_get_view_backend(tab->exportable);
+            if (!vb) continue;
+            if (tab->tab_id == o->tab_id) {
+                wpe_view_backend_add_activity_state(
+                    vb,
+                    wpe_view_activity_state_visible
+                    | wpe_view_activity_state_focused
+                    | wpe_view_activity_state_in_window);
+            } else {
+                wpe_view_backend_remove_activity_state(
+                    vb,
+                    wpe_view_activity_state_visible
+                    | wpe_view_activity_state_focused);
+            }
+        }
+    }
+    g_free(o);
+    return G_SOURCE_REMOVE;
+}
+
+void gutted_wpe_set_active_tab(gutted_wpe_handle h, uint32_t active_tab_id) {
+    instance_t *inst = (instance_t *)h;
+    if (!inst) return;
+    idle_tab_op_t *o = g_new0(idle_tab_op_t, 1);
+    o->inst = inst;
+    o->tab_id = active_tab_id;
+    g_main_context_invoke(inst->ctx, idle_set_active_tab, o);
+}
+
+static bool uris_equivalent(const char *a, const char *b) {
+    if (!a || !b) return false;
+    size_t la = strlen(a);
+    size_t lb = strlen(b);
+    while (la > 0 && a[la - 1] == '/') la--;
+    while (lb > 0 && b[lb - 1] == '/') lb--;
+    return la > 0 && la == lb && g_ascii_strncasecmp(a, b, la) == 0;
+}
+
 static gboolean idle_load_uri(gpointer p) {
     idle_tab_op_t *o = p;
     if (o->inst) {
         tab_t *tab = g_hash_table_lookup(o->inst->tabs, GUINT_TO_POINTER(o->tab_id));
         if (tab && tab->view && o->url) {
-            webkit_web_view_load_uri(tab->view, o->url);
+            const char *cur = webkit_web_view_get_uri(tab->view);
+            if (!(webkit_web_view_is_loading(tab->view) && uris_equivalent(cur, o->url))) {
+                webkit_web_view_load_uri(tab->view, o->url);
+            }
         }
     }
     g_free(o->url);
@@ -734,12 +897,45 @@ static gboolean idle_input(gpointer p) {
     return G_SOURCE_REMOVE;
 }
 
+static gboolean idle_motion(gpointer p) {
+    instance_t *inst = (instance_t *)p;
+    if (!inst) return G_SOURCE_REMOVE;
+    g_mutex_lock(&inst->motion_lock);
+    inst->motion_queued = false;
+    uint32_t tab_id = inst->motion_tab_id;
+    int32_t x = inst->motion_x;
+    int32_t y = inst->motion_y;
+    uint32_t modifiers = inst->motion_mods;
+    g_mutex_unlock(&inst->motion_lock);
+
+    tab_t *tab = g_hash_table_lookup(inst->tabs, GUINT_TO_POINTER(tab_id));
+    if (!tab || !tab->exportable) return G_SOURCE_REMOVE;
+    struct wpe_view_backend *vb =
+        wpe_view_backend_exportable_fdo_get_view_backend(tab->exportable);
+    uint32_t now_ms = (uint32_t)(g_get_monotonic_time() / 1000);
+    struct wpe_input_pointer_event ev = {
+        .type = wpe_input_pointer_event_type_motion,
+        .time = now_ms, .x = x, .y = y,
+        .button = 0, .state = 0, .modifiers = modifiers,
+    };
+    wpe_view_backend_dispatch_pointer_event(vb, &ev);
+    return G_SOURCE_REMOVE;
+}
+
 void gutted_wpe_inject_pointer_motion(gutted_wpe_handle h, uint32_t tab_id, int32_t x, int32_t y, uint32_t modifiers) {
     instance_t *inst = (instance_t *)h;
     if (!inst) return;
-    idle_input_t *e = g_new0(idle_input_t, 1);
-    e->inst = inst; e->tab_id = tab_id; e->kind = 0; e->x = x; e->y = y; e->modifiers = modifiers;
-    g_main_context_invoke(inst->ctx, idle_input, e);
+    g_mutex_lock(&inst->motion_lock);
+    inst->motion_tab_id = tab_id;
+    inst->motion_x = x;
+    inst->motion_y = y;
+    inst->motion_mods = modifiers;
+    bool need_schedule = !inst->motion_queued;
+    inst->motion_queued = true;
+    g_mutex_unlock(&inst->motion_lock);
+    if (need_schedule) {
+        g_main_context_invoke(inst->ctx, idle_motion, inst);
+    }
 }
 
 void gutted_wpe_inject_pointer_button(gutted_wpe_handle h, uint32_t tab_id, int32_t x, int32_t y, uint32_t button, bool pressed, uint32_t modifiers) {
@@ -850,4 +1046,139 @@ void gutted_wpe_clear_data(gutted_wpe_handle h, bool clear_cookies, bool clear_c
     idle_clear_t *c = g_new0(idle_clear_t, 1);
     c->inst = inst; c->cookies = clear_cookies; c->cache = clear_cache; c->storage = clear_storage;
     g_main_context_invoke(inst->ctx, idle_clear, c);
+}
+
+typedef struct {
+    instance_t *inst;
+    uint32_t tab_id;
+    char *file_path;
+    char *filename;
+    char *mime_type;
+    char *b64_data;
+} idle_file_upload_t;
+
+static gboolean idle_file_upload(gpointer p) {
+    idle_file_upload_t *u = p;
+    if (u->inst) {
+        tab_t *tab = g_hash_table_lookup(u->inst->tabs, GUINT_TO_POINTER(u->tab_id));
+        if (tab && tab->view) {
+            if (tab->pending_chooser) {
+                if (u->file_path && u->file_path[0]) {
+                    const gchar *files[2] = { u->file_path, NULL };
+                    webkit_file_chooser_request_select_files(tab->pending_chooser, files);
+                } else {
+                    webkit_file_chooser_request_cancel(tab->pending_chooser);
+                }
+                g_object_unref(tab->pending_chooser);
+                tab->pending_chooser = NULL;
+            } else if (u->b64_data && u->filename) {
+                gchar *esc_name = g_strescape(u->filename, NULL);
+                gchar *esc_mime = g_strescape(u->mime_type ? u->mime_type : "application/octet-stream", NULL);
+                gchar *js = g_strdup_printf(
+                    "(function(){\n"
+                    "  try {\n"
+                    "    var bin = atob('%s');\n"
+                    "    var arr = new Uint8Array(bin.length);\n"
+                    "    for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);\n"
+                    "    var file = new File([arr], \"%s\", { type: \"%s\" });\n"
+                    "    var dt = new DataTransfer();\n"
+                    "    dt.items.add(file);\n"
+                    "    var inp = document.querySelector('input[type=\"file\"]');\n"
+                    "    if (inp) {\n"
+                    "      inp.files = dt.files;\n"
+                    "      inp.dispatchEvent(new Event('input', { bubbles: true }));\n"
+                    "      inp.dispatchEvent(new Event('change', { bubbles: true }));\n"
+                    "    }\n"
+                    "    var target = document.activeElement || document.body;\n"
+                    "    if (target) {\n"
+                    "      var ev = new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt });\n"
+                    "      target.dispatchEvent(ev);\n"
+                    "    }\n"
+                    "  } catch(e) {}\n"
+                    "})();",
+                    u->b64_data, esc_name, esc_mime);
+                webkit_web_view_run_javascript(tab->view, js, NULL, NULL, NULL);
+                g_free(js);
+                g_free(esc_name);
+                g_free(esc_mime);
+            }
+        }
+    }
+    g_free(u->file_path);
+    g_free(u->filename);
+    g_free(u->mime_type);
+    g_free(u->b64_data);
+    g_free(u);
+    return G_SOURCE_REMOVE;
+}
+
+void gutted_wpe_complete_file_chooser(
+    gutted_wpe_handle h,
+    uint32_t tab_id,
+    const char *file_path,
+    const char *filename,
+    const char *mime_type,
+    const char *b64_data)
+{
+    instance_t *inst = (instance_t *)h;
+    if (!inst) return;
+    idle_file_upload_t *u = g_new0(idle_file_upload_t, 1);
+    u->inst = inst;
+    u->tab_id = tab_id;
+    u->file_path = file_path ? g_strdup(file_path) : NULL;
+    u->filename = filename ? g_strdup(filename) : NULL;
+    u->mime_type = mime_type ? g_strdup(mime_type) : NULL;
+    u->b64_data = b64_data ? g_strdup(b64_data) : NULL;
+    g_main_context_invoke(inst->ctx, idle_file_upload, u);
+}
+
+typedef struct {
+    instance_t *inst;
+    uint32_t tab_id;
+    char *text;
+} idle_paste_t;
+
+static gboolean idle_paste(gpointer p) {
+    idle_paste_t *ps = p;
+    if (ps->inst && ps->text) {
+        tab_t *tab = g_hash_table_lookup(ps->inst->tabs, GUINT_TO_POINTER(ps->tab_id));
+        if (tab && tab->view) {
+            gchar *esc = g_strescape(ps->text, NULL);
+            gchar *js = g_strdup_printf(
+                "(function(){\n"
+                "  try {\n"
+                "    var txt = \"%s\";\n"
+                "    var el = document.activeElement;\n"
+                "    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {\n"
+                "      var start = el.selectionStart || 0;\n"
+                "      var end = el.selectionEnd || 0;\n"
+                "      var val = el.value || '';\n"
+                "      el.value = val.slice(0, start) + txt + val.slice(end);\n"
+                "      el.selectionStart = el.selectionEnd = start + txt.length;\n"
+                "      el.dispatchEvent(new Event('input', { bubbles: true }));\n"
+                "      el.dispatchEvent(new Event('change', { bubbles: true }));\n"
+                "    } else if (document.queryCommandSupported && document.queryCommandSupported('insertText')) {\n"
+                "      document.execCommand('insertText', false, txt);\n"
+                "    }\n"
+                "  } catch(e) {}\n"
+                "})();",
+                esc);
+            webkit_web_view_run_javascript(tab->view, js, NULL, NULL, NULL);
+            g_free(js);
+            g_free(esc);
+        }
+    }
+    g_free(ps->text);
+    g_free(ps);
+    return G_SOURCE_REMOVE;
+}
+
+void gutted_wpe_paste_text(gutted_wpe_handle h, uint32_t tab_id, const char *text) {
+    instance_t *inst = (instance_t *)h;
+    if (!inst || !text) return;
+    idle_paste_t *ps = g_new0(idle_paste_t, 1);
+    ps->inst = inst;
+    ps->tab_id = tab_id;
+    ps->text = g_strdup(text);
+    g_main_context_invoke(inst->ctx, idle_paste, ps);
 }

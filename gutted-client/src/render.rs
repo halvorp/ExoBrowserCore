@@ -15,11 +15,11 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use gutted_proto::{caps, CursorShape, Message, ScrollPhase, PROTO_VERSION};
+use gutted_proto::{caps, CursorShape, FrameDecoder, Message, ScrollPhase, PROTO_VERSION};
 
 #[cfg(feature = "std")]
 use crate::{log_info, Result};
-#[cfg(feature = "std")]
+#[cfg(feature = "ttf")]
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 #[cfg(feature = "std")]
 use std::io::Write;
@@ -107,6 +107,16 @@ pub enum RenderEvent {
         tab_id: u32,
         url: String,
     },
+    Clipboard(String),
+    FileChooserPrompt {
+        tab_id: u32,
+        multiple: bool,
+        accept_mimes: String,
+    },
+    FileDownload {
+        filename: String,
+        data: Vec<u8>,
+    },
     Quit,
 }
 
@@ -182,6 +192,17 @@ impl RenderEvent {
             Message::TabActivated { tab_id } => Some(Self::TabActivated { tab_id }),
             Message::TabTitle { tab_id, title } => Some(Self::TabTitle { tab_id, title }),
             Message::TabUrl { tab_id, url } => Some(Self::TabUrl { tab_id, url }),
+            Message::Clipboard { text } => Some(Self::Clipboard(text)),
+            Message::FileChooserPrompt {
+                tab_id,
+                multiple,
+                accept_mimes,
+            } => Some(Self::FileChooserPrompt {
+                tab_id,
+                multiple,
+                accept_mimes,
+            }),
+            Message::FileDownload { filename, data } => Some(Self::FileDownload { filename, data }),
             _ => None,
         }
     }
@@ -238,6 +259,13 @@ pub enum InputEvent {
         clear_cache: bool,
         clear_storage: bool,
     },
+    Clipboard(String),
+    FileUpload {
+        tab_id: u32,
+        filename: String,
+        mime_type: String,
+        data: Vec<u8>,
+    },
 }
 
 impl InputEvent {
@@ -264,6 +292,18 @@ impl InputEvent {
                 clear_cookies,
                 clear_cache,
                 clear_storage,
+            },
+            Self::Clipboard(text) => Message::Clipboard { text },
+            Self::FileUpload {
+                tab_id,
+                filename,
+                mime_type,
+                data,
+            } => Message::FileUpload {
+                tab_id,
+                filename,
+                mime_type,
+                data,
             },
             Self::Motion { x, y, mods } => Message::InputPointer {
                 ts_us,
@@ -317,6 +357,32 @@ pub const BOOKMARKS: &[(&str, &str)] = &[
     ("Example", "https://example.com"),
 ];
 
+fn percent_encode_query(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0F) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+/// Compare two URLs for equivalence modulo surrounding whitespace and a single trailing `/`.
+pub fn urls_equivalent(a: &str, b: &str) -> bool {
+    let na = a.trim().trim_end_matches('/');
+    let nb = b.trim().trim_end_matches('/');
+    !na.is_empty() && na.eq_ignore_ascii_case(nb)
+}
+
 /// Canonicalize user input: valid URL/scheme passes through, localhost/IP gets http://,
 /// search queries go to DuckDuckGo, bare domains get https://.
 pub fn canonicalize_url(raw: &str) -> String {
@@ -325,7 +391,7 @@ pub fn canonicalize_url(raw: &str) -> String {
         return "about:blank".into();
     }
     if s.contains(' ') {
-        let query = s.replace(' ', "+");
+        let query = percent_encode_query(s);
         return format!("https://duckduckgo.com/?q={query}");
     }
     if s.starts_with("localhost:")
@@ -353,7 +419,8 @@ pub fn canonicalize_url(raw: &str) -> String {
         }
     }
     if !s.contains('.') {
-        return format!("https://duckduckgo.com/?q={s}");
+        let query = percent_encode_query(s);
+        return format!("https://duckduckgo.com/?q={query}");
     }
     format!("https://{s}")
 }
@@ -362,6 +429,7 @@ pub fn canonicalize_url(raw: &str) -> String {
 #[derive(Debug, Default)]
 pub struct AVClock {
     master_audio_pts: u64,
+    last_audio_wall_us: Option<u64>,
     #[cfg(feature = "std")]
     last_audio_tick: Option<Instant>,
 }
@@ -372,11 +440,17 @@ impl AVClock {
     }
 
     pub fn on_audio_frame(&mut self, pts_us: u64, duration_us: u64) {
-        self.master_audio_pts = pts_us + duration_us;
+        self.master_audio_pts = pts_us.saturating_add(duration_us);
         #[cfg(feature = "std")]
         {
             self.last_audio_tick = Some(Instant::now());
         }
+    }
+
+    /// Record an audio frame with an explicit monotonic timestamp `now_us` (for `#![no_std]` kernels).
+    pub fn on_audio_frame_at(&mut self, pts_us: u64, duration_us: u64, now_us: u64) {
+        self.master_audio_pts = pts_us.saturating_add(duration_us);
+        self.last_audio_wall_us = Some(now_us);
     }
 
     pub fn current_master_pts_us(&self) -> u64 {
@@ -393,9 +467,26 @@ impl AVClock {
         }
     }
 
+    /// Compute master PTS given a `#![no_std]` monotonic clock reading `now_us`.
+    pub fn current_master_pts_at(&self, now_us: u64) -> u64 {
+        match self.last_audio_wall_us {
+            Some(t0) => self.master_audio_pts.saturating_add(now_us.saturating_sub(t0)),
+            None => self.current_master_pts_us(),
+        }
+    }
+
     /// 0 = Present Now, 1 = Hold, 2 = Drop (Late)
     pub fn schedule_video(&self, video_pts_us: u64) -> u8 {
-        let master = self.current_master_pts_us();
+        self.schedule_against(video_pts_us, self.current_master_pts_us())
+    }
+
+    /// 0 = Present Now, 1 = Hold, 2 = Drop (Late) using an explicit monotonic timestamp `now_us`.
+    pub fn schedule_video_at(&self, video_pts_us: u64, now_us: u64) -> u8 {
+        self.schedule_against(video_pts_us, self.current_master_pts_at(now_us))
+    }
+
+    #[inline]
+    fn schedule_against(&self, video_pts_us: u64, master: u64) -> u8 {
         if master == 0 {
             return 0;
         }
@@ -411,14 +502,11 @@ impl AVClock {
 }
 
 /// Real-time 48kHz stereo PCM audio output engine (`std`).
+/// Uses a dedicated non-blocking background worker with a bounded queue so
+/// audio pipe I/O never stalls the UI/video compositor thread or accumulates drift.
 #[cfg(feature = "std")]
 pub struct AudioOutput {
-    child: Option<Child>,
-    stdin: Option<ChildStdin>,
-    #[cfg(target_os = "redox")]
-    redox_audio: Option<std::fs::File>,
-    rate: u32,
-    channels: u8,
+    tx: Option<std::sync::mpsc::SyncSender<(u32, u8, Vec<u8>)>>,
     pub muted: bool,
     pub last_active: Option<Instant>,
 }
@@ -431,8 +519,18 @@ impl Default for AudioOutput {
 }
 
 #[cfg(feature = "std")]
-impl AudioOutput {
-    pub fn new() -> Self {
+struct AudioSinkWorker {
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    #[cfg(target_os = "redox")]
+    redox_audio: Option<std::fs::File>,
+    rate: u32,
+    channels: u8,
+}
+
+#[cfg(feature = "std")]
+impl AudioSinkWorker {
+    fn new() -> Self {
         Self {
             child: None,
             stdin: None,
@@ -440,8 +538,6 @@ impl AudioOutput {
             redox_audio: None,
             rate: 48_000,
             channels: 2,
-            muted: false,
-            last_active: None,
         }
     }
 
@@ -482,7 +578,7 @@ impl AudioOutput {
                     "--format",
                     "s16",
                     "--latency",
-                    "20ms",
+                    "12ms",
                     "-",
                 ],
             ),
@@ -496,7 +592,7 @@ impl AudioOutput {
                     "--channels",
                     &ch_s,
                     "--format=s16le",
-                    "--latency-msec=20",
+                    "--latency-msec=12",
                 ],
             ),
             (
@@ -511,6 +607,7 @@ impl AudioOutput {
                     &rate_s,
                     "-c",
                     &ch_s,
+                    "--buffer-time=24000",
                     "-",
                 ],
             ),
@@ -539,11 +636,7 @@ impl AudioOutput {
         }
     }
 
-    pub fn write_pcm(&mut self, rate: u32, channels: u8, pcm: &[u8]) {
-        self.last_active = Some(Instant::now());
-        if self.muted || pcm.is_empty() {
-            return;
-        }
+    fn write_pcm(&mut self, rate: u32, channels: u8, pcm: &[u8]) {
         self.ensure_sink(rate, channels);
         #[cfg(target_os = "redox")]
         if let Some(f) = self.redox_audio.as_mut() {
@@ -559,12 +652,7 @@ impl AudioOutput {
         }
     }
 
-    pub fn is_playing(&self) -> bool {
-        self.last_active
-            .is_some_and(|t| t.elapsed() < Duration::from_millis(600))
-    }
-
-    pub fn close(&mut self) {
+    fn close(&mut self) {
         self.stdin.take();
         #[cfg(target_os = "redox")]
         {
@@ -574,6 +662,56 @@ impl AudioOutput {
             let _ = c.kill();
             let _ = c.wait();
         }
+    }
+}
+
+#[cfg(feature = "std")]
+impl Drop for AudioSinkWorker {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+#[cfg(feature = "std")]
+impl AudioOutput {
+    pub fn new() -> Self {
+        Self {
+            tx: None,
+            muted: false,
+            last_active: None,
+        }
+    }
+
+    pub fn write_pcm(&mut self, rate: u32, channels: u8, pcm: &[u8]) {
+        self.last_active = Some(Instant::now());
+        if self.muted || pcm.is_empty() {
+            return;
+        }
+        if self.tx.is_none() {
+            // Bounded queue of 12 chunks (~120ms at 10ms/chunk) prevents audio lag buildup
+            let (tx, rx) = std::sync::mpsc::sync_channel::<(u32, u8, Vec<u8>)>(12);
+            let _ = std::thread::Builder::new()
+                .name("gutted-audio-out".into())
+                .spawn(move || {
+                    let mut worker = AudioSinkWorker::new();
+                    while let Ok((r, ch, data)) = rx.recv() {
+                        worker.write_pcm(r, ch, &data);
+                    }
+                });
+            self.tx = Some(tx);
+        }
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send((rate, channels, pcm.to_vec()));
+        }
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.last_active
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(600))
+    }
+
+    pub fn close(&mut self) {
+        self.tx.take();
     }
 }
 
@@ -609,10 +747,124 @@ pub struct DamageRect {
     pub h: u32,
 }
 
-/// Anti-aliased TTF font renderer (`std`) with built-in `#![no_std]` `font8x8` bitmap fallback.
+/// Built-in 760-byte 8x8 ASCII bitmap font (`0x20..=0x7E`) for zero-dependency `#![no_std]` rendering.
+/// Each byte encodes one row (`bit 0` = leftmost pixel, `bit 7` = rightmost pixel).
+const ASCII_8X8: [[u8; 8]; 95] = [
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 0x20 ' '
+    [0x18, 0x3C, 0x3C, 0x18, 0x18, 0x00, 0x18, 0x00], // 0x21 '!'
+    [0x36, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 0x22 '"'
+    [0x36, 0x36, 0x7F, 0x36, 0x7F, 0x36, 0x36, 0x00], // 0x23 '#'
+    [0x0C, 0x3E, 0x03, 0x1E, 0x30, 0x1F, 0x0C, 0x00], // 0x24 '$'
+    [0x00, 0x63, 0x33, 0x18, 0x0C, 0x66, 0x63, 0x00], // 0x25 '%'
+    [0x1C, 0x36, 0x1C, 0x6E, 0x3B, 0x33, 0x6E, 0x00], // 0x26 '&'
+    [0x06, 0x06, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00], // 0x27 '\''
+    [0x18, 0x0C, 0x06, 0x06, 0x06, 0x0C, 0x18, 0x00], // 0x28 '('
+    [0x06, 0x0C, 0x18, 0x18, 0x18, 0x0C, 0x06, 0x00], // 0x29 ')'
+    [0x00, 0x66, 0x3C, 0xFF, 0x3C, 0x66, 0x00, 0x00], // 0x2A '*'
+    [0x00, 0x0C, 0x0C, 0x3F, 0x0C, 0x0C, 0x00, 0x00], // 0x2B '+'
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x06], // 0x2C ','
+    [0x00, 0x00, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x00], // 0x2D '-'
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x00], // 0x2E '.'
+    [0x60, 0x30, 0x18, 0x0C, 0x06, 0x03, 0x01, 0x00], // 0x2F '/'
+    [0x3E, 0x63, 0x73, 0x7B, 0x6F, 0x67, 0x3E, 0x00], // 0x30 '0'
+    [0x0C, 0x0E, 0x0C, 0x0C, 0x0C, 0x0C, 0x3F, 0x00], // 0x31 '1'
+    [0x1E, 0x33, 0x30, 0x1C, 0x06, 0x33, 0x3F, 0x00], // 0x32 '2'
+    [0x1E, 0x33, 0x30, 0x1C, 0x30, 0x33, 0x1E, 0x00], // 0x33 '3'
+    [0x38, 0x3C, 0x36, 0x33, 0x7F, 0x30, 0x78, 0x00], // 0x34 '4'
+    [0x3F, 0x03, 0x1F, 0x30, 0x30, 0x33, 0x1E, 0x00], // 0x35 '5'
+    [0x1C, 0x06, 0x03, 0x1F, 0x33, 0x33, 0x1E, 0x00], // 0x36 '6'
+    [0x3F, 0x33, 0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x00], // 0x37 '7'
+    [0x1E, 0x33, 0x33, 0x1E, 0x33, 0x33, 0x1E, 0x00], // 0x38 '8'
+    [0x1E, 0x33, 0x33, 0x3E, 0x30, 0x18, 0x0E, 0x00], // 0x39 '9'
+    [0x00, 0x0C, 0x0C, 0x00, 0x00, 0x0C, 0x0C, 0x00], // 0x3A ':'
+    [0x00, 0x0C, 0x0C, 0x00, 0x00, 0x0C, 0x0C, 0x06], // 0x3B ';'
+    [0x18, 0x0C, 0x06, 0x03, 0x06, 0x0C, 0x18, 0x00], // 0x3C '<'
+    [0x00, 0x00, 0x3F, 0x00, 0x00, 0x3F, 0x00, 0x00], // 0x3D '='
+    [0x06, 0x0C, 0x18, 0x30, 0x18, 0x0C, 0x06, 0x00], // 0x3E '>'
+    [0x1E, 0x33, 0x30, 0x18, 0x0C, 0x00, 0x0C, 0x00], // 0x3F '?'
+    [0x3E, 0x63, 0x7B, 0x7B, 0x7B, 0x03, 0x1E, 0x00], // 0x40 '@'
+    [0x0C, 0x1E, 0x33, 0x33, 0x3F, 0x33, 0x33, 0x00], // 0x41 'A'
+    [0x3F, 0x66, 0x66, 0x3E, 0x66, 0x66, 0x3F, 0x00], // 0x42 'B'
+    [0x3C, 0x66, 0x03, 0x03, 0x03, 0x66, 0x3C, 0x00], // 0x43 'C'
+    [0x1F, 0x36, 0x66, 0x66, 0x66, 0x36, 0x1F, 0x00], // 0x44 'D'
+    [0x7F, 0x46, 0x16, 0x1E, 0x16, 0x46, 0x7F, 0x00], // 0x45 'E'
+    [0x7F, 0x46, 0x16, 0x1E, 0x16, 0x06, 0x0F, 0x00], // 0x46 'F'
+    [0x3C, 0x66, 0x03, 0x03, 0x73, 0x66, 0x7C, 0x00], // 0x47 'G'
+    [0x33, 0x33, 0x33, 0x3F, 0x33, 0x33, 0x33, 0x00], // 0x48 'H'
+    [0x1E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00], // 0x49 'I'
+    [0x78, 0x30, 0x30, 0x30, 0x33, 0x33, 0x1E, 0x00], // 0x4A 'J'
+    [0x67, 0x66, 0x36, 0x1E, 0x36, 0x66, 0x67, 0x00], // 0x4B 'K'
+    [0x0F, 0x06, 0x06, 0x06, 0x46, 0x66, 0x7F, 0x00], // 0x4C 'L'
+    [0x63, 0x77, 0x7F, 0x7F, 0x6B, 0x63, 0x63, 0x00], // 0x4D 'M'
+    [0x63, 0x67, 0x6F, 0x7B, 0x73, 0x63, 0x63, 0x00], // 0x4E 'N'
+    [0x1C, 0x36, 0x63, 0x63, 0x63, 0x36, 0x1C, 0x00], // 0x4F 'O'
+    [0x3F, 0x66, 0x66, 0x3E, 0x06, 0x06, 0x0F, 0x00], // 0x50 'P'
+    [0x1E, 0x33, 0x33, 0x33, 0x3B, 0x1E, 0x38, 0x00], // 0x51 'Q'
+    [0x3F, 0x66, 0x66, 0x3E, 0x36, 0x66, 0x67, 0x00], // 0x52 'R'
+    [0x1E, 0x33, 0x07, 0x0E, 0x38, 0x33, 0x1E, 0x00], // 0x53 'S'
+    [0x3F, 0x2D, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00], // 0x54 'T'
+    [0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x3F, 0x00], // 0x55 'U'
+    [0x33, 0x33, 0x33, 0x33, 0x33, 0x1E, 0x0C, 0x00], // 0x56 'V'
+    [0x63, 0x63, 0x63, 0x6B, 0x7F, 0x77, 0x63, 0x00], // 0x57 'W'
+    [0x63, 0x63, 0x36, 0x1C, 0x1C, 0x36, 0x63, 0x00], // 0x58 'X'
+    [0x33, 0x33, 0x33, 0x1E, 0x0C, 0x0C, 0x1E, 0x00], // 0x59 'Y'
+    [0x7F, 0x63, 0x31, 0x18, 0x4C, 0x66, 0x7F, 0x00], // 0x5A 'Z'
+    [0x1E, 0x06, 0x06, 0x06, 0x06, 0x06, 0x1E, 0x00], // 0x5B '['
+    [0x03, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x40, 0x00], // 0x5C '\\'
+    [0x1E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x1E, 0x00], // 0x5D ']'
+    [0x08, 0x1C, 0x36, 0x63, 0x00, 0x00, 0x00, 0x00], // 0x5E '^'
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF], // 0x5F '_'
+    [0x0C, 0x0C, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00], // 0x60 '`'
+    [0x00, 0x00, 0x1E, 0x30, 0x3E, 0x33, 0x6E, 0x00], // 0x61 'a'
+    [0x07, 0x06, 0x06, 0x3E, 0x66, 0x66, 0x3B, 0x00], // 0x62 'b'
+    [0x00, 0x00, 0x1E, 0x33, 0x03, 0x33, 0x1E, 0x00], // 0x63 'c'
+    [0x38, 0x30, 0x30, 0x3E, 0x33, 0x33, 0x6E, 0x00], // 0x64 'd'
+    [0x00, 0x00, 0x1E, 0x33, 0x3F, 0x03, 0x1E, 0x00], // 0x65 'e'
+    [0x1C, 0x36, 0x06, 0x0F, 0x06, 0x06, 0x0F, 0x00], // 0x66 'f'
+    [0x00, 0x00, 0x6E, 0x33, 0x33, 0x3E, 0x30, 0x1F], // 0x67 'g'
+    [0x07, 0x06, 0x36, 0x6E, 0x66, 0x66, 0x67, 0x00], // 0x68 'h'
+    [0x0C, 0x00, 0x0E, 0x0C, 0x0C, 0x0C, 0x1E, 0x00], // 0x69 'i'
+    [0x30, 0x00, 0x30, 0x30, 0x30, 0x33, 0x33, 0x1E], // 0x6A 'j'
+    [0x07, 0x06, 0x66, 0x36, 0x1E, 0x36, 0x67, 0x00], // 0x6B 'k'
+    [0x0E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00], // 0x6C 'l'
+    [0x00, 0x00, 0x33, 0x7F, 0x7F, 0x6B, 0x63, 0x00], // 0x6D 'm'
+    [0x00, 0x00, 0x1F, 0x33, 0x33, 0x33, 0x33, 0x00], // 0x6E 'n'
+    [0x00, 0x00, 0x1E, 0x33, 0x33, 0x33, 0x1E, 0x00], // 0x6F 'o'
+    [0x00, 0x00, 0x3B, 0x66, 0x66, 0x3E, 0x06, 0x0F], // 0x70 'p'
+    [0x00, 0x00, 0x6E, 0x33, 0x33, 0x3E, 0x30, 0x78], // 0x71 'q'
+    [0x00, 0x00, 0x3B, 0x6E, 0x66, 0x06, 0x0F, 0x00], // 0x72 'r'
+    [0x00, 0x00, 0x3E, 0x03, 0x1E, 0x30, 0x1F, 0x00], // 0x73 's'
+    [0x08, 0x0C, 0x3E, 0x0C, 0x0C, 0x2C, 0x18, 0x00], // 0x74 't'
+    [0x00, 0x00, 0x33, 0x33, 0x33, 0x33, 0x6E, 0x00], // 0x75 'u'
+    [0x00, 0x00, 0x33, 0x33, 0x33, 0x1E, 0x0C, 0x00], // 0x76 'v'
+    [0x00, 0x00, 0x63, 0x6B, 0x7F, 0x7F, 0x36, 0x00], // 0x77 'w'
+    [0x00, 0x00, 0x63, 0x36, 0x1C, 0x36, 0x63, 0x00], // 0x78 'x'
+    [0x00, 0x00, 0x33, 0x33, 0x33, 0x3E, 0x30, 0x1F], // 0x79 'y'
+    [0x00, 0x00, 0x3F, 0x19, 0x0C, 0x26, 0x3F, 0x00], // 0x7A 'z'
+    [0x38, 0x0C, 0x0C, 0x07, 0x0C, 0x0C, 0x38, 0x00], // 0x7B '{'
+    [0x18, 0x18, 0x18, 0x00, 0x18, 0x18, 0x18, 0x00], // 0x7C '|'
+    [0x07, 0x0C, 0x0C, 0x38, 0x0C, 0x0C, 0x07, 0x00], // 0x7D '}'
+    [0x6E, 0x3B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 0x7E '~'
+];
+
+#[inline(always)]
+fn ascii_8x8_glyph(ch: char) -> [u8; 8] {
+    let cp = ch as u32;
+    if (0x20..=0x7E).contains(&cp) {
+        ASCII_8X8[(cp - 0x20) as usize]
+    } else if ch == '—' || ch == '–' {
+        ASCII_8X8[(b'-' - 0x20) as usize]
+    } else {
+        ASCII_8X8[(b'?' - 0x20) as usize]
+    }
+}
+
+/// Anti-aliased TTF font renderer (`ttf`/`std`) with zero-dependency `#![no_std]` 8x8 bitmap fallback.
 pub struct FontRenderer {
+    #[cfg(feature = "ttf")]
+    custom_ttf: Option<FontVec>,
     #[cfg(feature = "std")]
-    ttf: std::sync::OnceLock<Option<FontVec>>,
+    system_ttf: std::sync::OnceLock<Option<FontVec>>,
 }
 
 impl Default for FontRenderer {
@@ -623,40 +875,57 @@ impl Default for FontRenderer {
 
 impl FontRenderer {
     pub fn new() -> Self {
-        #[cfg(feature = "std")]
-        {
-            Self {
-                ttf: std::sync::OnceLock::new(),
-            }
-        }
-        #[cfg(not(feature = "std"))]
-        {
-            Self {}
+        Self {
+            #[cfg(feature = "ttf")]
+            custom_ttf: None,
+            #[cfg(feature = "std")]
+            system_ttf: std::sync::OnceLock::new(),
         }
     }
 
-    #[cfg(feature = "std")]
+    /// Construct a `FontRenderer` from raw `.ttf`/`.otf` font bytes in `#![no_std]` + `alloc` (`ttf` feature).
+    #[cfg(feature = "ttf")]
+    pub fn from_ttf_bytes(bytes: Vec<u8>) -> Option<Self> {
+        let font = FontVec::try_from_vec(bytes).ok()?;
+        Some(Self {
+            custom_ttf: Some(font),
+            #[cfg(feature = "std")]
+            system_ttf: std::sync::OnceLock::new(),
+        })
+    }
+
+    #[cfg(feature = "ttf")]
     fn get_ttf(&self) -> Option<&FontVec> {
-        self.ttf
-            .get_or_init(|| {
-                let font_paths = [
-                    "/usr/share/fonts/chromeos/roboto/Roboto-Regular.ttf",
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-                    "/usr/share/fonts/TTF/DejaVuSans.ttf",
-                    "/ui/fonts/Mono/Fira/Regular.ttf",
-                    "/ui/fonts/Sans/Fira/Regular.ttf",
-                ];
-                for p in font_paths {
-                    if let Ok(bytes) = std::fs::read(p) {
-                        if let Ok(f) = FontVec::try_from_vec(bytes) {
-                            return Some(f);
+        if let Some(f) = &self.custom_ttf {
+            return Some(f);
+        }
+        #[cfg(feature = "std")]
+        {
+            self.system_ttf
+                .get_or_init(|| {
+                    let font_paths = [
+                        "/usr/share/fonts/chromeos/roboto/Roboto-Regular.ttf",
+                        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+                        "/ui/fonts/Mono/Fira/Regular.ttf",
+                        "/ui/fonts/Sans/Fira/Regular.ttf",
+                    ];
+                    for p in font_paths {
+                        if let Ok(bytes) = std::fs::read(p) {
+                            if let Ok(f) = FontVec::try_from_vec(bytes) {
+                                return Some(f);
+                            }
                         }
                     }
-                }
-                None
-            })
-            .as_ref()
+                    None
+                })
+                .as_ref()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            None
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -672,7 +941,7 @@ impl FontRenderer {
         text: &str,
         max_w: i32,
     ) -> i32 {
-        #[cfg(feature = "std")]
+        #[cfg(feature = "ttf")]
         if let Some(font) = self.get_ttf() {
             let scale = PxScale::from(_size_px);
             let scaled = font.as_scaled(scale);
@@ -721,13 +990,12 @@ impl FontRenderer {
             return (pen_x - x as f32) as i32;
         }
 
-        use font8x8::UnicodeFonts;
         let mut pen_x = x;
         for ch in text.chars() {
             if pen_x + 8 > x + max_w {
                 break;
             }
-            let glyph = font8x8::BASIC_FONTS.get(ch).unwrap_or([0; 8]);
+            let glyph = ascii_8x8_glyph(ch);
             for (row, &bits) in glyph.iter().enumerate() {
                 let py = y + 3 + row as i32;
                 if py < 0 || (py as u32) >= buf_h {
@@ -832,13 +1100,15 @@ pub const MOD_BUTTON1: u32 = 1 << 20;
 pub const MOD_BUTTON2: u32 = 1 << 21;
 pub const MOD_BUTTON3: u32 = 1 << 22;
 
+const MAX_TILE_CACHE_ENTRIES: usize = 2048;
+
 /// Convert a byte slice of little-endian BGRA8 pixels into `0x00RRGGBB` `u32` words.
 #[inline(always)]
 fn copy_bgra_row_to_u32(src_bgra: &[u8], dst_u32: &mut [u32]) {
     let n = dst_u32.len().min(src_bgra.len() / 4);
     let (chunks, _) = src_bgra[..n * 4].as_chunks::<4>();
     for (px, dst) in chunks.iter().zip(&mut dst_u32[..n]) {
-        *dst = u32::from_le_bytes([px[0], px[1], px[2], 0]);
+        *dst = u32::from_le_bytes(*px) & 0x00FF_FFFF;
     }
 }
 
@@ -848,7 +1118,9 @@ fn copy_bgra_row_to_u32(src_bgra: &[u8], dst_u32: &mut [u32]) {
 /// framebuffer (`&mut [u32]`).
 pub struct BrowserCore {
     pub win_size: (u32, u32),
+    pub builtin_chrome: bool,
     pub font: FontRenderer,
+    pub decoder: FrameDecoder,
     pub outbound_inputs: Vec<InputEvent>,
     #[cfg(feature = "std")]
     pub input_tx: Option<std::sync::mpsc::Sender<InputEvent>>,
@@ -859,17 +1131,21 @@ pub struct BrowserCore {
     pub active_buf: Option<TabBuffer>,
     pub tab_composites: BTreeMap<u32, TabBuffer>,
     pub tile_cache: BTreeMap<u64, Vec<u32>>,
+    save_tab_snapshot: Option<u32>,
 
     pub cursor: (i32, i32),
     pub cursor_shape: CursorShape,
     pub window_title: String,
     pub mods: u32,
     pub url_buf: String,
+    pub clipboard: String,
+    pub downloaded_files: Vec<(String, Vec<u8>)>,
     pub editing: bool,
     pub is_loading: bool,
     pub zoom_milli: u32,
     pub status_toast_text: Option<String>,
     pub status_toast_frames_left: u32,
+    toast_underlay: Option<(u32, u32, u32, u32, Vec<u32>)>,
 
     pub chrome_dirty: bool,
     pub full_content_dirty: bool,
@@ -897,7 +1173,9 @@ impl BrowserCore {
     pub fn new_no_std(width: u32, height: u32, initial_url: String, editing: bool) -> Self {
         Self {
             win_size: (width, height),
+            builtin_chrome: true,
             font: FontRenderer::new(),
+            decoder: FrameDecoder::new(),
             outbound_inputs: Vec::with_capacity(16),
             #[cfg(feature = "std")]
             input_tx: None,
@@ -913,16 +1191,20 @@ impl BrowserCore {
             active_buf: None,
             tab_composites: BTreeMap::new(),
             tile_cache: BTreeMap::new(),
+            save_tab_snapshot: None,
             cursor: (0, 0),
             cursor_shape: CursorShape::Default,
             window_title: "ExoBrowser".into(),
             mods: 0,
             url_buf: initial_url,
+            clipboard: String::new(),
+            downloaded_files: Vec::new(),
             editing,
             is_loading: false,
             zoom_milli: 1000,
             status_toast_text: None,
             status_toast_frames_left: 0,
+            toast_underlay: None,
             chrome_dirty: true,
             full_content_dirty: true,
             pending_damage: Vec::with_capacity(16),
@@ -941,6 +1223,28 @@ impl BrowserCore {
             frames_seen: 0,
             synth_cursor: None,
         }
+    }
+
+    #[inline(always)]
+    pub fn chrome_h(&self) -> u32 {
+        if self.builtin_chrome {
+            CHROME_H
+        } else {
+            0
+        }
+    }
+
+    /// Returns `true` if `render_into` has pending visual changes to composite.
+    #[inline]
+    pub fn needs_redraw(&self) -> bool {
+        self.chrome_dirty
+            || self.full_content_dirty
+            || !self.pending_frames.is_empty()
+            || !self.pending_subframes.is_empty()
+            || !self.pending_tiles.is_empty()
+            || !self.pending_damage.is_empty()
+            || self.status_toast_frames_left > 0
+            || self.toast_underlay.is_some()
     }
 
     /// Construct a [`BrowserCore`] wired to an outbound `std::sync::mpsc::Sender<InputEvent>`.
@@ -979,7 +1283,7 @@ impl BrowserCore {
 
     /// Encode a `Message::Hello` handshake packet for this client's current viewport into `out`.
     pub fn encode_hello(&self, out: &mut Vec<u8>) {
-        let content_h = self.win_size.1.saturating_sub(CHROME_H).max(1);
+        let content_h = self.win_size.1.saturating_sub(self.chrome_h()).max(1);
         let hello = Message::Hello {
             proto_version: PROTO_VERSION,
             viewport_w: self.win_size.0.min(u16::MAX as u32) as u16,
@@ -989,6 +1293,23 @@ impl BrowserCore {
             capabilities: caps::H264 | caps::OPUS | caps::CLIENT_SCROLL,
         };
         hello.encode(out);
+    }
+
+    /// Push a chunk of raw wire bytes into the internal cursor-based [`FrameDecoder`] and
+    /// apply all complete [`gutted_proto::Message`] frames. Usable in `#![no_std]` + `alloc`.
+    pub fn ingest_wire_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> core::result::Result<usize, gutted_proto::Error> {
+        self.decoder.push(chunk);
+        let mut count = 0usize;
+        while let Some(msg) = self.decoder.next_message()? {
+            count += 1;
+            if let Some(rev) = RenderEvent::from_proto_message(msg) {
+                self.handle_render_event(rev);
+            }
+        }
+        Ok(count)
     }
 
     /// Decode and apply all complete [`gutted_proto::Message`] frames present in `inbuf`,
@@ -1026,14 +1347,107 @@ impl BrowserCore {
         self.pending_audio.drain(..)
     }
 
+    /// Drain completed file downloads `(filename, bytes)` (for `#![no_std]` VFS / ramdisk storage).
+    pub fn drain_downloads(&mut self) -> alloc::vec::Drain<'_, (String, Vec<u8>)> {
+        self.downloaded_files.drain(..)
+    }
+
+    /// Upload a file directly from raw bytes into `self.active_tab_id` (usable in `#![no_std]` + `alloc`).
+    pub fn upload_file_bytes(&mut self, filename: String, mime_type: String, data: Vec<u8>) {
+        let len = data.len();
+        self.status_toast_text = Some(format!("Uploaded {} ({} B)", filename, len));
+        self.status_toast_frames_left = 75;
+        self.chrome_dirty = true;
+        self.emit_input(InputEvent::FileUpload {
+            tab_id: self.active_tab_id,
+            filename,
+            mime_type,
+            data,
+        });
+    }
+
+    #[cfg(feature = "std")]
+    pub fn upload_file_from_path(&mut self, raw_path: &str, target_tab: u32) -> bool {
+        let path = std::path::Path::new(raw_path.trim());
+        match std::fs::read(path) {
+            Ok(data) => {
+                let filename = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("upload.bin")
+                    .to_string();
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let mime_type = match ext.as_str() {
+                    "txt" | "md" | "rs" | "c" | "py" | "json" | "csv" => "text/plain",
+                    "html" | "htm" => "text/html",
+                    "png" => "image/png",
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "gif" => "image/gif",
+                    "webp" => "image/webp",
+                    "svg" => "image/svg+xml",
+                    "pdf" => "application/pdf",
+                    "zip" => "application/zip",
+                    _ => "application/octet-stream",
+                }
+                .to_string();
+                let len = data.len();
+                self.status_toast_text = Some(format!("Uploaded {} ({} B)", filename, len));
+                self.status_toast_frames_left = 75;
+                self.chrome_dirty = true;
+                self.emit_input(InputEvent::FileUpload {
+                    tab_id: target_tab,
+                    filename,
+                    mime_type,
+                    data,
+                });
+                true
+            }
+            Err(e) => {
+                self.status_toast_text = Some(format!("Upload failed: {}", e));
+                self.status_toast_frames_left = 90;
+                self.chrome_dirty = true;
+                false
+            }
+        }
+    }
+
+    #[inline]
+    fn switch_to_tab_local(&mut self, new_tab_id: u32) {
+        if self.active_tab_id == new_tab_id {
+            return;
+        }
+        let old_id = self.active_tab_id;
+        if let Some(cur) = self.active_buf.take() {
+            self.tab_composites.insert(old_id, cur);
+        } else if self.save_tab_snapshot.is_none() {
+            self.save_tab_snapshot = Some(old_id);
+        }
+        self.active_tab_id = new_tab_id;
+        self.active_buf = self.tab_composites.remove(&new_tab_id);
+        if let Some(t) = self.tabs.iter().find(|t| t.id == new_tab_id) {
+            if !self.editing {
+                self.url_buf = t.url.clone();
+            }
+            self.is_loading = t.is_loading;
+        }
+        self.full_content_dirty = self.active_buf.is_some();
+        self.chrome_dirty = true;
+    }
+
     pub fn on_resize(&mut self, w: u32, h: u32) {
+        let chrome_h = self.chrome_h();
         let w = w.max(64);
-        let h = h.max(CHROME_H + 64);
+        let h = h.max(chrome_h + 64);
         if self.win_size != (w, h) {
             self.win_size = (w, h);
+            self.toast_underlay = None;
             self.chrome_dirty = true;
             self.full_content_dirty = true;
-            let content_h = h.saturating_sub(CHROME_H).max(1);
+            let content_h = h.saturating_sub(chrome_h).max(1);
             self.emit_input(InputEvent::Resize {
                 w: w.min(u16::MAX as u32) as u16,
                 h: content_h.min(u16::MAX as u32) as u16,
@@ -1042,6 +1456,21 @@ impl BrowserCore {
     }
 
     pub fn submit_omnibox(&mut self) {
+        if let Some(_rest) = self.url_buf.trim().strip_prefix("upload:") {
+            #[cfg(feature = "std")]
+            let path_str = _rest.trim().to_string();
+            self.editing = false;
+            if let Some(t) = self.tabs.iter().find(|t| t.id == self.active_tab_id) {
+                self.url_buf = t.url.clone();
+            }
+            #[cfg(feature = "std")]
+            if !path_str.is_empty() {
+                self.upload_file_from_path(&path_str, self.active_tab_id);
+                return;
+            }
+            self.chrome_dirty = true;
+            return;
+        }
         let url = canonicalize_url(&self.url_buf);
         self.url_buf = url.clone();
         self.editing = false;
@@ -1083,6 +1512,15 @@ impl BrowserCore {
                 if s.pixels.len() < expected {
                     return true;
                 }
+                // Drop any older queued subframes completely covered by this newer subframe
+                let sx1 = s.x.saturating_add(s.w);
+                let sy1 = s.y.saturating_add(s.h);
+                self.pending_subframes.retain(|old| {
+                    !(old.x >= s.x
+                        && old.y >= s.y
+                        && old.x.saturating_add(old.w) <= sx1
+                        && old.y.saturating_add(old.h) <= sy1)
+                });
                 self.pending_damage.push(DamageRect {
                     x: s.x,
                     y: s.y,
@@ -1094,6 +1532,13 @@ impl BrowserCore {
             }
             RenderEvent::TileData { hash, pixels } => {
                 if pixels.len() >= 64 * 64 * 4 {
+                    if self.tile_cache.len() >= MAX_TILE_CACHE_ENTRIES
+                        && !self.tile_cache.contains_key(&hash)
+                    {
+                        if let Some(&evict_key) = self.tile_cache.keys().next() {
+                            self.tile_cache.remove(&evict_key);
+                        }
+                    }
                     let mut words = vec![0u32; 64 * 64];
                     copy_bgra_row_to_u32(&pixels[..64 * 64 * 4], &mut words);
                     self.tile_cache.insert(hash, words);
@@ -1205,20 +1650,7 @@ impl BrowserCore {
                 self.chrome_dirty = true;
             }
             RenderEvent::TabActivated { tab_id } => {
-                if self.active_tab_id != tab_id {
-                    if let Some(cur) = self.active_buf.take() {
-                        self.tab_composites.insert(self.active_tab_id, cur);
-                    }
-                    self.active_tab_id = tab_id;
-                    self.active_buf = self.tab_composites.remove(&tab_id);
-                    if let Some(t) = self.tabs.iter().find(|t| t.id == tab_id) {
-                        if !self.editing {
-                            self.url_buf = t.url.clone();
-                        }
-                        self.is_loading = t.is_loading;
-                    }
-                    self.full_content_dirty = true;
-                }
+                self.switch_to_tab_local(tab_id);
                 self.chrome_dirty = true;
             }
             RenderEvent::TabTitle { tab_id, title } => {
@@ -1236,6 +1668,52 @@ impl BrowserCore {
                     }
                     self.chrome_dirty = true;
                 }
+            }
+            RenderEvent::Clipboard(text) => {
+                self.clipboard = text;
+            }
+            RenderEvent::FileChooserPrompt { tab_id: _tab_id, .. } => {
+                #[cfg(feature = "std")]
+                if let Ok(env_path) = std::env::var("GBROWSER_UPLOAD_FILE") {
+                    let target_tab = if _tab_id == 0 { self.active_tab_id } else { _tab_id };
+                    if !env_path.is_empty() && self.upload_file_from_path(&env_path, target_tab) {
+                        return true;
+                    }
+                }
+                self.editing = true;
+                self.url_buf = "upload:".into();
+                self.status_toast_text =
+                    Some("File chooser open: type path after upload: and press Enter".into());
+                self.status_toast_frames_left = 120;
+                self.chrome_dirty = true;
+            }
+            RenderEvent::FileDownload { filename, data } => {
+                let safe_name: String = filename
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
+                    .collect();
+                let safe_name = if safe_name.is_empty() {
+                    "download.bin".to_string()
+                } else {
+                    safe_name
+                };
+                let bytes_len = data.len();
+                #[cfg(feature = "std")]
+                {
+                    let dir = "/tmp/gutted-downloads";
+                    let _ = std::fs::create_dir_all(dir);
+                    let path = format!("{dir}/{safe_name}");
+                    let _ = std::fs::write(&path, &data);
+                    log_info(
+                        "gutted_client::render",
+                        &format!("saved download path={path} bytes={bytes_len}"),
+                    );
+                }
+                self.status_toast_text =
+                    Some(format!("Downloaded {} ({} B)", safe_name, bytes_len));
+                self.status_toast_frames_left = 90;
+                self.downloaded_files.push((safe_name, data));
+                self.chrome_dirty = true;
             }
         }
         true
@@ -1309,7 +1787,7 @@ impl BrowserCore {
                 .draw_text(buf, bw, bh, bx + 9, ny + 10, 13.5, 0xE5E7EB, label, 16);
         }
 
-        let right_w = 216;
+        let right_w = 262;
         let right_x = (bw as i32 - right_w).max(200);
 
         // Omnibox pill
@@ -1354,8 +1832,14 @@ impl BrowserCore {
             fill_rect(buf, bw, bh, caret_x, ny + 10, 2, 18, 0x60A5FA);
         }
 
+        // File upload button: [UPL]
+        let upl_x = right_x;
+        fill_rounded_rect(buf, bw, bh, upl_x, ny + 6, 40, 26, 6, 0x1E3A5F);
+        self.font
+            .draw_text(buf, bw, bh, upl_x + 7, ny + 11, 11.5, 0x93C5FD, "UPL", 30);
+
         // Audio mute/playing button
-        let aud_x = right_x;
+        let aud_x = right_x + 46;
         let aud_bg = if self.audio_muted {
             0x7F1D1D
         } else if self.audio_playing_frames_left > 0 {
@@ -1369,7 +1853,7 @@ impl BrowserCore {
             .draw_text(buf, bw, bh, aud_x + 6, ny + 11, 11.5, 0xF3F4F6, aud_txt, 34);
 
         // Zoom controls: [-] [100%] [+]
-        let zm_x = right_x + 48;
+        let zm_x = right_x + 94;
         fill_rounded_rect(buf, bw, bh, zm_x, ny + 6, 114, 26, 6, 0x2A2A38);
         self.font
             .draw_text(buf, bw, bh, zm_x + 8, ny + 10, 14.0, 0xE5E7EB, "-", 14);
@@ -1380,7 +1864,7 @@ impl BrowserCore {
             .draw_text(buf, bw, bh, zm_x + 94, ny + 10, 14.0, 0xE5E7EB, "+", 14);
 
         // Clear Data button: [CLR]
-        let clr_x = right_x + 168;
+        let clr_x = right_x + 214;
         fill_rounded_rect(buf, bw, bh, clr_x, ny + 6, 40, 26, 6, 0x3F232A);
         self.font
             .draw_text(buf, bw, bh, clr_x + 7, ny + 11, 11.5, 0xFCA5A5, "CLR", 30);
@@ -1500,9 +1984,6 @@ impl BrowserCore {
                         let new_id = self.next_tab_id;
                         self.next_tab_id += 1;
                         let url = "https://duckduckgo.com".to_string();
-                        if let Some(cur) = self.active_buf.take() {
-                            self.tab_composites.insert(self.active_tab_id, cur);
-                        }
                         self.tabs.push(TabInfo {
                             id: new_id,
                             title: "New Tab".into(),
@@ -1510,13 +1991,54 @@ impl BrowserCore {
                             is_loading: true,
                             is_secure: true,
                         });
-                        self.active_tab_id = new_id;
+                        self.switch_to_tab_local(new_id);
                         self.url_buf = url.clone();
                         self.editing = false;
                         self.full_content_dirty = true;
-                        self.chrome_dirty = true;
                         self.emit_input(InputEvent::CreateTab { tab_id: new_id, url });
                         return false;
+                    }
+                    0x0075 | 0x0055 => {
+                        self.editing = true;
+                        self.url_buf = "upload:".into();
+                        self.chrome_dirty = true;
+                        return false;
+                    }
+                    0x0063 | 0x0043 => {
+                        if self.editing {
+                            self.clipboard = self.url_buf.clone();
+                            self.status_toast_text = Some("Copied URL to clipboard".into());
+                            self.status_toast_frames_left = 45;
+                            self.chrome_dirty = true;
+                            return false;
+                        }
+                    }
+                    0x0078 | 0x0058 => {
+                        if self.editing {
+                            self.clipboard = self.url_buf.clone();
+                            self.url_buf.clear();
+                            self.chrome_dirty = true;
+                            return false;
+                        }
+                    }
+                    0x0076 | 0x0056 => {
+                        if self.editing {
+                            self.url_buf.push_str(&self.clipboard);
+                            self.chrome_dirty = true;
+                            return false;
+                        } else if !self.clipboard.is_empty() {
+                            self.emit_input(InputEvent::Clipboard(self.clipboard.clone()));
+                            return false;
+                        }
+                    }
+                    0x0031..=0x0039 => {
+                        let target_idx = (keysym - 0x0031) as usize;
+                        if target_idx < self.tabs.len() {
+                            let target_id = self.tabs[target_idx].id;
+                            self.switch_to_tab_local(target_id);
+                            self.emit_input(InputEvent::SwitchTab { tab_id: target_id });
+                            return false;
+                        }
                     }
                     0x0077 | 0x0057 => {
                         if self.tabs.len() > 1 {
@@ -1568,25 +2090,26 @@ impl BrowserCore {
                         self.chrome_dirty = true;
                         return false;
                     }
-                    0xff09 => {
+                    0xff09 | 0xfe20 => {
                         if self.tabs.len() > 1 {
+                            let shift = (self.mods & MOD_SHIFT) != 0 || keysym == 0xfe20;
                             let idx = self
                                 .tabs
                                 .iter()
                                 .position(|t| t.id == self.active_tab_id)
                                 .unwrap_or(0);
-                            let next_id = self.tabs[(idx + 1) % self.tabs.len()].id;
-                            if let Some(cur) = self.active_buf.take() {
-                                self.tab_composites.insert(self.active_tab_id, cur);
-                            }
-                            self.active_tab_id = next_id;
-                            self.active_buf = self.tab_composites.remove(&next_id);
-                            if let Some(t) = self.tabs.iter().find(|t| t.id == next_id) {
-                                self.url_buf = t.url.clone();
-                            }
+                            let next_idx = if shift {
+                                if idx == 0 {
+                                    self.tabs.len() - 1
+                                } else {
+                                    idx - 1
+                                }
+                            } else {
+                                (idx + 1) % self.tabs.len()
+                            };
+                            let next_id = self.tabs[next_idx].id;
+                            self.switch_to_tab_local(next_id);
                             self.emit_input(InputEvent::SwitchTab { tab_id: next_id });
-                            self.full_content_dirty = true;
-                            self.chrome_dirty = true;
                         }
                         return false;
                     }
@@ -1678,16 +2201,9 @@ impl BrowserCore {
                         return;
                     }
                     if self.active_tab_id != tab_id {
-                        if let Some(cur) = self.active_buf.take() {
-                            self.tab_composites.insert(self.active_tab_id, cur);
-                        }
-                        self.active_tab_id = tab_id;
-                        self.active_buf = self.tab_composites.remove(&tab_id);
-                        self.url_buf = self.tabs[i].url.clone();
+                        self.switch_to_tab_local(tab_id);
                         self.editing = false;
                         self.emit_input(InputEvent::SwitchTab { tab_id });
-                        self.full_content_dirty = true;
-                        self.chrome_dirty = true;
                     }
                     return;
                 }
@@ -1698,9 +2214,6 @@ impl BrowserCore {
                 let new_id = self.next_tab_id;
                 self.next_tab_id += 1;
                 let url = "https://duckduckgo.com".to_string();
-                if let Some(cur) = self.active_buf.take() {
-                    self.tab_composites.insert(self.active_tab_id, cur);
-                }
                 self.tabs.push(TabInfo {
                     id: new_id,
                     title: "New Tab".into(),
@@ -1708,11 +2221,10 @@ impl BrowserCore {
                     is_loading: true,
                     is_secure: true,
                 });
-                self.active_tab_id = new_id;
+                self.switch_to_tab_local(new_id);
                 self.url_buf = url.clone();
                 self.editing = false;
                 self.full_content_dirty = true;
-                self.chrome_dirty = true;
                 self.emit_input(InputEvent::CreateTab { tab_id: new_id, url });
             }
             return;
@@ -1744,7 +2256,7 @@ impl BrowserCore {
                 return;
             }
 
-            let right_w = 216;
+            let right_w = 262;
             let right_x = (bw - right_w).max(200);
             let omni_x = 140;
             let omni_w = (right_x - omni_x - 10).max(80);
@@ -1758,13 +2270,31 @@ impl BrowserCore {
                 return;
             }
 
-            if x >= right_x && x < right_x + 42 {
+            if x >= right_x && x < right_x + 40 {
+                #[cfg(feature = "std")]
+                if let Ok(env_path) = std::env::var("GBROWSER_UPLOAD_FILE") {
+                    if !env_path.is_empty() {
+                        self.upload_file_from_path(&env_path, self.active_tab_id);
+                        return;
+                    }
+                }
+                self.editing = true;
+                self.url_buf = "upload:".into();
+                self.status_toast_text =
+                    Some("Type local file path after upload: and press Enter".into());
+                self.status_toast_frames_left = 90;
+                self.chrome_dirty = true;
+                return;
+            }
+
+            let aud_x = right_x + 46;
+            if x >= aud_x && x < aud_x + 42 {
                 self.audio_muted = !self.audio_muted;
                 self.chrome_dirty = true;
                 return;
             }
 
-            let zm_x = right_x + 48;
+            let zm_x = right_x + 94;
             if x >= zm_x && x < zm_x + 28 {
                 self.zoom_milli = self.zoom_milli.saturating_sub(100).max(300);
                 self.emit_input(InputEvent::SetZoom {
@@ -1788,7 +2318,7 @@ impl BrowserCore {
                 return;
             }
 
-            let clr_x = right_x + 168;
+            let clr_x = right_x + 214;
             if x >= clr_x && x < clr_x + 40 {
                 self.emit_input(InputEvent::ClearData {
                     clear_cookies: true,
@@ -1841,42 +2371,86 @@ impl BrowserCore {
         }
 
         let mut damage = Vec::new();
+        let chrome_h = self.chrome_h().min(bh);
+
+        // Restore any previously drawn status toast underlay before applying new frame updates
+        if let Some((ux, uy, uw, uh, under)) = self.toast_underlay.take() {
+            if ux + uw <= bw && uy + uh <= bh && under.len() == (uw * uh) as usize {
+                for r in 0..uh as usize {
+                    let dst = (uy as usize + r) * bw as usize + ux as usize;
+                    let src = r * uw as usize;
+                    buffer[dst..dst + uw as usize].copy_from_slice(&under[src..src + uw as usize]);
+                }
+                if self.status_toast_frames_left == 0 {
+                    damage.push(DamageRect {
+                        x: ux,
+                        y: uy,
+                        w: uw,
+                        h: uh,
+                    });
+                }
+            }
+        }
 
         if self.chrome_dirty {
-            self.draw_chrome(buffer, bw, bh);
-            damage.push(DamageRect {
-                x: 0,
-                y: 0,
-                w: bw,
-                h: CHROME_H.min(bh),
-            });
+            if self.builtin_chrome && chrome_h > 0 {
+                self.draw_chrome(buffer, bw, bh);
+                damage.push(DamageRect {
+                    x: 0,
+                    y: 0,
+                    w: bw,
+                    h: chrome_h,
+                });
+            }
             self.chrome_dirty = false;
         }
 
-        let content_h = bh.saturating_sub(CHROME_H);
+        let content_h = bh.saturating_sub(chrome_h);
         if content_h > 0 {
+            if let Some(old_id) = self.save_tab_snapshot.take() {
+                if self.tabs.iter().any(|t| t.id == old_id) {
+                    let start = (chrome_h * bw) as usize;
+                    self.tab_composites.insert(
+                        old_id,
+                        TabBuffer {
+                            w: bw,
+                            h: content_h,
+                            pixels: buffer[start..needed].to_vec(),
+                        },
+                    );
+                }
+            }
             if let Some(f) = self.pending_frames.pop() {
                 self.pending_frames.clear();
                 let copy_w = f.width.min(bw) as usize;
                 let copy_h = f.height.min(content_h) as usize;
-                for row in 0..copy_h {
-                    let dst_start = (CHROME_H as usize + row) * bw as usize;
-                    let src_start = row * f.stride as usize;
+                if copy_w == bw as usize && f.stride as usize == copy_w * 4 {
+                    let dst_start = (chrome_h as usize) * (bw as usize);
+                    let total_px = copy_w * copy_h;
                     copy_bgra_row_to_u32(
-                        &f.pixels[src_start..src_start + copy_w * 4],
-                        &mut buffer[dst_start..dst_start + copy_w],
+                        &f.pixels[..total_px * 4],
+                        &mut buffer[dst_start..dst_start + total_px],
                     );
-                    if copy_w < bw as usize {
-                        buffer[dst_start + copy_w..dst_start + bw as usize].fill(0x0F0F12);
+                } else {
+                    for row in 0..copy_h {
+                        let dst_start = (chrome_h as usize + row) * bw as usize;
+                        let src_start = row * f.stride as usize;
+                        copy_bgra_row_to_u32(
+                            &f.pixels[src_start..src_start + copy_w * 4],
+                            &mut buffer[dst_start..dst_start + copy_w],
+                        );
+                        if copy_w < bw as usize {
+                            buffer[dst_start + copy_w..dst_start + bw as usize].fill(0x0F0F12);
+                        }
                     }
                 }
                 if copy_h < content_h as usize {
-                    let pad_start = (CHROME_H as usize + copy_h) * bw as usize;
+                    let pad_start = (chrome_h as usize + copy_h) * bw as usize;
                     buffer[pad_start..needed].fill(0x0F0F12);
                 }
                 damage.push(DamageRect {
                     x: 0,
-                    y: CHROME_H,
+                    y: chrome_h,
                     w: bw,
                     h: content_h,
                 });
@@ -1887,7 +2461,7 @@ impl BrowserCore {
                     let copy_w = tb.w.min(bw) as usize;
                     let copy_h = tb.h.min(content_h) as usize;
                     for row in 0..copy_h {
-                        let dst_start = (CHROME_H as usize + row) * bw as usize;
+                        let dst_start = (chrome_h as usize + row) * bw as usize;
                         let src_start = row * tb.w as usize;
                         buffer[dst_start..dst_start + copy_w]
                             .copy_from_slice(&tb.pixels[src_start..src_start + copy_w]);
@@ -1896,16 +2470,16 @@ impl BrowserCore {
                         }
                     }
                     if copy_h < content_h as usize {
-                        let pad_start = (CHROME_H as usize + copy_h) * bw as usize;
+                        let pad_start = (chrome_h as usize + copy_h) * bw as usize;
                         buffer[pad_start..needed].fill(0x0F0F12);
                     }
                 } else {
-                    let start = (CHROME_H * bw) as usize;
+                    let start = (chrome_h * bw) as usize;
                     buffer[start..needed].fill(0x0F0F12);
                 }
                 damage.push(DamageRect {
                     x: 0,
-                    y: CHROME_H,
+                    y: chrome_h,
                     w: bw,
                     h: content_h,
                 });
@@ -1923,7 +2497,7 @@ impl BrowserCore {
                     for row in 0..copy_h {
                         let src_off = row * s.stride as usize;
                         let dst_off =
-                            (CHROME_H as usize + y0 as usize + row) * bw as usize + x0 as usize;
+                            (chrome_h as usize + y0 as usize + row) * bw as usize + x0 as usize;
                         copy_bgra_row_to_u32(
                             &s.pixels[src_off..src_off + copy_w * 4],
                             &mut buffer[dst_off..dst_off + copy_w],
@@ -1931,7 +2505,7 @@ impl BrowserCore {
                     }
                     damage.push(DamageRect {
                         x: x0,
-                        y: CHROME_H + y0,
+                        y: chrome_h + y0,
                         w: x1 - x0,
                         h: y1 - y0,
                     });
@@ -1947,7 +2521,7 @@ impl BrowserCore {
                         let copy_w = (x1 - x0) as usize;
                         let copy_h = (y1 - y0) as usize;
                         for row in 0..copy_h {
-                            let dst_off = (CHROME_H as usize + y0 as usize + row) * bw as usize
+                            let dst_off = (chrome_h as usize + y0 as usize + row) * bw as usize
                                 + x0 as usize;
                             let src_off = row * 64;
                             buffer[dst_off..dst_off + copy_w]
@@ -1955,7 +2529,7 @@ impl BrowserCore {
                         }
                         damage.push(DamageRect {
                             x: x0,
-                            y: CHROME_H + y0,
+                            y: chrome_h + y0,
                             w: x1 - x0,
                             h: y1 - y0,
                         });
@@ -1970,18 +2544,27 @@ impl BrowserCore {
             if let Some(msg) = &self.status_toast_text {
                 let tw = (msg.len() as i32 * 7) + 24;
                 let ty = bh as i32 - 36;
-                fill_rounded_rect(buffer, bw, bh, 12, ty, tw, 24, 6, 0x1E293B);
-                self.font
-                    .draw_text(buffer, bw, bh, 22, ty + 4, 12.5, 0x93C5FD, msg, tw - 16);
-                damage.push(DamageRect {
-                    x: 12,
-                    y: ty.max(0) as u32,
-                    w: (tw as u32).min(bw),
-                    h: 24,
-                });
-            }
-            if self.status_toast_frames_left == 0 {
-                self.full_content_dirty = true;
+                let ux = 12u32.min(bw);
+                let uy = ty.max(0) as u32;
+                let uw = (tw.max(0) as u32).min(bw.saturating_sub(ux));
+                let uh = 24u32.min(bh.saturating_sub(uy));
+                if uw > 0 && uh > 0 {
+                    let mut under = Vec::with_capacity((uw * uh) as usize);
+                    for r in 0..uh as usize {
+                        let src = (uy as usize + r) * bw as usize + ux as usize;
+                        under.extend_from_slice(&buffer[src..src + uw as usize]);
+                    }
+                    self.toast_underlay = Some((ux, uy, uw, uh, under));
+                    fill_rounded_rect(buffer, bw, bh, 12, ty, tw, 24, 6, 0x1E293B);
+                    self.font
+                        .draw_text(buffer, bw, bh, 22, ty + 4, 12.5, 0x93C5FD, msg, tw - 16);
+                    damage.push(DamageRect {
+                        x: ux,
+                        y: uy,
+                        w: uw,
+                        h: uh,
+                    });
+                }
             }
         }
 
@@ -2001,7 +2584,35 @@ impl BrowserCore {
             }
         }
 
+        coalesce_damage_rects(&mut damage);
         damage
+    }
+}
+
+fn coalesce_damage_rects(rects: &mut Vec<DamageRect>) {
+    rects.retain(|r| r.w > 0 && r.h > 0);
+    if rects.len() <= 1 {
+        return;
+    }
+    let mut i = 0usize;
+    while i < rects.len() {
+        let a = rects[i];
+        let ax1 = a.x.saturating_add(a.w);
+        let ay1 = a.y.saturating_add(a.h);
+        let covered = rects.iter().enumerate().any(|(j, b)| {
+            if i == j {
+                return false;
+            }
+            let bx1 = b.x.saturating_add(b.w);
+            let by1 = b.y.saturating_add(b.h);
+            b.x <= a.x && b.y <= a.y && bx1 >= ax1 && by1 >= ay1
+                && (j < i || b.w > a.w || b.h > a.h)
+        });
+        if covered {
+            rects.remove(i);
+        } else {
+            i += 1;
+        }
     }
 }
 
@@ -2206,11 +2817,11 @@ fn run_x11_loop(
 
     loop {
         let mut dirty_from_x11 = false;
+        let mut expose_full = false;
         while let Some(ev) = conn.poll_for_event()? {
             match ev {
                 Event::Expose(_) => {
-                    core.chrome_dirty = true;
-                    core.full_content_dirty = true;
+                    expose_full = true;
                     dirty_from_x11 = true;
                 }
                 Event::ConfigureNotify(cfg) => {
@@ -2318,12 +2929,7 @@ fn run_x11_loop(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
 
-        if got_net
-            || dirty_from_x11
-            || core.chrome_dirty
-            || core.full_content_dirty
-            || !core.pending_damage.is_empty()
-        {
+        if got_net || dirty_from_x11 || core.needs_redraw() {
             if core.window_title != last_title {
                 last_title = core.window_title.clone();
                 let _ = conn.change_property8(
@@ -2335,7 +2941,16 @@ fn run_x11_loop(
                 );
             }
             let _ = ChangeWindowAttributesAux::default();
-            let damage = core.render_into(&mut framebuffer);
+            let mut damage = core.render_into(&mut framebuffer);
+            if expose_full {
+                damage.clear();
+                damage.push(DamageRect {
+                    x: 0,
+                    y: 0,
+                    w: core.win_size.0,
+                    h: core.win_size.1,
+                });
+            }
             if !damage.is_empty() {
                 present_x11_damage(
                     &conn,
@@ -2375,14 +2990,16 @@ fn present_x11_damage<C: x11rb::connection::Connection>(
         let mut ry = 0u32;
         while ry < d.h {
             let chunk_h = (d.h - ry).min(max_rows_per_chunk);
-            scratch_bytes.clear();
-            scratch_bytes.reserve(row_bytes * chunk_h as usize);
-            for r in 0..chunk_h {
-                let py = (d.y + ry + r) as usize;
+            scratch_bytes.resize(row_bytes * chunk_h as usize, 0);
+            let (dst_pixels, _) = scratch_bytes.as_chunks_mut::<4>();
+            let dw = d.w as usize;
+            for r in 0..chunk_h as usize {
+                let py = (d.y + ry) as usize + r;
                 let row_start = py * bw as usize + d.x as usize;
-                let row_slice = &framebuffer[row_start..row_start + d.w as usize];
-                for &px in row_slice {
-                    scratch_bytes.extend_from_slice(&px.to_le_bytes());
+                let row_slice = &framebuffer[row_start..row_start + dw];
+                let dst_row = &mut dst_pixels[r * dw..(r + 1) * dw];
+                for (dst, &px) in dst_row.iter_mut().zip(row_slice) {
+                    *dst = px.to_le_bytes();
                 }
             }
             conn.put_image(
@@ -2496,8 +3113,9 @@ fn run_redox_orbital_loop(
 
     let present_orbital =
         |file: &mut std::fs::File, fb: &[u32], raw: &mut [u8]| -> std::io::Result<()> {
-            for (i, &px) in fb.iter().enumerate() {
-                raw[i * 4..i * 4 + 4].copy_from_slice(&(px | 0xFF00_0000).to_le_bytes());
+            let (dst_pixels, _) = raw.as_chunks_mut::<4>();
+            for (dst, &px) in dst_pixels.iter_mut().zip(fb) {
+                *dst = (px | 0xFF00_0000).to_le_bytes();
             }
             file.write_all(raw)?;
             file.sync_data()
@@ -2588,8 +3206,20 @@ mod tests {
             canonicalize_url("rust programming"),
             "https://duckduckgo.com/?q=rust+programming"
         );
+        assert_eq!(
+            canonicalize_url("c++ & rust#1"),
+            "https://duckduckgo.com/?q=c%2B%2B+%26+rust%231"
+        );
         assert_eq!(canonicalize_url("localhost:8080"), "http://localhost:8080");
         assert_eq!(canonicalize_url("127.0.0.1:4433"), "http://127.0.0.1:4433");
+        assert!(urls_equivalent(
+            "https://news.ycombinator.com",
+            "https://news.ycombinator.com/"
+        ));
+        assert!(!urls_equivalent(
+            "https://news.ycombinator.com",
+            "https://duckduckgo.com"
+        ));
     }
 
     #[test]
@@ -2634,5 +3264,52 @@ mod tests {
         assert!(wire.is_empty());
         let damage3 = core.render_into(&mut fb);
         assert!(!damage3.is_empty());
+
+        // Verify toast underlay save & restore does not wipe content
+        let sample_idx = (CHROME_H as usize + 10) * 640 + 10;
+        assert_eq!(fb[sample_idx], 0x00808080);
+        core.status_toast_text = Some("Toast test".into());
+        core.status_toast_frames_left = 1;
+        let _ = core.render_into(&mut fb);
+        assert_eq!(core.status_toast_frames_left, 0);
+        let damage_restore = core.render_into(&mut fb);
+        assert!(!damage_restore.is_empty());
+        assert_eq!(fb[sample_idx], 0x00808080);
+
+        // Verify instant local tab switching preserves Tab 1's rendered framebuffer
+        core.mods = MOD_CTRL;
+        core.on_key(0x0074, true, None); // Ctrl+T creates Tab 2
+        assert_eq!(core.active_tab_id, 2);
+        let _ = core.render_into(&mut fb);
+        assert_eq!(fb[sample_idx], 0x0F0F12); // Tab 2 starts blank while waiting for host frame
+
+        // Ctrl+1 switches back to Tab 1 and immediately restores its cached framebuffer locally
+        core.on_key(0x0031, true, None);
+        assert_eq!(core.active_tab_id, 1);
+        let _ = core.render_into(&mut fb);
+        assert_eq!(fb[sample_idx], 0x00808080);
+
+        // Verify Clipboard, FileUpload, and FileDownload round-trip in BrowserCore
+        core.mods = 0;
+        core.clipboard = "hello microkernel".into();
+        core.mods = MOD_CTRL;
+        core.on_key(0x0076, true, None); // Ctrl+V in webpage mode emits InputEvent::Clipboard
+        core.upload_file_bytes("notes.txt".into(), "text/plain".into(), b"data123".to_vec());
+
+        let mut out_wire = Vec::new();
+        core.encode_outbound_messages(5000, &mut out_wire);
+        assert!(!out_wire.is_empty());
+
+        let mut dl_wire = Vec::new();
+        Message::FileDownload {
+            filename: "report.txt".into(),
+            data: b"pdf-content".to_vec(),
+        }
+        .encode(&mut dl_wire);
+        core.ingest_wire_chunk(&dl_wire).unwrap();
+        let dls: Vec<_> = core.drain_downloads().collect();
+        assert_eq!(dls.len(), 1);
+        assert_eq!(dls[0].0, "report.txt");
+        assert_eq!(dls[0].1, b"pdf-content");
     }
 }

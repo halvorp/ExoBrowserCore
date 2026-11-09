@@ -27,14 +27,18 @@ typedef void (*gutted_wpe_cursor_cb)(void *userdata, uint32_t tab_id, int32_t sh
 typedef void (*gutted_wpe_title_cb)(void *userdata, uint32_t tab_id, const char *title);
 typedef void (*gutted_wpe_url_cb)(void *userdata, uint32_t tab_id, const char *url);
 typedef void (*gutted_wpe_ready_cb)(void *userdata, gutted_wpe_handle handle);
+typedef void (*gutted_wpe_file_chooser_cb)(void *userdata, uint32_t tab_id, bool multiple, const char *accept_mimes);
+typedef void (*gutted_wpe_download_cb)(void *userdata, const char *filename, const char *local_path);
 
 typedef struct {
-    gutted_wpe_frame_cb  on_frame;
-    gutted_wpe_load_cb   on_load;
-    gutted_wpe_cursor_cb on_cursor;
-    gutted_wpe_ready_cb  on_ready;
-    gutted_wpe_title_cb  on_title;
-    gutted_wpe_url_cb    on_url;
+    gutted_wpe_frame_cb        on_frame;
+    gutted_wpe_load_cb         on_load;
+    gutted_wpe_cursor_cb       on_cursor;
+    gutted_wpe_ready_cb        on_ready;
+    gutted_wpe_title_cb        on_title;
+    gutted_wpe_url_cb          on_url;
+    gutted_wpe_file_chooser_cb on_file_chooser;
+    gutted_wpe_download_cb     on_download;
 } gutted_wpe_callbacks;
 
 int gutted_wpe_run(
@@ -48,6 +52,7 @@ void gutted_wpe_stop(gutted_wpe_handle h);
 
 void gutted_wpe_create_tab(gutted_wpe_handle h, uint32_t tab_id, const char *url);
 void gutted_wpe_close_tab(gutted_wpe_handle h, uint32_t tab_id);
+void gutted_wpe_set_active_tab(gutted_wpe_handle h, uint32_t active_tab_id);
 void gutted_wpe_load_uri(gutted_wpe_handle h, uint32_t tab_id, const char *url);
 void gutted_wpe_resize(gutted_wpe_handle h, uint32_t tab_id, uint32_t w, uint32_t h_px);
 void gutted_wpe_resize_all(gutted_wpe_handle h, uint32_t w, uint32_t h_px);
@@ -63,6 +68,14 @@ void gutted_wpe_go_forward(gutted_wpe_handle h, uint32_t tab_id);
 void gutted_wpe_reload(gutted_wpe_handle h, uint32_t tab_id);
 void gutted_wpe_stop_loading(gutted_wpe_handle h, uint32_t tab_id);
 void gutted_wpe_clear_data(gutted_wpe_handle h, bool clear_cookies, bool clear_cache, bool clear_storage);
+void gutted_wpe_complete_file_chooser(
+    gutted_wpe_handle h,
+    uint32_t tab_id,
+    const char *file_path,
+    const char *filename,
+    const char *mime_type,
+    const char *b64_data);
+void gutted_wpe_paste_text(gutted_wpe_handle h, uint32_t tab_id, const char *text);
 
 #ifdef __cplusplus
 }

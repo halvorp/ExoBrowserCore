@@ -52,6 +52,8 @@ COPY --from=builder /app/target/release/gutted-host /usr/local/bin/gutted-host
 ENV GBROWSER_LISTEN=0.0.0.0:4433
 ENV GBROWSER_WEB_LISTEN=0.0.0.0:8080
 ENV LIBGL_ALWAYS_SOFTWARE=1
+ENV LP_NUM_THREADS=4
+ENV PULSE_LATENCY_MSEC=15
 ENV WEBKIT_GST_DMABUF_SINK_ENABLED=0
 ENV WEBKIT_GST_MAX_AVC1_RESOLUTION=720P
 ENV GST_PLUGIN_FEATURE_RANK=vah264dec:NONE,vaav1dec:NONE,vavp9dec:NONE,nvdec:NONE,openh264dec:NONE,avdec_h264:MAX
@@ -59,6 +61,6 @@ ENV XDG_RUNTIME_DIR=/tmp/xdg-runtime
 
 RUN mkdir -p /tmp/xdg-runtime && chmod 0700 /tmp/xdg-runtime
 
-EXPOSE 4433/udp 8080/tcp
+EXPOSE 4433/udp 4433/tcp 8080/tcp
 
 ENTRYPOINT ["/usr/local/bin/gutted-host"]
