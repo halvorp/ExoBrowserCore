@@ -529,6 +529,89 @@ impl AVClock {
     }
 }
 
+/// `#![no_std]` ALVR-style zero-allocation PCM packet-loss & underrun concealer.
+/// Eliminates audible clicks/pops on Wi-Fi/WAN jitter by applying a 64-sample linear
+/// cross-fade across PTS discontinuities and synthesizing a smooth 2ms fade-to-zero on underruns.
+#[derive(Debug, Default, Clone)]
+pub struct PcmConcealer {
+    last_l: i16,
+    last_r: i16,
+    last_end_pts_us: u64,
+    initialized: bool,
+}
+
+impl PcmConcealer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Process an incoming S16LE PCM buffer in-place. If a PTS gap (>25ms) or jump is detected,
+    /// cross-fades the first 64 stereo frames from the previous tail sample `(last_l, last_r)`.
+    pub fn process_in_place(&mut self, pts_us: u64, sample_rate: u32, channels: u8, pcm: &mut [u8]) {
+        let ch = (channels.max(1)) as usize;
+        let frame_bytes = ch * 2;
+        let num_frames = pcm.len() / frame_bytes;
+        if num_frames == 0 {
+            return;
+        }
+        let dur_us = ((num_frames as u64) * 1_000_000) / (sample_rate.max(1) as u64);
+        let discontinuous = self.initialized
+            && (pts_us > self.last_end_pts_us.saturating_add(25_000)
+                || pts_us.saturating_add(25_000) < self.last_end_pts_us);
+
+        if discontinuous {
+            let fade_len = num_frames.min(64);
+            let old_l = self.last_l as i32;
+            let old_r = self.last_r as i32;
+            for i in 0..fade_len {
+                let w_new = i as i32;
+                let w_old = 64 - w_new;
+                let base = i * frame_bytes;
+                let cur_l = i16::from_le_bytes([pcm[base], pcm[base + 1]]) as i32;
+                let out_l = ((old_l * w_old + cur_l * w_new) >> 6) as i16;
+                pcm[base..base + 2].copy_from_slice(&out_l.to_le_bytes());
+                if ch >= 2 {
+                    let cur_r = i16::from_le_bytes([pcm[base + 2], pcm[base + 3]]) as i32;
+                    let out_r = ((old_r * w_old + cur_r * w_new) >> 6) as i16;
+                    pcm[base + 2..base + 4].copy_from_slice(&out_r.to_le_bytes());
+                }
+            }
+        }
+
+        let last_base = (num_frames - 1) * frame_bytes;
+        self.last_l = i16::from_le_bytes([pcm[last_base], pcm[last_base + 1]]);
+        self.last_r = if ch >= 2 {
+            i16::from_le_bytes([pcm[last_base + 2], pcm[last_base + 3]])
+        } else {
+            self.last_l
+        };
+        self.last_end_pts_us = pts_us.saturating_add(dur_us);
+        self.initialized = true;
+    }
+
+    /// Synthesize a smooth 2ms ramp-to-zero into `out` when an audio underrun occurs,
+    /// resetting `(last_l, last_r)` to `0` so the speaker membrane does not pop.
+    pub fn synthesize_fadeout_2ms(&mut self, sample_rate: u32, channels: u8, out: &mut Vec<u8>) {
+        let ch = (channels.max(1)) as usize;
+        let frames = ((sample_rate.max(1) as usize) / 500).max(16);
+        out.reserve(frames * ch * 2);
+        let start_l = self.last_l as i32;
+        let start_r = self.last_r as i32;
+        let n = frames as i32;
+        for i in 0..frames {
+            let rem = (n - 1 - (i as i32)).max(0);
+            let l = ((start_l * rem) / n) as i16;
+            out.extend_from_slice(&l.to_le_bytes());
+            if ch >= 2 {
+                let r = ((start_r * rem) / n) as i16;
+                out.extend_from_slice(&r.to_le_bytes());
+            }
+        }
+        self.last_l = 0;
+        self.last_r = 0;
+    }
+}
+
 /// Real-time 48kHz stereo PCM audio output engine (`std`).
 /// Uses a dedicated non-blocking background worker with a bounded queue so
 /// audio pipe I/O never stalls the UI/video compositor thread or accumulates drift.
@@ -1186,6 +1269,7 @@ pub struct BrowserCore {
     pub audio_muted: bool,
     pub audio_playing_frames_left: u32,
     pub pending_audio: Vec<AudioChunk>,
+    pub pcm_concealer: PcmConcealer,
     #[cfg(feature = "std")]
     pub audio_out: AudioOutput,
     pub av_clock: AVClock,
@@ -1244,6 +1328,7 @@ impl BrowserCore {
             audio_muted: false,
             audio_playing_frames_left: 0,
             pending_audio: Vec::new(),
+            pcm_concealer: PcmConcealer::new(),
             #[cfg(feature = "std")]
             audio_out: AudioOutput::new(),
             av_clock: AVClock::new(),
@@ -1600,7 +1685,7 @@ impl BrowserCore {
                 pts_us,
                 channels,
                 sample_rate,
-                data,
+                mut data,
             } => {
                 let bytes_per_sample = (channels.max(1) as u64) * 2;
                 let samples = (data.len() as u64) / bytes_per_sample;
@@ -1608,6 +1693,8 @@ impl BrowserCore {
                 let was_playing = self.audio_playing_frames_left > 0;
                 self.audio_playing_frames_left = 30;
                 self.av_clock.on_audio_frame(pts_us, dur_us);
+                self.pcm_concealer
+                    .process_in_place(pts_us, sample_rate, channels, &mut data);
                 #[cfg(feature = "std")]
                 {
                     self.audio_out.muted = self.audio_muted;
@@ -3351,6 +3438,34 @@ mod tests {
         assert_eq!(clock.schedule_video(master), 0);
         assert_eq!(clock.schedule_video(master + 50_000), 1);
         assert_eq!(clock.schedule_video(master.saturating_sub(60_000)), 2);
+
+        // Verify ALVR-style PCM cross-fade packet-loss concealment & 2ms fadeout
+        let mut concealer = PcmConcealer::new();
+        let mut frame1 = [0u8; 256];
+        for chunk in frame1.as_chunks_mut::<4>().0 {
+            chunk[0..2].copy_from_slice(&10_000i16.to_le_bytes());
+            chunk[2..4].copy_from_slice(&(-10_000i16).to_le_bytes());
+        }
+        concealer.process_in_place(1_000_000, 48_000, 2, &mut frame1);
+
+        // Simulate a 100ms packet loss gap followed by a -10_000 / +10_000 frame
+        let mut frame2 = [0u8; 256];
+        for chunk in frame2.as_chunks_mut::<4>().0 {
+            chunk[0..2].copy_from_slice(&(-10_000i16).to_le_bytes());
+            chunk[2..4].copy_from_slice(&10_000i16.to_le_bytes());
+        }
+        concealer.process_in_place(1_100_000, 48_000, 2, &mut frame2);
+        // Sample 0 of frame2 must start smoothly at frame1's tail (10_000, -10_000), not jump to -10_000
+        let s0_l = i16::from_le_bytes([frame2[0], frame2[1]]);
+        let s0_r = i16::from_le_bytes([frame2[2], frame2[3]]);
+        assert_eq!(s0_l, 10_000);
+        assert_eq!(s0_r, -10_000);
+
+        let mut fadeout = Vec::new();
+        concealer.synthesize_fadeout_2ms(48_000, 2, &mut fadeout);
+        assert!(!fadeout.is_empty());
+        let last_fade = i16::from_le_bytes([fadeout[fadeout.len() - 4], fadeout[fadeout.len() - 3]]);
+        assert_eq!(last_fade, 0);
     }
 
     #[test]

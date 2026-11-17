@@ -416,29 +416,57 @@ impl HostState {
 
         tokio::spawn(async move {
             let mut force_full: HashSet<u32> = HashSet::new();
-            let mut q2_dirty_since: HashMap<u32, std::time::Instant> = HashMap::new();
+            // Per-tab union bounding box `(last_updated, x, y, w, h)` of unrefined lossy Q2 regions
+            let mut q2_dirty_bounds: HashMap<u32, (std::time::Instant, u16, u16, u16, u16)> = HashMap::new();
+            let mut video_tracker = VideoSubregionTracker::new();
+            let mut tile_tracker = TileCacheTracker::new();
             let mut refine_tick = tokio::time::interval(std::time::Duration::from_millis(60));
             refine_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
-                    _ = refine_tick.tick(), if !q2_dirty_since.is_empty() => {
+                    _ = refine_tick.tick(), if !q2_dirty_bounds.is_empty() => {
                         let active = active_atomic.load(Ordering::Relaxed);
-                        if let Some(&since) = q2_dirty_since.get(&active) {
+                        if let Some(&(since, rx, ry, rw, rh)) = q2_dirty_bounds.get(&active) {
                             if since.elapsed() >= std::time::Duration::from_millis(140) {
-                                q2_dirty_since.remove(&active);
+                                q2_dirty_bounds.remove(&active);
                                 if bus_clone.has_subscribers() {
                                     if let Some(f) = last_frames_ref.lock().ok().and_then(|g| g.get(&active).cloned()) {
                                         let ts_us = SystemTime::now().duration_since(UNIX_EPOCH)
                                             .unwrap_or_default().as_micros() as u64;
-                                        bus_clone.publish_raw_frame(
-                                            ts_us,
-                                            f.width as u16,
-                                            f.height as u16,
-                                            f.stride as u32,
-                                            f.format,
-                                            gutted_proto::compression::ZSTD,
-                                            &f.pixels,
-                                        );
+                                        let fw = f.width.max(1) as u16;
+                                        let fh = f.height.max(1) as u16;
+                                        let x0 = rx.min(fw);
+                                        let y0 = ry.min(fh);
+                                        let w = rw.min(fw.saturating_sub(x0));
+                                        let h = rh.min(fh.saturating_sub(y0));
+                                        let dirty_area = (w as u64) * (h as u64);
+                                        let full_area = (fw as u64) * (fh as u64);
+                                        // Scoped refinement: if the lossy Q2 region covers <75% of the viewport
+                                        // (e.g. a paused 640x360 video player), refine ONLY that subregion!
+                                        if w > 0 && h > 0 && dirty_area * 4 < full_area * 3 {
+                                            let sub = extract_subrect(&f.pixels, f.stride, x0, y0, w, h);
+                                            bus_clone.publish_subframe(
+                                                ts_us,
+                                                x0,
+                                                y0,
+                                                w,
+                                                h,
+                                                (w as u32) * 4,
+                                                f.format,
+                                                gutted_proto::compression::ZSTD,
+                                                &sub,
+                                            );
+                                        } else {
+                                            bus_clone.publish_raw_frame(
+                                                ts_us,
+                                                fw,
+                                                fh,
+                                                f.stride as u32,
+                                                f.format,
+                                                gutted_proto::compression::ZSTD,
+                                                &f.pixels,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -462,7 +490,7 @@ impl HostState {
                                     l.width == f.width && l.height == f.height && l.stride == f.stride);
 
                                 if !same_geom {
-                                    q2_dirty_since.remove(&this_tab_id);
+                                    q2_dirty_bounds.remove(&this_tab_id);
                                     bus_clone.publish_raw_frame(
                                         ts_us,
                                         f.width as u16,
@@ -486,8 +514,8 @@ impl HostState {
                                         // test whether the frame shifted vertically. If so, emit a
                                         // 22-byte CopyRect and only transmit lossless subframes for
                                         // the newly exposed strip + any fixed headers/scrollbars!
-                                        // If the tab had pending Q2 lossy pixels, keep/reset the 140ms
-                                        // refinement timer so the shifted region still gets its lossless
+                                        // If the tab had pending Q2 lossy pixels, shift & reset the 140ms
+                                        // refinement bounds so the shifted region still gets its lossless
                                         // ZSTD pass once scrolling stops.
                                         let mut did_copy_rect = false;
                                         if total_px * 20 >= full_px * 9 {
@@ -513,8 +541,12 @@ impl HostState {
                                                     .map(|(_, _, w, h)| (*w as u64) * (*h as u64))
                                                     .sum();
                                                 if scroll_px * 2 < full_px && scroll_regs.len() <= 16 {
-                                                    if q2_dirty_since.contains_key(&this_tab_id) {
-                                                        q2_dirty_since.insert(this_tab_id, std::time::Instant::now());
+                                                    if let Some(entry) = q2_dirty_bounds.get_mut(&this_tab_id) {
+                                                        entry.0 = std::time::Instant::now();
+                                                        entry.1 = 0;
+                                                        entry.2 = 0;
+                                                        entry.3 = f.width as u16;
+                                                        entry.4 = f.height as u16;
                                                     }
                                                     bus_clone.publish_copy_rect(
                                                         ts_us,
@@ -534,10 +566,13 @@ impl HostState {
 
                                         if !did_copy_rect && (total_px * 10 >= full_px * 8 || regions.len() > 16) {
                                             let comp = if f.stride == f.width * 4 {
-                                                q2_dirty_since.insert(this_tab_id, std::time::Instant::now());
+                                                q2_dirty_bounds.insert(
+                                                    this_tab_id,
+                                                    (std::time::Instant::now(), 0, 0, f.width as u16, f.height as u16),
+                                                );
                                                 gutted_proto::compression::LZ4_DELTA_Q2
                                             } else {
-                                                q2_dirty_since.remove(&this_tab_id);
+                                                q2_dirty_bounds.remove(&this_tab_id);
                                                 gutted_proto::compression::ZSTD
                                             };
                                             bus_clone.publish_raw_frame(
@@ -556,10 +591,51 @@ impl HostState {
                                             let fmt = f.format;
                                             let stride = f.stride;
                                             let s_usize = stride as usize;
+                                            let now = std::time::Instant::now();
                                             for &(x, y, w, h) in &regions {
+                                                // Content-addressable 64x64 tile cache fast-path
+                                                if w == 64 && h == 64 {
+                                                    let sub = extract_subrect(&f.pixels, stride, x, y, 64, 64);
+                                                    if let Some(hash) = fxhash_tile_64x64(&sub) {
+                                                        if tile_tracker.check_or_insert(hash) {
+                                                            bus_clone.publish(Arc::new(Message::TileRef {
+                                                                ts_us,
+                                                                x,
+                                                                y,
+                                                                w: 64,
+                                                                h: 64,
+                                                                hash,
+                                                            }));
+                                                            continue;
+                                                        } else {
+                                                            bus_clone.publish(Arc::new(Message::TileData {
+                                                                hash,
+                                                                w: 64,
+                                                                h: 64,
+                                                                stride: 256,
+                                                                format: fmt,
+                                                                compression: gutted_proto::compression::QOI,
+                                                                pixels: sub.clone(),
+                                                            }));
+                                                            bus_clone.publish(Arc::new(Message::TileRef {
+                                                                ts_us,
+                                                                x,
+                                                                y,
+                                                                w: 64,
+                                                                h: 64,
+                                                                hash,
+                                                            }));
+                                                            continue;
+                                                        }
+                                                    }
+                                                }
+
                                                 let area = (w as usize) * (h as usize);
-                                                let comp = if !did_copy_rect && area >= 96_000 {
-                                                    q2_dirty_since.insert(this_tab_id, std::time::Instant::now());
+                                                let is_video_sub = !did_copy_rect
+                                                    && area >= 16_000
+                                                    && video_tracker.record_and_is_video(this_tab_id, (x, y, w, h), now);
+                                                let comp = if !did_copy_rect && (area >= 96_000 || is_video_sub) {
+                                                    merge_q2_dirty_bounds(&mut q2_dirty_bounds, this_tab_id, now, x, y, w, h);
                                                     gutted_proto::compression::LZ4_DELTA_Q2
                                                 } else if area >= 32_000 {
                                                     gutted_proto::compression::ZSTD
@@ -2013,6 +2089,163 @@ fn extract_subrect(pixels: &[u8], stride: i32, x: u16, y: u16, w: u16, h: u16) -
     out
 }
 
+/// Merge a newly dirtied `LZ4_DELTA_Q2` rectangle `(x, y, w, h)` into the per-tab
+/// union bounding box and reset its 140ms refinement timestamp.
+fn merge_q2_dirty_bounds(
+    map: &mut HashMap<u32, (std::time::Instant, u16, u16, u16, u16)>,
+    tab_id: u32,
+    now: std::time::Instant,
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+) {
+    match map.get_mut(&tab_id) {
+        Some(entry) => {
+            let ox0 = entry.1;
+            let oy0 = entry.2;
+            let ox1 = ox0.saturating_add(entry.3);
+            let oy1 = oy0.saturating_add(entry.4);
+            let nx0 = ox0.min(x);
+            let ny0 = oy0.min(y);
+            let nx1 = ox1.max(x.saturating_add(w));
+            let ny1 = oy1.max(y.saturating_add(h));
+            *entry = (now, nx0, ny0, nx1.saturating_sub(nx0), ny1.saturating_sub(ny0));
+        }
+        None => {
+            map.insert(tab_id, (now, x, y, w, h));
+        }
+    }
+}
+
+type VideoRectEntry = (u16, u16, u16, u16, std::time::Instant);
+
+/// Xpra-style video subregion classifier: tracks a per-tab ring buffer of recent dirty
+/// bounding boxes and promotes any region with >=5 overlapping updates (>75% IoU) within
+/// 250ms to an active video subregion.
+struct VideoSubregionTracker {
+    history: HashMap<u32, std::collections::VecDeque<VideoRectEntry>>,
+}
+
+impl VideoSubregionTracker {
+    fn new() -> Self {
+        Self {
+            history: HashMap::new(),
+        }
+    }
+
+    fn record_and_is_video(
+        &mut self,
+        tab_id: u32,
+        rect: (u16, u16, u16, u16),
+        now: std::time::Instant,
+    ) -> bool {
+        let q = self.history.entry(tab_id).or_default();
+        while let Some(&(_, _, _, _, ts)) = q.front() {
+            if now.saturating_duration_since(ts) > std::time::Duration::from_millis(250) {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+        let matches = q
+            .iter()
+            .filter(|&&(ox, oy, ow, oh, _)| rect_iou_pct(rect, (ox, oy, ow, oh)) >= 75)
+            .count();
+        if q.len() >= 12 {
+            q.pop_front();
+        }
+        q.push_back((rect.0, rect.1, rect.2, rect.3, now));
+        matches >= 4
+    }
+}
+
+#[inline]
+fn rect_iou_pct(a: (u16, u16, u16, u16), b: (u16, u16, u16, u16)) -> u64 {
+    let ax0 = a.0 as u64;
+    let ay0 = a.1 as u64;
+    let ax1 = ax0 + (a.2 as u64);
+    let ay1 = ay0 + (a.3 as u64);
+
+    let bx0 = b.0 as u64;
+    let by0 = b.1 as u64;
+    let bx1 = bx0 + (b.2 as u64);
+    let by1 = by0 + (b.3 as u64);
+
+    let ix0 = ax0.max(bx0);
+    let iy0 = ay0.max(by0);
+    let ix1 = ax1.min(bx1);
+    let iy1 = ay1.min(by1);
+    if ix1 <= ix0 || iy1 <= iy0 {
+        return 0;
+    }
+    let inter = (ix1 - ix0) * (iy1 - iy0);
+    let area_a = (a.2 as u64) * (a.3 as u64);
+    let area_b = (b.2 as u64) * (b.3 as u64);
+    let union = area_a + area_b - inter;
+    (inter * 100).checked_div(union).unwrap_or(0)
+}
+
+/// Content-addressable 64x64 tile cache tracker (bounded FIFO of 2048 tile hashes,
+/// matching `BrowserCore`'s `MAX_TILE_CACHE_ENTRIES`).
+struct TileCacheTracker {
+    set: HashSet<u64>,
+    order: std::collections::VecDeque<u64>,
+}
+
+impl TileCacheTracker {
+    fn new() -> Self {
+        Self {
+            set: HashSet::with_capacity(2048),
+            order: std::collections::VecDeque::with_capacity(2048),
+        }
+    }
+
+    /// Returns `true` if `hash` was already present in the client cache, or `false` if newly inserted.
+    fn check_or_insert(&mut self, hash: u64) -> bool {
+        if self.set.contains(&hash) {
+            return true;
+        }
+        if self.order.len() >= 2048 {
+            if let Some(evict) = self.order.pop_front() {
+                self.set.remove(&evict);
+            }
+        }
+        self.set.insert(hash);
+        self.order.push_back(hash);
+        false
+    }
+}
+
+/// Compute a 64-bit FxHash over a 64x64 BGRA8 tile (`16384` bytes).
+/// Returns `None` if the tile is a single flat solid color (since QOI/LZ4 RLE encodes flat
+/// tiles in <16 bytes without consuming a client tile cache slot).
+fn fxhash_tile_64x64(tile: &[u8]) -> Option<u64> {
+    if tile.len() != 64 * 64 * 4 {
+        return None;
+    }
+    let first_px: [u8; 4] = tile[0..4].try_into().unwrap();
+    let mut uniform = true;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let (chunks, _) = tile.as_chunks::<8>();
+    let first_u64 = u64::from_le_bytes([
+        first_px[0], first_px[1], first_px[2], first_px[3],
+        first_px[0], first_px[1], first_px[2], first_px[3],
+    ]);
+    for &c in chunks {
+        let v = u64::from_le_bytes(c);
+        if uniform && v != first_u64 {
+            uniform = false;
+        }
+        h = (h.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    if uniform {
+        None
+    } else {
+        Some(h)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2106,5 +2339,36 @@ mod tests {
 
         let regs = diff_regions_scrolled(&prev, &curr, w as i32, h as i32, stride, 20, 0, 80);
         assert_eq!(regs, vec![(0, 80, 128, 20)]);
+    }
+
+    #[test]
+    fn video_subregion_and_tile_cache_trackers() {
+        let mut vt = VideoSubregionTracker::new();
+        let t0 = std::time::Instant::now();
+        // First 4 frames of a 320x180 region at (100, 100) are not yet promoted
+        for i in 0..4 {
+            assert!(!vt.record_and_is_video(
+                1,
+                (100, 100, 320, 180),
+                t0 + std::time::Duration::from_millis(i * 16)
+            ));
+        }
+        // 5th frame within 250ms with >75% IoU promotes it to an active video subregion
+        assert!(vt.record_and_is_video(
+            1,
+            (102, 100, 318, 180),
+            t0 + std::time::Duration::from_millis(64)
+        ));
+
+        // Tile cache tracker + fxhash_tile_64x64
+        let flat = vec![0xAAu8; 64 * 64 * 4];
+        assert_eq!(fxhash_tile_64x64(&flat), None);
+
+        let mut patterned = vec![0xAAu8; 64 * 64 * 4];
+        patterned[100] = 0x12;
+        let h = fxhash_tile_64x64(&patterned).unwrap();
+        let mut tt = TileCacheTracker::new();
+        assert!(!tt.check_or_insert(h));
+        assert!(tt.check_or_insert(h));
     }
 }
