@@ -28,6 +28,7 @@ use tracing::{error, info, warn};
 #[derive(Clone, Copy, Debug)]
 pub enum BusMeta {
     RawFrame,
+    CopyRect,
     Subframe { x: u16, y: u16, w: u16, h: u16 },
     Other,
 }
@@ -63,6 +64,7 @@ impl FrameBus {
     fn encode_msg(msg: &Message) -> BusItem {
         let meta = match msg {
             Message::RawFrame { .. } => BusMeta::RawFrame,
+            Message::CopyRect { .. } => BusMeta::CopyRect,
             Message::Subframe { x, y, w, h, .. } => BusMeta::Subframe {
                 x: *x,
                 y: *y,
@@ -152,6 +154,28 @@ impl FrameBus {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn publish_copy_rect(
+        &self,
+        ts_us: u64,
+        src_x: u16,
+        src_y: u16,
+        dst_x: u16,
+        dst_y: u16,
+        w: u16,
+        h: u16,
+    ) {
+        if self.tx.receiver_count() == 0 {
+            return;
+        }
+        let mut buf = Vec::with_capacity(24);
+        Message::encode_copy_rect(&mut buf, ts_us, src_x, src_y, dst_x, dst_y, w, h);
+        let _ = self.tx.send(BusItem {
+            meta: BusMeta::CopyRect,
+            wire_quic: Bytes::from(buf),
+        });
+    }
+
     #[inline]
     pub fn has_subscribers(&self) -> bool {
         self.tx.receiver_count() > 0
@@ -198,7 +222,12 @@ pub fn coalesce_bus_batch(
     while let Ok(newer) = rx.try_recv() {
         match newer.meta {
             BusMeta::RawFrame => {
-                batch.retain(|old| !matches!(old.meta, BusMeta::RawFrame | BusMeta::Subframe { .. }));
+                batch.retain(|old| {
+                    !matches!(
+                        old.meta,
+                        BusMeta::RawFrame | BusMeta::CopyRect | BusMeta::Subframe { .. }
+                    )
+                });
             }
             BusMeta::Subframe {
                 x: x2,
@@ -210,23 +239,35 @@ pub fn coalesce_bus_batch(
                 let ny0 = y2 as u32;
                 let nx1 = nx0 + (w2 as u32);
                 let ny1 = ny0 + (h2 as u32);
-                batch.retain(|old| match old.meta {
-                    BusMeta::Subframe {
-                        x: x1,
-                        y: y1,
-                        w: w1,
-                        h: h1,
-                    } => {
-                        let ox0 = x1 as u32;
-                        let oy0 = y1 as u32;
-                        let ox1 = ox0 + (w1 as u32);
-                        let oy1 = oy0 + (h1 as u32);
-                        !(nx0 <= ox0 && ny0 <= oy0 && nx1 >= ox1 && ny1 >= oy1)
+                let after_copy = batch
+                    .iter()
+                    .rposition(|b| matches!(b.meta, BusMeta::CopyRect))
+                    .map_or(0, |i| i + 1);
+                let mut idx = 0usize;
+                batch.retain(|old| {
+                    let cur_idx = idx;
+                    idx += 1;
+                    if cur_idx < after_copy {
+                        return true;
                     }
-                    _ => true,
+                    match old.meta {
+                        BusMeta::Subframe {
+                            x: x1,
+                            y: y1,
+                            w: w1,
+                            h: h1,
+                        } => {
+                            let ox0 = x1 as u32;
+                            let oy0 = y1 as u32;
+                            let ox1 = ox0 + (w1 as u32);
+                            let oy1 = oy0 + (h1 as u32);
+                            !(nx0 <= ox0 && ny0 <= oy0 && nx1 >= ox1 && ny1 >= oy1)
+                        }
+                        _ => true,
+                    }
                 });
             }
-            BusMeta::Other => {}
+            BusMeta::CopyRect | BusMeta::Other => {}
         }
         batch.push(newer);
     }
@@ -436,11 +477,56 @@ impl HostState {
                                     }
                                 } else {
                                     let prev_f = prev.unwrap();
-                                    let regions = diff_regions(&prev_f.pixels, &f.pixels, f.width, f.height, f.stride);
+                                    let mut regions = diff_regions(&prev_f.pixels, &f.pixels, f.width, f.height, f.stride);
                                     if !regions.is_empty() {
-                                        let total_px: u64 = regions.iter().map(|(_, _, w, h)| (*w as u64) * (*h as u64)).sum();
+                                        let mut total_px: u64 = regions.iter().map(|(_, _, w, h)| (*w as u64) * (*h as u64)).sum();
                                         let full_px = (f.width as u64) * (f.height as u64);
-                                        if total_px * 10 >= full_px * 8 || regions.len() > 16 {
+
+                                        // Scroll CopyRect fast-path: if >= 45% of pixels changed on a clean
+                                        // 1:1 framebuffer, test whether the frame shifted vertically. If so,
+                                        // emit a 22-byte CopyRect and only transmit lossless subframes for
+                                        // the newly exposed strip + any fixed headers/scrollbars!
+                                        let mut did_copy_rect = false;
+                                        if total_px * 20 >= full_px * 9 && !q2_dirty_since.contains_key(&this_tab_id) {
+                                            if let Some((src_y, dst_y, copy_h)) = detect_vertical_scroll(
+                                                &prev_f.pixels,
+                                                &f.pixels,
+                                                f.width,
+                                                f.height,
+                                                f.stride,
+                                            ) {
+                                                let scroll_regs = diff_regions_scrolled(
+                                                    &prev_f.pixels,
+                                                    &f.pixels,
+                                                    f.width,
+                                                    f.height,
+                                                    f.stride,
+                                                    src_y,
+                                                    dst_y,
+                                                    copy_h,
+                                                );
+                                                let scroll_px: u64 = scroll_regs
+                                                    .iter()
+                                                    .map(|(_, _, w, h)| (*w as u64) * (*h as u64))
+                                                    .sum();
+                                                if scroll_px * 2 < full_px && scroll_regs.len() <= 16 {
+                                                    bus_clone.publish_copy_rect(
+                                                        ts_us,
+                                                        0,
+                                                        src_y,
+                                                        0,
+                                                        dst_y,
+                                                        f.width as u16,
+                                                        copy_h,
+                                                    );
+                                                    regions = scroll_regs;
+                                                    total_px = scroll_px;
+                                                    did_copy_rect = true;
+                                                }
+                                            }
+                                        }
+
+                                        if !did_copy_rect && (total_px * 10 >= full_px * 8 || regions.len() > 16) {
                                             let comp = if f.stride == f.width * 4 {
                                                 q2_dirty_since.insert(this_tab_id, std::time::Instant::now());
                                                 gutted_proto::compression::LZ4_DELTA_Q2
@@ -466,13 +552,15 @@ impl HostState {
                                             let s_usize = stride as usize;
                                             for &(x, y, w, h) in &regions {
                                                 let area = (w as usize) * (h as usize);
-                                                let comp = if area >= 96_000 {
+                                                let comp = if !did_copy_rect && area >= 96_000 {
                                                     q2_dirty_since.insert(this_tab_id, std::time::Instant::now());
                                                     gutted_proto::compression::LZ4_DELTA_Q2
                                                 } else if area >= 32_000 {
                                                     gutted_proto::compression::ZSTD
-                                                } else {
+                                                } else if area >= 12_000 {
                                                     gutted_proto::compression::ZSTD_DELTA
+                                                } else {
+                                                    gutted_proto::compression::QOI
                                                 };
                                                 if x == 0 && (w as i32) * 4 == stride {
                                                     let start = (y as usize) * s_usize;
@@ -973,7 +1061,7 @@ async fn handle_ctrl_stream(
                             cum_bytes += n as u64;
                             match item.meta {
                                 BusMeta::RawFrame => cum_full += n as u64,
-                                BusMeta::Subframe { .. } => cum_sub += n as u64,
+                                BusMeta::Subframe { .. } | BusMeta::CopyRect => cum_sub += n as u64,
                                 BusMeta::Other => {}
                             }
                         }
@@ -1414,15 +1502,16 @@ fn hex_sha256(bytes: &[u8]) -> String {
 fn first_diff_u32(a: &[u32], b: &[u32]) -> Option<usize> {
     let n = a.len().min(b.len());
     let mut i = 0usize;
-    while i + 8 <= n {
-        if a[i..i + 8] != b[i..i + 8] {
-            for j in i..i + 8 {
+    // 64-byte cache-line (16-pixel) unrolled scan
+    while i + 16 <= n {
+        if a[i..i + 16] != b[i..i + 16] {
+            for j in i..i + 16 {
                 if a[j] != b[j] {
                     return Some(j);
                 }
             }
         }
-        i += 8;
+        i += 16;
     }
     while i < n {
         if a[i] != b[i] {
@@ -1436,15 +1525,16 @@ fn first_diff_u32(a: &[u32], b: &[u32]) -> Option<usize> {
 #[inline]
 fn last_diff_u32(a: &[u32], b: &[u32]) -> Option<usize> {
     let mut i = a.len().min(b.len());
-    while i >= 8 {
-        if a[i - 8..i] != b[i - 8..i] {
-            for j in (i - 8..i).rev() {
+    // 64-byte cache-line (16-pixel) reverse unrolled scan
+    while i >= 16 {
+        if a[i - 16..i] != b[i - 16..i] {
+            for j in (i - 16..i).rev() {
                 if a[j] != b[j] {
                     return Some(j);
                 }
             }
         }
-        i -= 8;
+        i -= 16;
     }
     while i > 0 {
         i -= 1;
@@ -1508,6 +1598,169 @@ fn update_row_bounds(ra: &[u8], rb: &[u8], w: usize, left: &mut usize, right: &m
     }
 }
 
+/// Compute a 64-bit FNV-1a hash over the interior 75% of a scanline (`[w/8 .. w - w/8]`).
+/// Returns `None` if the interior of the scanline is a uniform flat color (so blank whitespace
+/// rows cannot produce false scroll shift matches).
+#[inline]
+fn row_interior_hash(row: &[u8], w: usize) -> Option<u64> {
+    let x0 = (w / 8) * 4;
+    let x1 = (w - w / 8) * 4;
+    if x1 <= x0 + 16 || row.len() < x1 {
+        return None;
+    }
+    let slice = &row[x0..x1];
+    let first_px: [u8; 4] = slice[0..4].try_into().unwrap();
+    let mut uniform = true;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let (chunks, rem) = slice.as_chunks::<16>();
+    for c in chunks {
+        if uniform
+            && (c[0..4] != first_px
+                || c[4..8] != first_px
+                || c[8..12] != first_px
+                || c[12..16] != first_px)
+        {
+            uniform = false;
+        }
+        let v0 = u64::from_le_bytes(c[0..8].try_into().unwrap());
+        let v1 = u64::from_le_bytes(c[8..16].try_into().unwrap());
+        h = (h ^ v0).wrapping_mul(0x1000_0000_01b3);
+        h = (h ^ v1).wrapping_mul(0x1000_0000_01b3);
+    }
+    for px in rem.as_chunks::<4>().0 {
+        if uniform && *px != first_px {
+            uniform = false;
+        }
+        h = (h ^ (u32::from_le_bytes(*px) as u64)).wrapping_mul(0x1000_0000_01b3);
+    }
+    if uniform {
+        None
+    } else {
+        Some(h)
+    }
+}
+
+/// Detect a vertical scroll shift between `prev` and `curr`.
+/// Returns `Some((src_y, dst_y, copy_h))` if a vertical translation of `1..=h/2` rows
+/// matches at least 55% of the overlapped scanlines.
+fn detect_vertical_scroll(
+    prev: &[u8],
+    curr: &[u8],
+    width: i32,
+    height: i32,
+    stride: i32,
+) -> Option<(u16, u16, u16)> {
+    let w = width as usize;
+    let h = height as usize;
+    let s = stride as usize;
+    let row_bytes = w * 4;
+    if w < 32 || h < 32 || prev.len() < h * s || curr.len() < h * s {
+        return None;
+    }
+
+    let mut prev_hashes = Vec::with_capacity(h);
+    let mut curr_hashes = Vec::with_capacity(h);
+    for y in 0..h {
+        prev_hashes.push(row_interior_hash(&prev[y * s..y * s + row_bytes], w));
+        curr_hashes.push(row_interior_hash(&curr[y * s..y * s + row_bytes], w));
+    }
+
+    // Collect up to 8 non-uniform anchor rows from the middle 70% of `curr`
+    let y_start = h / 7;
+    let y_end = h - y_start;
+    let mut anchors = Vec::with_capacity(8);
+    let step = ((y_end.saturating_sub(y_start)) / 16).max(1);
+    let mut y = y_start;
+    while y < y_end && anchors.len() < 8 {
+        if let Some(hc) = curr_hashes[y] {
+            // Skip rows whose hash repeats immediately (e.g. vertical stripes/borders)
+            let prev_same = y > 0 && curr_hashes[y - 1] == Some(hc);
+            let next_same = y + 1 < h && curr_hashes[y + 1] == Some(hc);
+            if !prev_same && !next_same {
+                anchors.push((y, hc));
+                y += step * 2;
+                continue;
+            }
+        }
+        y += 1;
+    }
+    if anchors.len() < 2 {
+        return None;
+    }
+
+    let max_shift = (h / 2) as i32;
+    let mut votes: HashMap<i32, usize> = HashMap::new();
+    for &(yc, hc) in &anchors {
+        for (yp, &hp_opt) in prev_hashes.iter().enumerate() {
+            if yp == yc {
+                continue;
+            }
+            if hp_opt == Some(hc) {
+                let dy = (yc as i32) - (yp as i32);
+                if dy.abs() <= max_shift {
+                    *votes.entry(dy).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    let (&best_dy, &best_votes) = votes.iter().max_by_key(|&(_, count)| count)?;
+    if best_votes < 2 || best_dy == 0 {
+        return None;
+    }
+
+    let (src_y, dst_y, copy_h) = if best_dy > 0 {
+        let dy = best_dy as usize;
+        (0usize, dy, h - dy)
+    } else {
+        let dy = (-best_dy) as usize;
+        (dy, 0usize, h - dy)
+    };
+    if copy_h < h / 3 {
+        return None;
+    }
+
+    let x0 = (w / 8) * 4;
+    let x1 = (w - w / 8) * 4;
+    let mut matched_rows = 0usize;
+    for r in 0..copy_h {
+        let py = src_y + r;
+        let cy = dst_y + r;
+        let eq = match (prev_hashes[py], curr_hashes[cy]) {
+            (Some(hp), Some(hc)) => hp == hc,
+            (None, None) => {
+                prev[py * s + x0..py * s + x1] == curr[cy * s + x0..cy * s + x1]
+            }
+            _ => false,
+        };
+        if eq {
+            matched_rows += 1;
+        }
+    }
+
+    if matched_rows * 100 >= copy_h * 55 {
+        Some((src_y as u16, dst_y as u16, copy_h as u16))
+    } else {
+        None
+    }
+}
+
+/// Split a frame diff into tight sub-rects against `a` after virtually applying
+/// `CopyRect(0, src_y, 0, dst_y, width, copy_h)` to `a`.
+#[allow(clippy::too_many_arguments)]
+fn diff_regions_scrolled(
+    a: &[u8],
+    b: &[u8],
+    width: i32,
+    height: i32,
+    stride: i32,
+    src_y: u16,
+    dst_y: u16,
+    copy_h: u16,
+) -> Vec<(u16, u16, u16, u16)> {
+    diff_regions_inner(a, b, width, height, stride, Some((src_y as usize, dst_y as usize, copy_h as usize)))
+}
+
 /// Split a frame diff into up to N tight sub-rects by grouping changed
 /// rows into contiguous runs (gap-tolerant up to `gap` clean rows).
 /// Empty vec = no differences.
@@ -1515,10 +1768,31 @@ fn diff_regions(
     a: &[u8], b: &[u8],
     width: i32, height: i32, stride: i32,
 ) -> Vec<(u16, u16, u16, u16)> {
+    diff_regions_inner(a, b, width, height, stride, None)
+}
+
+fn diff_regions_inner(
+    a: &[u8],
+    b: &[u8],
+    width: i32,
+    height: i32,
+    stride: i32,
+    scroll: Option<(usize, usize, usize)>,
+) -> Vec<(u16, u16, u16, u16)> {
     let w = width  as usize;
     let h = height as usize;
     let s = stride as usize;
     let row_bytes = w * 4;
+
+    #[inline(always)]
+    fn ref_row_y(y: usize, scroll: Option<(usize, usize, usize)>) -> usize {
+        if let Some((src_y, dst_y, copy_h)) = scroll {
+            if y >= dst_y && y < dst_y + copy_h {
+                return src_y + (y - dst_y);
+            }
+        }
+        y
+    }
 
     // 1) which rows changed?
     let mut dirty = vec![false; h];
@@ -1527,7 +1801,8 @@ fn diff_regions(
     let mut last_dirty = 0usize;
 
     for (y, is_dirty_slot) in dirty.iter_mut().enumerate().take(h) {
-        let ra = &a[y * s .. y * s + row_bytes];
+        let ay = ref_row_y(y, scroll);
+        let ra = &a[ay * s .. ay * s + row_bytes];
         let rb = &b[y * s .. y * s + row_bytes];
         let is_d = ra != rb;
         *is_dirty_slot = is_d;
@@ -1569,12 +1844,13 @@ fn diff_regions(
 
     // Fast-path: if >50% of screen rows changed or >8 disjoint runs,
     // compute a single tight horizontal bounding box across all dirty rows.
-    if dirty_count * 2 >= h || runs.len() > 8 {
+    if (scroll.is_none() && dirty_count * 2 >= h) || runs.len() > 8 {
         let mut min_left = w;
         let mut max_right = 0usize;
         for (yy, &is_d) in dirty.iter().enumerate().take(last_dirty + 1).skip(first_dirty) {
             if !is_d { continue; }
-            let ra = &a[yy * s .. yy * s + row_bytes];
+            let ay = ref_row_y(yy, scroll);
+            let ra = &a[ay * s .. ay * s + row_bytes];
             let rb = &b[yy * s .. yy * s + row_bytes];
             update_row_bounds(ra, rb, w, &mut min_left, &mut max_right);
             if min_left == 0 && max_right + 1 >= w {
@@ -1594,7 +1870,8 @@ fn diff_regions(
         let mut right = 0usize;
         for (yy, &is_d) in dirty.iter().enumerate().take(bot + 1).skip(top) {
             if !is_d { continue; }
-            let ra = &a[yy * s .. yy * s + row_bytes];
+            let ay = ref_row_y(yy, scroll);
+            let ra = &a[ay * s .. ay * s + row_bytes];
             let rb = &b[yy * s .. yy * s + row_bytes];
             update_row_bounds(ra, rb, w, &mut left, &mut right);
             if left == 0 && right + 1 >= w {
@@ -1790,5 +2067,37 @@ mod tests {
         let regions = diff_regions(&a, &b, 64, 64, stride);
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0], (20, 10, 5, 2));
+    }
+
+    #[test]
+    fn vertical_scroll_detection_and_scrolled_diff() {
+        let (w, h) = (128usize, 100usize);
+        let stride = (w * 4) as i32;
+        let mut prev = vec![0u8; w * h * 4];
+        // Generate synthetic webpage rows with distinct content per row y
+        for y in 0..h {
+            for x in 0..w {
+                let idx = (y * w + x) * 4;
+                let v = ((y * 37 + x * 13) & 0xFF) as u8;
+                prev[idx..idx + 4].copy_from_slice(&[v, v.wrapping_mul(3), (y as u8), 0xFF]);
+            }
+        }
+
+        // Scroll page down by 20px (content moves UP on screen: src_y=20, dst_y=0, copy_h=80)
+        let mut curr = vec![0u8; w * h * 4];
+        curr[0..80 * w * 4].copy_from_slice(&prev[20 * w * 4..100 * w * 4]);
+        // Fill newly exposed bottom 20 rows (y=80..100) with new content
+        for y in 80..100 {
+            for x in 0..w {
+                let idx = (y * w + x) * 4;
+                curr[idx..idx + 4].copy_from_slice(&[0xAA, 0x55, (x as u8), 0xFF]);
+            }
+        }
+
+        let detected = detect_vertical_scroll(&prev, &curr, w as i32, h as i32, stride);
+        assert_eq!(detected, Some((20, 0, 80)));
+
+        let regs = diff_regions_scrolled(&prev, &curr, w as i32, h as i32, stride, 20, 0, 80);
+        assert_eq!(regs, vec![(0, 80, 128, 20)]);
     }
 }

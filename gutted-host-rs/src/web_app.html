@@ -474,7 +474,7 @@
         NAV_ACTION: 0x06, STOP: 0x07,
         INPUT_POINTER: 0x10, INPUT_KEY: 0x11, INPUT_SCROLL: 0x12, INPUT_BUTTON: 0x13, SET_ZOOM: 0x14,
         CURSOR_STATE: 0x30, LOAD_STATE: 0x31, TITLE: 0x32, URL_CHANGED: 0x33,
-        RAW_FRAME: 0x40, SUBFRAME: 0x41, AUDIO_FRAME: 0x48,
+        RAW_FRAME: 0x40, SUBFRAME: 0x41, COPY_RECT: 0x44, AUDIO_FRAME: 0x48,
         CREATE_TAB: 0x70, CLOSE_TAB: 0x71, SWITCH_TAB: 0x72,
         TAB_CREATED: 0x73, TAB_CLOSED: 0x74, TAB_ACTIVATED: 0x75, TAB_TITLE: 0x76, TAB_URL: 0x77,
         CLEAR_DATA: 0x80, CLIPBOARD: 0x81, FILE_CHOOSER_PROMPT: 0x82, FILE_UPLOAD: 0x83, FILE_DOWNLOAD: 0x84
@@ -732,6 +732,60 @@
         }
       }
 
+      function qoiDecodeBgra(src) {
+        if (src.length < 4) return new Uint8Array(0);
+        const uncompLen = (src[0] | (src[1] << 8) | (src[2] << 16) | (src[3] << 24)) >>> 0;
+        const out = new Uint8Array(uncompLen);
+        const index = new Uint8Array(64 * 4);
+        for (let i = 0; i < 64; i++) index[i * 4 + 3] = 0;
+        let pb = 0, pg = 0, pr = 0, pa = 255;
+        let sp = 4, dp = 0;
+        const pixelBytes = uncompLen & ~3;
+        while (dp < pixelBytes && sp < src.length) {
+          const b1 = src[sp++];
+          if (b1 === 0xFE) {
+            pb = src[sp++]; pg = src[sp++]; pr = src[sp++];
+            const h = ((pb * 7 + pg * 5 + pr * 3 + pa * 11) & 63) << 2;
+            index[h] = pb; index[h + 1] = pg; index[h + 2] = pr; index[h + 3] = pa;
+            out[dp++] = pb; out[dp++] = pg; out[dp++] = pr; out[dp++] = pa;
+          } else if (b1 === 0xFF) {
+            pb = src[sp++]; pg = src[sp++]; pr = src[sp++]; pa = src[sp++];
+            const h = ((pb * 7 + pg * 5 + pr * 3 + pa * 11) & 63) << 2;
+            index[h] = pb; index[h + 1] = pg; index[h + 2] = pr; index[h + 3] = pa;
+            out[dp++] = pb; out[dp++] = pg; out[dp++] = pr; out[dp++] = pa;
+          } else {
+            const op = b1 & 0xC0;
+            if (op === 0x00) {
+              const h = (b1 & 0x3F) << 2;
+              pb = index[h]; pg = index[h + 1]; pr = index[h + 2]; pa = index[h + 3];
+              out[dp++] = pb; out[dp++] = pg; out[dp++] = pr; out[dp++] = pa;
+            } else if (op === 0x40) {
+              pr = (pr + ((b1 >>> 4) & 0x03) - 2) & 0xFF;
+              pg = (pg + ((b1 >>> 2) & 0x03) - 2) & 0xFF;
+              pb = (pb + (b1 & 0x03) - 2) & 0xFF;
+              const h = ((pb * 7 + pg * 5 + pr * 3 + pa * 11) & 63) << 2;
+              index[h] = pb; index[h + 1] = pg; index[h + 2] = pr; index[h + 3] = pa;
+              out[dp++] = pb; out[dp++] = pg; out[dp++] = pr; out[dp++] = pa;
+            } else if (op === 0x80) {
+              const b2 = src[sp++];
+              const dg = (b1 & 0x3F) - 32;
+              pr = (pr + dg + ((b2 >>> 4) & 0x0F) - 8) & 0xFF;
+              pg = (pg + dg) & 0xFF;
+              pb = (pb + dg + (b2 & 0x0F) - 8) & 0xFF;
+              const h = ((pb * 7 + pg * 5 + pr * 3 + pa * 11) & 63) << 2;
+              index[h] = pb; index[h + 1] = pg; index[h + 2] = pr; index[h + 3] = pa;
+              out[dp++] = pb; out[dp++] = pg; out[dp++] = pr; out[dp++] = pa;
+            } else {
+              const run = (b1 & 0x3F) + 1;
+              for (let r = 0; r < run && dp < pixelBytes; r++) {
+                out[dp++] = pb; out[dp++] = pg; out[dp++] = pr; out[dp++] = pa;
+              }
+            }
+          }
+        }
+        return out;
+      }
+
       function decodeFramePayload(comp, w, h, stride, raw) {
         let decoded = raw;
         if (comp === 1) {
@@ -739,6 +793,8 @@
         } else if (comp === 2) {
           decoded = lz4Decode(lz4Decode(raw));
           spatialUnfilterSubInPlace(decoded);
+        } else if (comp === 4) {
+          decoded = qoiDecodeBgra(raw);
         } else if (comp === 3) {
           const qw = (w + 1) >> 1, qh = (h + 1) >> 1;
           const qbuf = lz4Decode(raw);
@@ -818,6 +874,17 @@
             const pixelBytes = decodeFramePayload(comp, w, h, stride, raw);
             const imgData = new ImageData(pixelBytes, w, h);
             ctx.putImageData(imgData, x, y);
+            updateFps();
+            break;
+          }
+          case TAG.COPY_RECT: {
+            const srcX = dv.getUint16(8, true);
+            const srcY = dv.getUint16(10, true);
+            const dstX = dv.getUint16(12, true);
+            const dstY = dv.getUint16(14, true);
+            const w = dv.getUint16(16, true);
+            const h = dv.getUint16(18, true);
+            ctx.drawImage(canvas, srcX, srcY, w, h, dstX, dstY, w, h);
             updateFps();
             break;
           }

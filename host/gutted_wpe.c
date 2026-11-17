@@ -86,6 +86,28 @@ static const char *k_media_lifecycle_script =
     "      if (!navigator.getGamepads) {\n"
     "        navigator.getGamepads = function() { return [null, null, null, null]; };\n"
     "      }\n"
+    "      var origAEL = EventTarget.prototype.addEventListener;\n"
+    "      EventTarget.prototype.addEventListener = function(type, fn, opts) {\n"
+    "        if (type === 'wheel' || type === 'mousewheel' || type === 'touchstart' || type === 'touchmove') {\n"
+    "          if (opts === undefined || typeof opts === 'boolean') {\n"
+    "            opts = { capture: !!opts, passive: true };\n"
+    "          } else if (typeof opts === 'object' && opts !== null && opts.passive === undefined) {\n"
+    "            opts = Object.assign({}, opts, { passive: true });\n"
+    "          }\n"
+    "        }\n"
+    "        return origAEL.call(this, type, fn, opts);\n"
+    "      };\n"
+    "      var injectPerfCss = function() {\n"
+    "        var root = document.head || document.documentElement;\n"
+    "        if (root && !document.getElementById('__gt_perf_css')) {\n"
+    "          var s = document.createElement('style');\n"
+    "          s.id = '__gt_perf_css';\n"
+    "          s.textContent = '* { scroll-behavior: auto !important; backdrop-filter: none !important; -webkit-backdrop-filter: none !important; }';\n"
+    "          root.appendChild(s);\n"
+    "        }\n"
+    "      };\n"
+    "      if (document.head || document.documentElement) injectPerfCss();\n"
+    "      document.addEventListener('DOMContentLoaded', injectPerfCss, { once: true });\n"
     "    }\n"
     "    if (window.MediaSource && window.MediaSource.isTypeSupported && !window.__gt_mse_patched) {\n"
     "      window.__gt_mse_patched = true;\n"
@@ -610,6 +632,17 @@ int gutted_wpe_run(
 
     static gsize web_ctx_init = 0;
     if (g_once_init_enter(&web_ctx_init)) {
+        WebKitMemoryPressureSettings *mp = webkit_memory_pressure_settings_new();
+        if (mp) {
+            webkit_memory_pressure_settings_set_memory_limit(mp, 768);
+            webkit_memory_pressure_settings_set_conservative_threshold(mp, 0.50);
+            webkit_memory_pressure_settings_set_strict_threshold(mp, 0.75);
+            webkit_memory_pressure_settings_set_kill_threshold(mp, 0.95);
+            webkit_memory_pressure_settings_set_poll_interval(mp, 5.0);
+            webkit_website_data_manager_set_memory_pressure_settings(mp);
+            webkit_memory_pressure_settings_free(mp);
+        }
+
         WebKitWebContext *web_ctx = webkit_web_context_get_default();
         webkit_web_context_set_sandbox_enabled(web_ctx, FALSE);
         webkit_web_context_set_cache_model(web_ctx, WEBKIT_CACHE_MODEL_WEB_BROWSER);

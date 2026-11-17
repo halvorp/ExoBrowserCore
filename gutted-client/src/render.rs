@@ -53,6 +53,17 @@ pub struct GfxSubframe {
     pub pixels: Vec<u8>,
 }
 
+/// An in-place rectangular copy inside the existing tab framebuffer (used for scroll/pan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GfxCopyRect {
+    pub src_x: u32,
+    pub src_y: u32,
+    pub dst_x: u32,
+    pub dst_y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
 /// Decoded 16-bit signed little-endian PCM audio chunk queued in [`BrowserCore`] for `#![no_std]` audio drivers.
 #[derive(Debug, Clone)]
 pub struct AudioChunk {
@@ -66,6 +77,7 @@ pub struct AudioChunk {
 pub enum RenderEvent {
     Frame(GfxFrame),
     Subframe(GfxSubframe),
+    CopyRect(GfxCopyRect),
     TileData {
         hash: u64,
         pixels: Vec<u8>,
@@ -169,6 +181,22 @@ impl RenderEvent {
                 h: h as u32,
                 hash,
             }),
+            Message::CopyRect {
+                src_x,
+                src_y,
+                dst_x,
+                dst_y,
+                w,
+                h,
+                ..
+            } => Some(Self::CopyRect(GfxCopyRect {
+                src_x: src_x as u32,
+                src_y: src_y as u32,
+                dst_x: dst_x as u32,
+                dst_y: dst_y as u32,
+                w: w as u32,
+                h: h as u32,
+            })),
             Message::AudioFrame {
                 pts_us,
                 channels,
@@ -1151,6 +1179,7 @@ pub struct BrowserCore {
     pub full_content_dirty: bool,
     pub pending_damage: Vec<DamageRect>,
     pub pending_frames: Vec<GfxFrame>,
+    pub pending_copy_rects: Vec<(Vec<GfxSubframe>, GfxCopyRect)>,
     pub pending_subframes: Vec<GfxSubframe>,
     pub pending_tiles: Vec<(u32, u32, u64)>,
 
@@ -1209,6 +1238,7 @@ impl BrowserCore {
             full_content_dirty: true,
             pending_damage: Vec::with_capacity(16),
             pending_frames: Vec::with_capacity(2),
+            pending_copy_rects: Vec::new(),
             pending_subframes: Vec::with_capacity(8),
             pending_tiles: Vec::new(),
             audio_muted: false,
@@ -1240,6 +1270,7 @@ impl BrowserCore {
         self.chrome_dirty
             || self.full_content_dirty
             || !self.pending_frames.is_empty()
+            || !self.pending_copy_rects.is_empty()
             || !self.pending_subframes.is_empty()
             || !self.pending_tiles.is_empty()
             || !self.pending_damage.is_empty()
@@ -1497,11 +1528,26 @@ impl BrowserCore {
                     return true;
                 }
                 self.pending_frames.clear();
+                self.pending_copy_rects.clear();
                 self.pending_subframes.clear();
                 self.pending_tiles.clear();
                 self.pending_damage.clear();
                 self.pending_frames.push(f);
                 self.full_content_dirty = true;
+                self.frames_seen += 1;
+            }
+            RenderEvent::CopyRect(cr) => {
+                if cr.w == 0 || cr.h == 0 || (cr.src_x == cr.dst_x && cr.src_y == cr.dst_y) {
+                    return true;
+                }
+                let pre_subs = core::mem::take(&mut self.pending_subframes);
+                self.pending_damage.push(DamageRect {
+                    x: cr.dst_x,
+                    y: cr.dst_y,
+                    w: cr.w,
+                    h: cr.h,
+                });
+                self.pending_copy_rects.push((pre_subs, cr));
                 self.frames_seen += 1;
             }
             RenderEvent::Subframe(s) => {
@@ -2486,6 +2532,76 @@ impl BrowserCore {
                 self.full_content_dirty = false;
                 self.pending_damage.clear();
             }
+            for (pre_subs, cr) in self.pending_copy_rects.drain(..) {
+                for s in pre_subs {
+                    let x0 = s.x.min(bw);
+                    let y0 = s.y.min(content_h);
+                    let x1 = (s.x + s.w).min(bw);
+                    let y1 = (s.y + s.h).min(content_h);
+                    if x1 > x0 && y1 > y0 {
+                        let copy_w = (x1 - x0) as usize;
+                        let copy_h = (y1 - y0) as usize;
+                        for row in 0..copy_h {
+                            let src_off = row * s.stride as usize;
+                            let dst_off =
+                                (chrome_h as usize + y0 as usize + row) * bw as usize + x0 as usize;
+                            copy_bgra_row_to_u32(
+                                &s.pixels[src_off..src_off + copy_w * 4],
+                                &mut buffer[dst_off..dst_off + copy_w],
+                            );
+                        }
+                        damage.push(DamageRect {
+                            x: x0,
+                            y: chrome_h + y0,
+                            w: x1 - x0,
+                            h: y1 - y0,
+                        });
+                    }
+                }
+                let copy_w = cr
+                    .w
+                    .min(bw.saturating_sub(cr.src_x))
+                    .min(bw.saturating_sub(cr.dst_x));
+                let copy_h = cr
+                    .h
+                    .min(content_h.saturating_sub(cr.src_y))
+                    .min(content_h.saturating_sub(cr.dst_y));
+                if copy_w > 0 && copy_h > 0 {
+                    let cw = copy_w as usize;
+                    let ch = copy_h as usize;
+                    let bw_u = bw as usize;
+                    let base_y = chrome_h as usize;
+                    let sx = cr.src_x as usize;
+                    let sy = cr.src_y as usize;
+                    let dx = cr.dst_x as usize;
+                    let dy = cr.dst_y as usize;
+                    if dy < sy {
+                        for row in 0..ch {
+                            let src_off = (base_y + sy + row) * bw_u + sx;
+                            let dst_off = (base_y + dy + row) * bw_u + dx;
+                            buffer.copy_within(src_off..src_off + cw, dst_off);
+                        }
+                    } else if dy > sy {
+                        for row in (0..ch).rev() {
+                            let src_off = (base_y + sy + row) * bw_u + sx;
+                            let dst_off = (base_y + dy + row) * bw_u + dx;
+                            buffer.copy_within(src_off..src_off + cw, dst_off);
+                        }
+                    } else {
+                        for row in 0..ch {
+                            let src_off = (base_y + sy + row) * bw_u + sx;
+                            let dst_off = (base_y + dy + row) * bw_u + dx;
+                            buffer.copy_within(src_off..src_off + cw, dst_off);
+                        }
+                    }
+                    damage.push(DamageRect {
+                        x: cr.dst_x,
+                        y: chrome_h + cr.dst_y,
+                        w: copy_w,
+                        h: copy_h,
+                    });
+                }
+            }
             for s in self.pending_subframes.drain(..) {
                 let x0 = s.x.min(bw);
                 let y0 = s.y.min(content_h);
@@ -2702,6 +2818,7 @@ fn run_headless_loop(
             }
         } else {
             core.pending_frames.clear();
+            core.pending_copy_rects.clear();
             core.pending_subframes.clear();
             core.pending_tiles.clear();
             core.pending_damage.clear();
@@ -3311,5 +3428,44 @@ mod tests {
         assert_eq!(dls.len(), 1);
         assert_eq!(dls[0].0, "report.txt");
         assert_eq!(dls[0].1, b"pdf-content");
+
+        // Verify CopyRect + QOI subframe scroll pipeline in BrowserCore
+        let mut scroll_wire = Vec::new();
+        // 1) Paint a QOI subframe at y=20..24, x=0..64 with 0x00112233 (BGRA: [0x33, 0x22, 0x11, 0xFF])
+        Message::Subframe {
+            ts_us: 2000,
+            x: 0,
+            y: 20,
+            w: 64,
+            h: 4,
+            stride: 256,
+            format: 0,
+            compression: gutted_proto::compression::QOI,
+            pixels: [0x33u8, 0x22, 0x11, 0xFF].repeat(64 * 4),
+        }
+        .encode(&mut scroll_wire);
+        // 2) Scroll up by 10px: CopyRect from src_y=10..50 to dst_y=0..40 (so y=20 moves to y=10)
+        Message::encode_copy_rect(&mut scroll_wire, 2001, 0, 10, 0, 0, 64, 40);
+        // 3) Paint newly exposed bottom strip y=40..44 with 0x00445566 (BGRA: [0x66, 0x55, 0x44, 0xFF])
+        Message::Subframe {
+            ts_us: 2001,
+            x: 0,
+            y: 40,
+            w: 64,
+            h: 4,
+            stride: 256,
+            format: 0,
+            compression: gutted_proto::compression::QOI,
+            pixels: [0x66u8, 0x55, 0x44, 0xFF].repeat(64 * 4),
+        }
+        .encode(&mut scroll_wire);
+
+        core.ingest_wire_chunk(&scroll_wire).unwrap();
+        let scroll_damage = core.render_into(&mut fb);
+        assert!(!scroll_damage.is_empty());
+        // Row y=20 was shifted to y=10 by CopyRect
+        assert_eq!(fb[(CHROME_H as usize + 10) * 640 + 5], 0x00112233);
+        // Newly exposed strip at y=40 has the post-CopyRect QOI subframe
+        assert_eq!(fb[(CHROME_H as usize + 40) * 640 + 5], 0x00445566);
     }
 }

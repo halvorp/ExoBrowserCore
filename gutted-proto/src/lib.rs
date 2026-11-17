@@ -59,6 +59,8 @@ pub mod tag {
     pub const TILE_DATA:      u32 = 0x42;
     /// Host → client: blit tile by hash (zero payload; client uses local tile cache).
     pub const TILE_REF:       u32 = 0x43;
+    /// Host → client: copy a rectangle within the client's local framebuffer (scroll / pan).
+    pub const COPY_RECT:      u32 = 0x44;
     /// Host → client: Opus / PCM audio frame.
     pub const AUDIO_FRAME:    u32 = 0x48;
     /// Host → client: Encoded H.264 / AV1 video track chunk.
@@ -382,6 +384,17 @@ pub enum Message {
         h: u16,
         hash: u64,
     },
+    /// Host → client: copy a rectangular region inside the client's existing tab framebuffer.
+    /// Used for zero-bandwidth vertical/horizontal scroll shifts before sending edge subframes.
+    CopyRect {
+        ts_us: u64,
+        src_x: u16,
+        src_y: u16,
+        dst_x: u16,
+        dst_y: u16,
+        w: u16,
+        h: u16,
+    },
     /// Host → client: register immutable asset by SHA256 hash.
     AssetRegister {
         hash: [u8; 32],
@@ -498,6 +511,7 @@ pub enum DrawCommand {
     DrawImage { x: i32, y: i32, w: u32, h: u32, asset_hash: [u8; 32] },
     SetClip { x: i32, y: i32, w: u32, h: u32 },
     ClearClip,
+    CopyRect { src_x: u16, src_y: u16, dst_x: u16, dst_y: u16, w: u16, h: u16 },
 }
 
 #[repr(u8)]
@@ -646,6 +660,29 @@ impl Message {
         });
     }
 
+    /// Encode a `CopyRect` message directly without allocating an owned `Message`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_copy_rect(
+        out: &mut Vec<u8>,
+        ts_us: u64,
+        src_x: u16,
+        src_y: u16,
+        dst_x: u16,
+        dst_y: u16,
+        w: u16,
+        h: u16,
+    ) {
+        Self::encode_with_tag_and_payload(out, tag::COPY_RECT, |out| {
+            write_u64(out, ts_us);
+            write_u16(out, src_x);
+            write_u16(out, src_y);
+            write_u16(out, dst_x);
+            write_u16(out, dst_y);
+            write_u16(out, w);
+            write_u16(out, h);
+        });
+    }
+
     #[inline]
     fn encode_with_tag_and_payload<F: FnOnce(&mut Vec<u8>)>(
         out: &mut Vec<u8>,
@@ -710,6 +747,7 @@ impl Message {
             Message::Subframe { .. }     => tag::SUBFRAME,
             Message::TileData { .. }     => tag::TILE_DATA,
             Message::TileRef { .. }      => tag::TILE_REF,
+            Message::CopyRect { .. }     => tag::COPY_RECT,
             Message::AssetRegister { .. } => tag::ASSET_REGISTER,
             Message::DrawCommands { .. } => tag::DRAW_COMMANDS,
             Message::AudioFrame { .. }   => tag::AUDIO_FRAME,
@@ -860,6 +898,15 @@ impl Message {
                 write_u16(out, *w);
                 write_u16(out, *h);
                 write_u64(out, *hash);
+            }
+            Message::CopyRect { ts_us, src_x, src_y, dst_x, dst_y, w, h } => {
+                write_u64(out, *ts_us);
+                write_u16(out, *src_x);
+                write_u16(out, *src_y);
+                write_u16(out, *dst_x);
+                write_u16(out, *dst_y);
+                write_u16(out, *w);
+                write_u16(out, *h);
             }
             Message::AssetRegister { hash, kind, data } => {
                 out.extend_from_slice(hash);
@@ -1114,6 +1161,16 @@ impl Message {
                 let hash  = read_u64(p)?;
                 Message::TileRef { ts_us, x, y, w, h, hash }
             }
+            tag::COPY_RECT => {
+                let ts_us = read_u64(p)?;
+                let src_x = read_u16(p)?;
+                let src_y = read_u16(p)?;
+                let dst_x = read_u16(p)?;
+                let dst_y = read_u16(p)?;
+                let w     = read_u16(p)?;
+                let h     = read_u16(p)?;
+                Message::CopyRect { ts_us, src_x, src_y, dst_x, dst_y, w, h }
+            }
             tag::ASSET_REGISTER => {
                 let bytes = p.get(..32).ok_or(Error::UnexpectedEof)?;
                 let mut hash = [0u8; 32];
@@ -1308,6 +1365,12 @@ fn write_draw_cmd(out: &mut Vec<u8>, cmd: &DrawCommand) {
             write_u32(out, *w); write_u32(out, *h);
         }
         DrawCommand::ClearClip => out.push(6),
+        DrawCommand::CopyRect { src_x, src_y, dst_x, dst_y, w, h } => {
+            out.push(7);
+            write_u16(out, *src_x); write_u16(out, *src_y);
+            write_u16(out, *dst_x); write_u16(out, *dst_y);
+            write_u16(out, *w);     write_u16(out, *h);
+        }
     }
 }
 
@@ -1342,6 +1405,11 @@ fn read_draw_cmd(p: &mut &[u8]) -> Result<DrawCommand> {
             w: read_u32(p)?, h: read_u32(p)?,
         },
         6 => DrawCommand::ClearClip,
+        7 => DrawCommand::CopyRect {
+            src_x: read_u16(p)?, src_y: read_u16(p)?,
+            dst_x: read_u16(p)?, dst_y: read_u16(p)?,
+            w: read_u16(p)?,     h: read_u16(p)?,
+        },
         _ => return Err(Error::InvalidValue),
     })
 }
@@ -1355,6 +1423,9 @@ pub mod compression {
     /// Half-resolution (2x2 box-downsampled) spatial-delta + LZ4 frame for high-FPS video subframes.
     /// Cuts wire bandwidth and decode CPU by >4x while keeping text/UI subframes at 1:1 lossless resolution.
     pub const LZ4_DELTA_Q2: u8 = 3;
+    /// Single-pass 100% lossless QOI (Quite OK Image) spatial pixel codec (`#![no_std]`, zero intermediate allocs).
+    /// Ideal for anti-aliased text, icons, and UI subframes.
+    pub const QOI: u8 = 4;
 }
 
 #[inline(always)]
@@ -1504,6 +1575,9 @@ fn write_payload_geom(out: &mut Vec<u8>, compression: u8, w: u16, h: u16, pixels
             downsample_and_delta_2x2_bgra(pixels, w as usize, h as usize, &mut filtered_down);
             lz4_encode_into(&filtered_down, out);
         }
+        4 => {
+            qoi_encode_bgra_into(pixels, out);
+        }
         other => panic!("gutted-proto: unknown compression {other} on encode"),
     }
 }
@@ -1534,12 +1608,182 @@ fn read_payload_geom(
             spatial_unfilter_sub_in_place(&mut qbuf);
             upsample_2x2_bgra(&qbuf, w, h)
         }
+        4 => qoi_decode_bgra(wire, Some(expected_len))?,
         _ => return Err(Error::InvalidValue),
     };
     if pixels.len() != expected_len {
         return Err(Error::InvalidValue);
     }
     Ok(pixels)
+}
+
+// ─── 100% Pure-Rust Zero-Dep QOI BGRA8 Spatial Codec (no_std + alloc) ────
+
+#[inline(always)]
+fn qoi_hash_bgra(px: [u8; 4]) -> usize {
+    ((px[0] as usize).wrapping_mul(7)
+        .wrapping_add((px[1] as usize).wrapping_mul(5))
+        .wrapping_add((px[2] as usize).wrapping_mul(3))
+        .wrapping_add((px[3] as usize).wrapping_mul(11)))
+        & 63
+}
+
+/// Single-pass QOI (Quite OK Image) encoder for 4-byte BGRA8 pixels with zero intermediate allocations.
+pub fn qoi_encode_bgra_into(pixels: &[u8], out: &mut Vec<u8>) {
+    out.extend_from_slice(&(pixels.len() as u32).to_le_bytes());
+    let (chunks, tail) = pixels.as_chunks::<4>();
+    let mut index = [0u32; 64];
+    let mut prev = [0u8, 0u8, 0u8, 255u8];
+    let mut run = 0u8;
+
+    for &px in chunks {
+        if px == prev {
+            run += 1;
+            if run == 62 {
+                out.push(0xC0 | (run - 1));
+                run = 0;
+            }
+            continue;
+        }
+        if run > 0 {
+            out.push(0xC0 | (run - 1));
+            run = 0;
+        }
+        let h = qoi_hash_bgra(px);
+        let px_u32 = u32::from_le_bytes(px);
+        if index[h] == px_u32 {
+            out.push(h as u8);
+        } else {
+            index[h] = px_u32;
+            if px[3] == prev[3] {
+                let db = px[0].wrapping_sub(prev[0]) as i8;
+                let dg = px[1].wrapping_sub(prev[1]) as i8;
+                let dr = px[2].wrapping_sub(prev[2]) as i8;
+                let dr_dg = dr.wrapping_sub(dg);
+                let db_dg = db.wrapping_sub(dg);
+                if (-2..=1).contains(&db) && (-2..=1).contains(&dg) && (-2..=1).contains(&dr) {
+                    out.push(
+                        0x40 | (((dr + 2) as u8) << 4)
+                            | (((dg + 2) as u8) << 2)
+                            | ((db + 2) as u8),
+                    );
+                } else if (-32..=31).contains(&dg)
+                    && (-8..=7).contains(&dr_dg)
+                    && (-8..=7).contains(&db_dg)
+                {
+                    out.push(0x80 | ((dg + 32) as u8));
+                    out.push((((dr_dg + 8) as u8) << 4) | ((db_dg + 8) as u8));
+                } else {
+                    out.extend_from_slice(&[0xFE, px[0], px[1], px[2]]);
+                }
+            } else {
+                out.extend_from_slice(&[0xFF, px[0], px[1], px[2], px[3]]);
+            }
+        }
+        prev = px;
+    }
+    if run > 0 {
+        out.push(0xC0 | (run - 1));
+    }
+    if !tail.is_empty() {
+        out.extend_from_slice(tail);
+    }
+}
+
+/// Single-pass QOI (Quite OK Image) decoder for 4-byte BGRA8 pixels.
+pub fn qoi_decode_bgra(src: &[u8], expected_len: Option<usize>) -> Result<Vec<u8>> {
+    if src.len() < 4 {
+        return Err(Error::InvalidValue);
+    }
+    let uncomp_len = u32::from_le_bytes([src[0], src[1], src[2], src[3]]) as usize;
+    if uncomp_len > MAX_MESSAGE_BYTES {
+        return Err(Error::MessageTooLarge);
+    }
+    if let Some(exp) = expected_len {
+        if uncomp_len != exp {
+            return Err(Error::InvalidValue);
+        }
+    }
+    let mut out = Vec::with_capacity(uncomp_len);
+    let mut index = [0u32; 64];
+    let mut prev = [0u8, 0u8, 0u8, 255u8];
+    let mut sp = 4usize;
+    let pixel_bytes = uncomp_len & !3;
+
+    while out.len() < pixel_bytes {
+        let b1 = *src.get(sp).ok_or(Error::InvalidValue)?;
+        sp += 1;
+        if b1 == 0xFE {
+            let b = *src.get(sp).ok_or(Error::InvalidValue)?;
+            let g = *src.get(sp + 1).ok_or(Error::InvalidValue)?;
+            let r = *src.get(sp + 2).ok_or(Error::InvalidValue)?;
+            sp += 3;
+            prev[0] = b;
+            prev[1] = g;
+            prev[2] = r;
+            index[qoi_hash_bgra(prev)] = u32::from_le_bytes(prev);
+            out.extend_from_slice(&prev);
+        } else if b1 == 0xFF {
+            let b = *src.get(sp).ok_or(Error::InvalidValue)?;
+            let g = *src.get(sp + 1).ok_or(Error::InvalidValue)?;
+            let r = *src.get(sp + 2).ok_or(Error::InvalidValue)?;
+            let a = *src.get(sp + 3).ok_or(Error::InvalidValue)?;
+            sp += 4;
+            prev = [b, g, r, a];
+            index[qoi_hash_bgra(prev)] = u32::from_le_bytes(prev);
+            out.extend_from_slice(&prev);
+        } else {
+            match b1 & 0xC0 {
+                0x00 => {
+                    prev = index[(b1 & 0x3F) as usize].to_le_bytes();
+                    out.extend_from_slice(&prev);
+                }
+                0x40 => {
+                    let dr = (((b1 >> 4) & 0x03) as i8 - 2) as u8;
+                    let dg = (((b1 >> 2) & 0x03) as i8 - 2) as u8;
+                    let db = ((b1 & 0x03) as i8 - 2) as u8;
+                    prev[0] = prev[0].wrapping_add(db);
+                    prev[1] = prev[1].wrapping_add(dg);
+                    prev[2] = prev[2].wrapping_add(dr);
+                    index[qoi_hash_bgra(prev)] = u32::from_le_bytes(prev);
+                    out.extend_from_slice(&prev);
+                }
+                0x80 => {
+                    let b2 = *src.get(sp).ok_or(Error::InvalidValue)?;
+                    sp += 1;
+                    let dg = ((b1 & 0x3F) as i8 - 32) as u8;
+                    let dr = dg.wrapping_add((((b2 >> 4) & 0x0F) as i8 - 8) as u8);
+                    let db = dg.wrapping_add(((b2 & 0x0F) as i8 - 8) as u8);
+                    prev[0] = prev[0].wrapping_add(db);
+                    prev[1] = prev[1].wrapping_add(dg);
+                    prev[2] = prev[2].wrapping_add(dr);
+                    index[qoi_hash_bgra(prev)] = u32::from_le_bytes(prev);
+                    out.extend_from_slice(&prev);
+                }
+                _ => {
+                    let run = ((b1 & 0x3F) as usize) + 1;
+                    if out.len() + run * 4 > pixel_bytes {
+                        return Err(Error::InvalidValue);
+                    }
+                    let old_len = out.len();
+                    out.resize(old_len + run * 4, 0);
+                    let (chunks, _) = out[old_len..].as_chunks_mut::<4>();
+                    chunks.fill(prev);
+                }
+            }
+        }
+    }
+
+    let rem = uncomp_len - pixel_bytes;
+    if rem > 0 {
+        let tail = src.get(sp..sp + rem).ok_or(Error::InvalidValue)?;
+        out.extend_from_slice(tail);
+        sp += rem;
+    }
+    if sp != src.len() || out.len() != uncomp_len {
+        return Err(Error::InvalidValue);
+    }
+    Ok(out)
 }
 
 fn spatial_filter_sub_into(pixels: &[u8], out: &mut Vec<u8>) {
@@ -2343,5 +2587,81 @@ mod tests {
         }
         assert_eq!(decoded, msgs);
         assert_eq!(dec.buffered_len(), 0);
+    }
+
+    #[test]
+    fn copy_rect_and_qoi_roundtrip() {
+        roundtrip(Message::CopyRect {
+            ts_us: 123_456,
+            src_x: 0,
+            src_y: 48,
+            dst_x: 0,
+            dst_y: 0,
+            w: 1280,
+            h: 600,
+        });
+
+        let mut fast_wire = Vec::new();
+        Message::encode_copy_rect(&mut fast_wire, 123_456, 0, 48, 0, 0, 1280, 600);
+        assert_eq!(fast_wire.len(), 22);
+        let mut s = fast_wire.as_slice();
+        assert_eq!(
+            Message::decode(&mut s).unwrap().unwrap(),
+            Message::CopyRect {
+                ts_us: 123_456,
+                src_x: 0,
+                src_y: 48,
+                dst_x: 0,
+                dst_y: 0,
+                w: 1280,
+                h: 600,
+            }
+        );
+
+        roundtrip(Message::DrawCommands {
+            ts_us: 99,
+            layer_id: 0,
+            commands: vec![DrawCommand::CopyRect {
+                src_x: 0,
+                src_y: 0,
+                dst_x: 0,
+                dst_y: 40,
+                w: 800,
+                h: 500,
+            }],
+        });
+
+        // Test QOI lossless roundtrip on anti-aliased UI/text-like palette + gradients
+        let (w, h) = (96u16, 48u16);
+        let stride = (w as u32) * 4;
+        let mut px = Vec::with_capacity((stride as usize) * (h as usize));
+        let palette: [[u8; 4]; 6] = [
+            [0x18, 0x18, 0x1B, 0xFF],
+            [0xF4, 0xF4, 0xF5, 0xFF],
+            [0x80, 0x80, 0x88, 0xFF],
+            [0xF6, 0x82, 0x3B, 0xFF],
+            [0x19, 0x19, 0x1C, 0xFF],
+            [0x20, 0x40, 0x80, 0x80],
+        ];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                if (10..38).contains(&y) && (12..84).contains(&x) {
+                    px.extend_from_slice(&palette[(x * 3 + y * 5) % palette.len()]);
+                } else {
+                    px.extend_from_slice(&palette[0]);
+                }
+            }
+        }
+        roundtrip(Message::Subframe {
+            ts_us: 777,
+            x: 10,
+            y: 20,
+            w,
+            h,
+            stride,
+            format: 0,
+            compression: compression::QOI,
+            pixels: px,
+        });
     }
 }
