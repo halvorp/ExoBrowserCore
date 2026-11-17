@@ -1786,6 +1786,162 @@ pub fn qoi_decode_bgra(src: &[u8], expected_len: Option<usize>) -> Result<Vec<u8
     Ok(out)
 }
 
+/// Zero-allocation strided QOI decoder that writes `0x00RRGGBB` `u32` pixels directly into
+/// a destination framebuffer (`dst` with row stride `dst_stride`) at rectangle `(dst_x, dst_y, w, h)`.
+/// Eliminates the temporary `Vec<u8>` heap allocation and second memory copy on `#![no_std]` clients.
+pub fn qoi_decode_bgra_strided(
+    src: &[u8],
+    dst: &mut [u32],
+    dst_stride: usize,
+    dst_x: usize,
+    dst_y: usize,
+    w: usize,
+    h: usize,
+) -> Result<()> {
+    if src.len() < 4 {
+        return Err(Error::InvalidValue);
+    }
+    let uncomp_len = u32::from_le_bytes([src[0], src[1], src[2], src[3]]) as usize;
+    let total_px = w.checked_mul(h).ok_or(Error::InvalidValue)?;
+    if uncomp_len != total_px.checked_mul(4).ok_or(Error::InvalidValue)? {
+        return Err(Error::InvalidValue);
+    }
+    if w == 0 || h == 0 {
+        return Ok(());
+    }
+    let last_row_end = (dst_y + h - 1)
+        .checked_mul(dst_stride)
+        .and_then(|r| r.checked_add(dst_x + w))
+        .ok_or(Error::InvalidValue)?;
+    if dst_x + w > dst_stride || last_row_end > dst.len() {
+        return Err(Error::InvalidValue);
+    }
+
+    let mut index = [0u32; 64];
+    let mut prev = [0u8, 0u8, 0u8, 255u8];
+    let mut prev_u32 = 0u32;
+    let mut sp = 4usize;
+    let mut row = 0usize;
+    let mut col = 0usize;
+    let mut row_base = (dst_y + row) * dst_stride + dst_x;
+
+    while row < h {
+        let b1 = *src.get(sp).ok_or(Error::InvalidValue)?;
+        sp += 1;
+        if b1 == 0xFE {
+            let b = *src.get(sp).ok_or(Error::InvalidValue)?;
+            let g = *src.get(sp + 1).ok_or(Error::InvalidValue)?;
+            let r = *src.get(sp + 2).ok_or(Error::InvalidValue)?;
+            sp += 3;
+            prev[0] = b;
+            prev[1] = g;
+            prev[2] = r;
+            let raw_u32 = u32::from_le_bytes(prev);
+            index[qoi_hash_bgra(prev)] = raw_u32;
+            prev_u32 = raw_u32 & 0x00FF_FFFF;
+            dst[row_base + col] = prev_u32;
+            col += 1;
+            if col == w {
+                col = 0;
+                row += 1;
+                row_base += dst_stride;
+            }
+        } else if b1 == 0xFF {
+            let b = *src.get(sp).ok_or(Error::InvalidValue)?;
+            let g = *src.get(sp + 1).ok_or(Error::InvalidValue)?;
+            let r = *src.get(sp + 2).ok_or(Error::InvalidValue)?;
+            let a = *src.get(sp + 3).ok_or(Error::InvalidValue)?;
+            sp += 4;
+            prev = [b, g, r, a];
+            let raw_u32 = u32::from_le_bytes(prev);
+            index[qoi_hash_bgra(prev)] = raw_u32;
+            prev_u32 = raw_u32 & 0x00FF_FFFF;
+            dst[row_base + col] = prev_u32;
+            col += 1;
+            if col == w {
+                col = 0;
+                row += 1;
+                row_base += dst_stride;
+            }
+        } else {
+            match b1 & 0xC0 {
+                0x00 => {
+                    let raw_u32 = index[(b1 & 0x3F) as usize];
+                    prev = raw_u32.to_le_bytes();
+                    prev_u32 = raw_u32 & 0x00FF_FFFF;
+                    dst[row_base + col] = prev_u32;
+                    col += 1;
+                    if col == w {
+                        col = 0;
+                        row += 1;
+                        row_base += dst_stride;
+                    }
+                }
+                0x40 => {
+                    let dr = (((b1 >> 4) & 0x03) as i8 - 2) as u8;
+                    let dg = (((b1 >> 2) & 0x03) as i8 - 2) as u8;
+                    let db = ((b1 & 0x03) as i8 - 2) as u8;
+                    prev[0] = prev[0].wrapping_add(db);
+                    prev[1] = prev[1].wrapping_add(dg);
+                    prev[2] = prev[2].wrapping_add(dr);
+                    let raw_u32 = u32::from_le_bytes(prev);
+                    index[qoi_hash_bgra(prev)] = raw_u32;
+                    prev_u32 = raw_u32 & 0x00FF_FFFF;
+                    dst[row_base + col] = prev_u32;
+                    col += 1;
+                    if col == w {
+                        col = 0;
+                        row += 1;
+                        row_base += dst_stride;
+                    }
+                }
+                0x80 => {
+                    let b2 = *src.get(sp).ok_or(Error::InvalidValue)?;
+                    sp += 1;
+                    let dg = ((b1 & 0x3F) as i8 - 32) as u8;
+                    let dr = dg.wrapping_add((((b2 >> 4) & 0x0F) as i8 - 8) as u8);
+                    let db = dg.wrapping_add(((b2 & 0x0F) as i8 - 8) as u8);
+                    prev[0] = prev[0].wrapping_add(db);
+                    prev[1] = prev[1].wrapping_add(dg);
+                    prev[2] = prev[2].wrapping_add(dr);
+                    let raw_u32 = u32::from_le_bytes(prev);
+                    index[qoi_hash_bgra(prev)] = raw_u32;
+                    prev_u32 = raw_u32 & 0x00FF_FFFF;
+                    dst[row_base + col] = prev_u32;
+                    col += 1;
+                    if col == w {
+                        col = 0;
+                        row += 1;
+                        row_base += dst_stride;
+                    }
+                }
+                _ => {
+                    let mut rem_run = ((b1 & 0x3F) as usize) + 1;
+                    while rem_run > 0 {
+                        if row >= h {
+                            return Err(Error::InvalidValue);
+                        }
+                        let span = rem_run.min(w - col);
+                        dst[row_base + col..row_base + col + span].fill(prev_u32);
+                        col += span;
+                        rem_run -= span;
+                        if col == w {
+                            col = 0;
+                            row += 1;
+                            row_base += dst_stride;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if sp != src.len() {
+        return Err(Error::InvalidValue);
+    }
+    Ok(())
+}
+
 fn spatial_filter_sub_into(pixels: &[u8], out: &mut Vec<u8>) {
     let (src_chunks, _) = pixels.as_chunks::<4>();
     out.resize(src_chunks.len() * 4, 0);
@@ -2661,7 +2817,23 @@ mod tests {
             stride,
             format: 0,
             compression: compression::QOI,
-            pixels: px,
+            pixels: px.clone(),
         });
+
+        // Verify zero-allocation strided QOI decode directly into a [u32] framebuffer
+        let mut qoi_wire = Vec::new();
+        qoi_encode_bgra_into(&px, &mut qoi_wire);
+        let fb_w = 200usize;
+        let fb_h = 100usize;
+        let mut fb = vec![0xDEADBEEFu32; fb_w * fb_h];
+        qoi_decode_bgra_strided(&qoi_wire, &mut fb, fb_w, 10, 20, w as usize, h as usize).unwrap();
+        for ry in 0..h as usize {
+            for rx in 0..w as usize {
+                let src_idx = (ry * (w as usize) + rx) * 4;
+                let expected_u32 =
+                    u32::from_le_bytes(px[src_idx..src_idx + 4].try_into().unwrap()) & 0x00FF_FFFF;
+                assert_eq!(fb[(20 + ry) * fb_w + (10 + rx)], expected_u32);
+            }
+        }
     }
 }

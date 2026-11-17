@@ -482,12 +482,15 @@ impl HostState {
                                         let mut total_px: u64 = regions.iter().map(|(_, _, w, h)| (*w as u64) * (*h as u64)).sum();
                                         let full_px = (f.width as u64) * (f.height as u64);
 
-                                        // Scroll CopyRect fast-path: if >= 45% of pixels changed on a clean
-                                        // 1:1 framebuffer, test whether the frame shifted vertically. If so,
-                                        // emit a 22-byte CopyRect and only transmit lossless subframes for
+                                        // Scroll CopyRect fast-path: if >= 45% of pixels changed,
+                                        // test whether the frame shifted vertically. If so, emit a
+                                        // 22-byte CopyRect and only transmit lossless subframes for
                                         // the newly exposed strip + any fixed headers/scrollbars!
+                                        // If the tab had pending Q2 lossy pixels, keep/reset the 140ms
+                                        // refinement timer so the shifted region still gets its lossless
+                                        // ZSTD pass once scrolling stops.
                                         let mut did_copy_rect = false;
-                                        if total_px * 20 >= full_px * 9 && !q2_dirty_since.contains_key(&this_tab_id) {
+                                        if total_px * 20 >= full_px * 9 {
                                             if let Some((src_y, dst_y, copy_h)) = detect_vertical_scroll(
                                                 &prev_f.pixels,
                                                 &f.pixels,
@@ -510,6 +513,9 @@ impl HostState {
                                                     .map(|(_, _, w, h)| (*w as u64) * (*h as u64))
                                                     .sum();
                                                 if scroll_px * 2 < full_px && scroll_regs.len() <= 16 {
+                                                    if q2_dirty_since.contains_key(&this_tab_id) {
+                                                        q2_dirty_since.insert(this_tab_id, std::time::Instant::now());
+                                                    }
                                                     bus_clone.publish_copy_rect(
                                                         ts_us,
                                                         0,
@@ -1946,6 +1952,7 @@ fn spawn_audio_capture(bus: FrameBus) {
                     "--channels=2",
                     "--raw",
                     "--latency-msec=10",
+                    "--process-time-msec=5",
                 ])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())

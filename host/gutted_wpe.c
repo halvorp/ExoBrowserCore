@@ -52,6 +52,7 @@ static gboolean wpe_process_init(void) {
         setenv("LIBGL_ALWAYS_SOFTWARE", "1", 0);
         setenv("LP_NUM_THREADS", "4", 0);
         setenv("PULSE_LATENCY_MSEC", "15", 0);
+        setenv("WEBKIT_SKIA_ENABLE_CPU_RENDERING", "1", 0);
         setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "0", 0);
         setenv("WEBKIT_GST_DMABUF_SINK_ENABLED", "0", 0);
         setenv("WEBKIT_GST_MAX_AVC1_RESOLUTION", "720P", 0);
@@ -102,7 +103,7 @@ static const char *k_media_lifecycle_script =
     "        if (root && !document.getElementById('__gt_perf_css')) {\n"
     "          var s = document.createElement('style');\n"
     "          s.id = '__gt_perf_css';\n"
-    "          s.textContent = '* { scroll-behavior: auto !important; backdrop-filter: none !important; -webkit-backdrop-filter: none !important; }';\n"
+    "          s.textContent = '* { scroll-behavior: auto !important; backdrop-filter: none !important; -webkit-backdrop-filter: none !important; will-change: auto !important; }';\n"
     "          root.appendChild(s);\n"
     "        }\n"
     "      };\n"
