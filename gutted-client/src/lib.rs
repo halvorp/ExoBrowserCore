@@ -25,8 +25,13 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
+pub mod cbp;
 pub mod render;
 
+pub use cbp::{
+    decode_cbp_frame_header, decode_cbp_header, encode_cbp_frame_header, encode_cbp_return_page,
+    CbpCloudBridge, CbpError, CbpFrameHeader, CbpHeader, CbpViewport,
+};
 pub use gutted_proto::FrameDecoder;
 pub use render::{
     canonicalize_url, extract_origin, urls_equivalent, AVClock, AudioChunk, BrowserCore,
