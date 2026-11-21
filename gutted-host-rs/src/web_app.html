@@ -475,7 +475,7 @@
         INPUT_POINTER: 0x10, INPUT_KEY: 0x11, INPUT_SCROLL: 0x12, INPUT_BUTTON: 0x13, SET_ZOOM: 0x14,
         CURSOR_STATE: 0x30, LOAD_STATE: 0x31, TITLE: 0x32, URL_CHANGED: 0x33,
         RAW_FRAME: 0x40, SUBFRAME: 0x41, TILE_DATA: 0x42, TILE_REF: 0x43, COPY_RECT: 0x44,
-        FRAME_EPOCH: 0x45, RELEASE_FRAME: 0x46, AUDIO_FRAME: 0x48,
+        FRAME_EPOCH: 0x45, RELEASE_FRAME: 0x46, AUDIO_FRAME: 0x48, DRAW_COMMANDS: 0x51,
         CREATE_TAB: 0x70, CLOSE_TAB: 0x71, SWITCH_TAB: 0x72,
         TAB_CREATED: 0x73, TAB_CLOSED: 0x74, TAB_ACTIVATED: 0x75, TAB_TITLE: 0x76, TAB_URL: 0x77,
         CLEAR_DATA: 0x80, CLIPBOARD: 0x81, FILE_CHOOSER_PROMPT: 0x82, FILE_UPLOAD: 0x83, FILE_DOWNLOAD: 0x84
@@ -923,6 +923,48 @@
               ack.set(p.subarray(0, 28), 0);
               ack[28] = 1; // DISPOSITION_COPIED
               sendMsg(TAG.RELEASE_FRAME, ack);
+            }
+            break;
+          }
+          case TAG.DRAW_COMMANDS: {
+            const cntInfo = readVarint(dv, 12);
+            if (cntInfo) {
+              let off = 12 + cntInfo.bytesRead;
+              for (let i = 0; i < cntInfo.value && off < p.byteLength; i++) {
+                const op = dv.getUint8(off++);
+                if (op === 1) { // FillRect(x:i32, y:i32, w:u32, h:u32, rgba:u32)
+                  const rx = dv.getInt32(off, true); off += 4;
+                  const ry = dv.getInt32(off, true); off += 4;
+                  const rw = dv.getUint32(off, true); off += 4;
+                  const rh = dv.getUint32(off, true); off += 4;
+                  const rgba = dv.getUint32(off, true); off += 4;
+                  const r = (rgba >>> 16) & 0xff, g = (rgba >>> 8) & 0xff, b = rgba & 0xff;
+                  ctx.fillStyle = `rgb(${r},${g},${b})`;
+                  ctx.fillRect(rx, ry, rw, rh);
+                } else if (op === 2) { // StrokeRect
+                  const rx = dv.getInt32(off, true); off += 4;
+                  const ry = dv.getInt32(off, true); off += 4;
+                  const rw = dv.getUint32(off, true); off += 4;
+                  const rh = dv.getUint32(off, true); off += 4;
+                  const rgba = dv.getUint32(off, true); off += 4;
+                  const lw = dv.getUint16(off, true); off += 2;
+                  const r = (rgba >>> 16) & 0xff, g = (rgba >>> 8) & 0xff, b = rgba & 0xff;
+                  ctx.strokeStyle = `rgb(${r},${g},${b})`;
+                  ctx.lineWidth = lw || 1;
+                  ctx.strokeRect(rx, ry, rw, rh);
+                } else if (op === 7) { // CopyRect
+                  const sx = dv.getUint16(off, true); off += 2;
+                  const sy = dv.getUint16(off, true); off += 2;
+                  const dx = dv.getUint16(off, true); off += 2;
+                  const dy = dv.getUint16(off, true); off += 2;
+                  const cw = dv.getUint16(off, true); off += 2;
+                  const ch = dv.getUint16(off, true); off += 2;
+                  ctx.drawImage(canvas, sx, sy, cw, ch, dx, dy, cw, ch);
+                } else {
+                  break;
+                }
+              }
+              updateFps();
             }
             break;
           }

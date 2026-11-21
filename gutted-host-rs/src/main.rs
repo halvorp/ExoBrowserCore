@@ -29,6 +29,7 @@ use tracing::{error, info, warn};
 pub enum BusMeta {
     RawFrame,
     CopyRect,
+    DrawCommands,
     Subframe { x: u16, y: u16, w: u16, h: u16 },
     Other,
 }
@@ -65,6 +66,7 @@ impl FrameBus {
         let meta = match msg {
             Message::RawFrame { .. } => BusMeta::RawFrame,
             Message::CopyRect { .. } => BusMeta::CopyRect,
+            Message::DrawCommands { .. } => BusMeta::DrawCommands,
             Message::Subframe { x, y, w, h, .. } => BusMeta::Subframe {
                 x: *x,
                 y: *y,
@@ -246,7 +248,10 @@ pub fn coalesce_bus_batch(
                 batch.retain(|old| {
                     !matches!(
                         old.meta,
-                        BusMeta::RawFrame | BusMeta::CopyRect | BusMeta::Subframe { .. }
+                        BusMeta::RawFrame
+                            | BusMeta::CopyRect
+                            | BusMeta::DrawCommands
+                            | BusMeta::Subframe { .. }
                     )
                 });
             }
@@ -262,7 +267,7 @@ pub fn coalesce_bus_batch(
                 let ny1 = ny0 + (h2 as u32);
                 let after_copy = batch
                     .iter()
-                    .rposition(|b| matches!(b.meta, BusMeta::CopyRect))
+                    .rposition(|b| matches!(b.meta, BusMeta::CopyRect | BusMeta::DrawCommands))
                     .map_or(0, |i| i + 1);
                 let mut idx = 0usize;
                 batch.retain(|old| {
@@ -289,7 +294,7 @@ pub fn coalesce_bus_batch(
                     }
                 });
             }
-            BusMeta::CopyRect | BusMeta::Other => {}
+            BusMeta::CopyRect | BusMeta::DrawCommands | BusMeta::Other => {}
         }
         batch.push(newer);
     }
@@ -484,7 +489,6 @@ impl HostState {
         let active_atomic = active_tab_id.clone();
         let tabs_ref = tabs.clone();
         let last_frames_ref = last_frames.clone();
-        let scroll_ms_ref = last_scroll_ms.clone();
         let vw_ref = viewport_w.clone();
         let vh_ref = viewport_h.clone();
         let nav_id_ref = nav_id.clone();
@@ -615,15 +619,11 @@ impl HostState {
                                         let mut total_px: u64 = regions.iter().map(|(_, _, w, h)| (*w as u64) * (*h as u64)).sum();
                                         let full_px = (f.width as u64) * (f.height as u64);
 
-                                        // Scroll CopyRect fast-path: only run scanline scroll detection
-                                        // within 500ms of an actual scroll/key input event so passive
-                                        // YouTube video playback spends 0% CPU on scroll hashing!
-                                        let now_ms = ts_us / 1000;
-                                        let recent_scroll = now_ms
-                                            .saturating_sub(scroll_ms_ref.load(Ordering::Relaxed))
-                                            <= 500;
+                                        // Scroll CopyRect fast-path: run scanline scroll detection whenever
+                                        // >=20% of the viewport changed (covers scroll wheel, scrollbar drag,
+                                        // smooth CSS/JS momentum scrolling, and keyboard scrolling!).
                                         let mut did_copy_rect = false;
-                                        if recent_scroll && total_px * 20 >= full_px * 9 {
+                                        if total_px * 5 >= full_px {
                                             if let Some((src_y, dst_y, copy_h)) = detect_vertical_scroll(
                                                 &prev_f.pixels,
                                                 &f.pixels,
@@ -645,7 +645,7 @@ impl HostState {
                                                     .iter()
                                                     .map(|(_, _, w, h)| (*w as u64) * (*h as u64))
                                                     .sum();
-                                                if scroll_px * 2 < full_px && scroll_regs.len() <= 16 {
+                                                if scroll_px * 3 < full_px * 2 && scroll_regs.len() <= 24 {
                                                     if let Some(entry) = q2_dirty_bounds.get_mut(&this_tab_id) {
                                                         entry.0 = std::time::Instant::now();
                                                         entry.1 = 0;
@@ -669,24 +669,17 @@ impl HostState {
                                             }
                                         }
 
-                                        if !did_copy_rect && (total_px * 10 >= full_px * 8 || regions.len() > 16) {
-                                            let comp = if f.stride == f.width * 4 {
-                                                q2_dirty_bounds.insert(
-                                                    this_tab_id,
-                                                    (std::time::Instant::now(), 0, 0, f.width as u16, f.height as u16),
-                                                );
-                                                gutted_proto::compression::LZ4_DELTA_Q2
-                                            } else {
-                                                q2_dirty_bounds.remove(&this_tab_id);
-                                                gutted_proto::compression::ZSTD
-                                            };
+                                        if !did_copy_rect && (total_px * 10 >= full_px * 8 || regions.len() > 20) {
+                                            // Full-frame update: always use 1:1 lossless ZSTD so scrolling,
+                                            // page transitions, and large DOM layouts never blur or pixelate text!
+                                            q2_dirty_bounds.remove(&this_tab_id);
                                             bus_clone.publish_raw_frame(
                                                 ts_us,
                                                 f.width as u16,
                                                 f.height as u16,
                                                 f.stride as u32,
                                                 f.format,
-                                                comp,
+                                                gutted_proto::compression::ZSTD,
                                                 &f.pixels,
                                             );
                                             if let Ok(mut g) = last_frames_ref.lock() {
@@ -697,8 +690,24 @@ impl HostState {
                                             let stride = f.stride;
                                             let s_usize = stride as usize;
                                             let now = std::time::Instant::now();
+                                            let mut draw_cmds: Vec<gutted_proto::DrawCommand> = Vec::new();
                                             for &(x, y, w, h) in &regions {
-                                                // Content-addressable 64x64 tile cache fast-path
+                                                // 1. Vector DrawCommand::FillRect synthesis: if the dirty region
+                                                //    is a uniform solid color (backgrounds, cleared areas, skeleton cards,
+                                                //    solid buttons/bars), emit a 21-byte vector FillRect command instead
+                                                //    of transmitting any pixel bitmap!
+                                                if let Some(rgba) = check_solid_fill_rect(&f.pixels, stride, x, y, w, h) {
+                                                    draw_cmds.push(gutted_proto::DrawCommand::FillRect {
+                                                        x: x as i32,
+                                                        y: y as i32,
+                                                        w: w as u32,
+                                                        h: h as u32,
+                                                        rgba,
+                                                    });
+                                                    continue;
+                                                }
+
+                                                // 2. Content-addressable 64x64 tile cache fast-path
                                                 if w == 64 && h == 64 {
                                                     let sub = extract_subrect(&f.pixels, stride, x, y, 64, 64);
                                                     if let Some(hash) = fxhash_tile_64x64(&sub) {
@@ -736,10 +745,15 @@ impl HostState {
                                                 }
 
                                                 let area = (w as usize) * (h as usize);
+                                                // Only use 2x2 downsampled Q2 for confirmed high-frequency video
+                                                // subregions (>=5 overlapping frames in 250ms, not full-width scrolling).
+                                                // Everything else (text, cards, scrolling strips, UI hovers) is sent
+                                                // at 1:1 lossless resolution (QOI / ZSTD_DELTA / ZSTD)!
                                                 let is_video_sub = !did_copy_rect
-                                                    && area >= 36_000
+                                                    && (w as i32) < f.width
+                                                    && (36_000..=550_000).contains(&area)
                                                     && video_tracker.record_and_is_video(this_tab_id, (x, y, w, h), now);
-                                                let comp = if !did_copy_rect && (area >= 90_000 || is_video_sub) {
+                                                let comp = if is_video_sub {
                                                     merge_q2_dirty_bounds(&mut q2_dirty_bounds, this_tab_id, now, x, y, w, h);
                                                     gutted_proto::compression::LZ4_DELTA_Q2
                                                 } else if area >= 32_000 {
@@ -777,6 +791,13 @@ impl HostState {
                                                         &sub,
                                                     );
                                                 }
+                                            }
+                                            if !draw_cmds.is_empty() {
+                                                bus_clone.publish(Arc::new(Message::DrawCommands {
+                                                    ts_us,
+                                                    layer_id: 0,
+                                                    commands: draw_cmds,
+                                                }));
                                             }
                                             if let Ok(mut g) = last_frames_ref.lock() {
                                                 g.insert(this_tab_id, f);
@@ -1349,7 +1370,7 @@ async fn handle_ctrl_stream(
                             cum_bytes += n as u64;
                             match item.meta {
                                 BusMeta::RawFrame => cum_full += n as u64,
-                                BusMeta::Subframe { .. } | BusMeta::CopyRect => cum_sub += n as u64,
+                                BusMeta::Subframe { .. } | BusMeta::CopyRect | BusMeta::DrawCommands => cum_sub += n as u64,
                                 BusMeta::Other => {}
                             }
                         }
@@ -2333,6 +2354,37 @@ fn extract_subrect(pixels: &[u8], stride: i32, x: u16, y: u16, w: u16, h: u16) -
     out
 }
 
+/// Check if a sub-rectangle `(x, y, w, h)` in `pixels` is a single uniform solid color.
+/// If so, returns `Some(0xFFRRGGBB)` so the host can emit a 21-byte `DrawCommand::FillRect`
+/// instead of transmitting a pixel bitmap.
+fn check_solid_fill_rect(
+    pixels: &[u8],
+    stride: i32,
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+) -> Option<u32> {
+    let area = (w as usize) * (h as usize);
+    if area < 64 || w == 0 || h == 0 {
+        return None;
+    }
+    let s = stride as usize;
+    let row0 = (y as usize) * s + (x as usize) * 4;
+    let first_px: [u8; 4] = pixels.get(row0..row0 + 4)?.try_into().ok()?;
+    let first_u32 = u32::from_le_bytes(first_px);
+    let row_bytes = (w as usize) * 4;
+    for yy in 0..h as usize {
+        let row_start = (y as usize + yy) * s + (x as usize) * 4;
+        let row_slice = pixels.get(row_start..row_start + row_bytes)?;
+        let (chunks, _) = row_slice.as_chunks::<4>();
+        if chunks.iter().any(|&px| px != first_px) {
+            return None;
+        }
+    }
+    Some(first_u32 | 0xFF00_0000)
+}
+
 /// Merge a newly dirtied `LZ4_DELTA_Q2` rectangle `(x, y, w, h)` into the per-tab
 /// union bounding box and reset its 140ms refinement timestamp.
 fn merge_q2_dirty_bounds(
@@ -2614,5 +2666,18 @@ mod tests {
         let mut tt = TileCacheTracker::new();
         assert!(!tt.check_or_insert(h));
         assert!(tt.check_or_insert(h));
+
+        // Solid FillRect synthesis check
+        let (solid_frame, solid_stride) = make_frame(64, 64, [0x33, 0x22, 0x11, 0xFF]);
+        assert_eq!(
+            check_solid_fill_rect(&solid_frame, solid_stride, 0, 0, 32, 32),
+            Some(0xFF112233)
+        );
+        let mut non_solid = solid_frame.clone();
+        non_solid[0] = 0x99;
+        assert_eq!(
+            check_solid_fill_rect(&non_solid, solid_stride, 0, 0, 32, 32),
+            None
+        );
     }
 }

@@ -280,6 +280,9 @@ version = "0.0.1"
 dependencies = [
  "ab_glyph",
  "gutted-proto",
+ "quinn",
+ "rustls",
+ "tokio",
  "x11rb",
 ]
 

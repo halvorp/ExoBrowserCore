@@ -78,6 +78,10 @@ pub enum RenderEvent {
     Frame(GfxFrame),
     Subframe(GfxSubframe),
     CopyRect(GfxCopyRect),
+    DrawCommands {
+        layer_id: u32,
+        commands: Vec<gutted_proto::DrawCommand>,
+    },
     TileData {
         hash: u64,
         pixels: Vec<u8>,
@@ -219,6 +223,9 @@ impl RenderEvent {
                 w: w as u32,
                 h: h as u32,
             })),
+            Message::DrawCommands {
+                layer_id, commands, ..
+            } => Some(Self::DrawCommands { layer_id, commands }),
             Message::AudioFrame {
                 pts_us,
                 channels,
@@ -2076,6 +2083,7 @@ pub struct BrowserCore {
     pub pending_copy_rects: Vec<(Vec<GfxSubframe>, GfxCopyRect)>,
     pub pending_subframes: Vec<GfxSubframe>,
     pub pending_tiles: Vec<(u32, u32, u64)>,
+    pub pending_draw_cmds: Vec<gutted_proto::DrawCommand>,
 
     pub audio_muted: bool,
     pub audio_playing_frames_left: u32,
@@ -2144,6 +2152,7 @@ impl BrowserCore {
             pending_copy_rects: Vec::new(),
             pending_subframes: Vec::with_capacity(8),
             pending_tiles: Vec::new(),
+            pending_draw_cmds: Vec::new(),
             audio_muted: false,
             audio_playing_frames_left: 0,
             pending_audio: Vec::new(),
@@ -2499,9 +2508,20 @@ impl BrowserCore {
                 self.pending_copy_rects.clear();
                 self.pending_subframes.clear();
                 self.pending_tiles.clear();
+                self.pending_draw_cmds.clear();
                 self.pending_damage.clear();
                 self.pending_frames.push(f);
                 self.full_content_dirty = true;
+                self.frames_seen += 1;
+            }
+            RenderEvent::DrawCommands { commands, .. } => {
+                if self.epoch_stale {
+                    return true;
+                }
+                if self.pending_frames.is_empty() && self.active_buf.is_none() {
+                    self.full_content_dirty = false;
+                }
+                self.pending_draw_cmds.extend(commands);
                 self.frames_seen += 1;
             }
             RenderEvent::CopyRect(cr) => {
@@ -3765,6 +3785,137 @@ impl BrowserCore {
                     }
                 }
             }
+            for cmd in self.pending_draw_cmds.drain(..) {
+                match cmd {
+                    gutted_proto::DrawCommand::FillRect { x, y, w, h, rgba } => {
+                        let rgb = rgba & 0x00FF_FFFF;
+                        let cx = x.max(0) as u32;
+                        let cy = y.max(0) as u32;
+                        let cw = w.min(bw.saturating_sub(cx));
+                        let ch = h.min(content_h.saturating_sub(cy));
+                        if cw > 0 && ch > 0 {
+                            fill_rect(
+                                buffer,
+                                bw,
+                                bh,
+                                cx as i32,
+                                (chrome_h + cy) as i32,
+                                cw as i32,
+                                ch as i32,
+                                rgb,
+                            );
+                            damage.push(DamageRect {
+                                x: cx,
+                                y: chrome_h + cy,
+                                w: cw,
+                                h: ch,
+                            });
+                        }
+                    }
+                    gutted_proto::DrawCommand::StrokeRect {
+                        x,
+                        y,
+                        w,
+                        h,
+                        rgba,
+                        line_width,
+                    } => {
+                        let rgb = rgba & 0x00FF_FFFF;
+                        let lw = (line_width.max(1) as i32).min(w as i32).min(h as i32);
+                        let py = chrome_h as i32 + y;
+                        fill_rect(buffer, bw, bh, x, py, w as i32, lw, rgb);
+                        fill_rect(buffer, bw, bh, x, py + h as i32 - lw, w as i32, lw, rgb);
+                        fill_rect(buffer, bw, bh, x, py, lw, h as i32, rgb);
+                        fill_rect(buffer, bw, bh, x + w as i32 - lw, py, lw, h as i32, rgb);
+                        let cx = x.max(0) as u32;
+                        let cy = y.max(0) as u32;
+                        let cw = w.min(bw.saturating_sub(cx));
+                        let ch = h.min(content_h.saturating_sub(cy));
+                        if cw > 0 && ch > 0 {
+                            damage.push(DamageRect {
+                                x: cx,
+                                y: chrome_h + cy,
+                                w: cw,
+                                h: ch,
+                            });
+                        }
+                    }
+                    gutted_proto::DrawCommand::DrawText {
+                        x,
+                        y,
+                        font_size,
+                        rgba,
+                        text,
+                    } => {
+                        let rgb = rgba & 0x00FF_FFFF;
+                        let py = chrome_h as i32 + y;
+                        let drawn_w = self.font.draw_text(
+                            buffer,
+                            bw,
+                            bh,
+                            x,
+                            py,
+                            font_size.max(8) as f32,
+                            rgb,
+                            &text,
+                            (bw as i32 - x).max(0),
+                        );
+                        if drawn_w > 0 && x >= 0 && y >= 0 {
+                            damage.push(DamageRect {
+                                x: (x as u32).min(bw),
+                                y: (chrome_h + y as u32).min(bh),
+                                w: (drawn_w as u32).min(bw.saturating_sub(x as u32)),
+                                h: (font_size as u32 + 6).min(content_h.saturating_sub(y as u32)),
+                            });
+                        }
+                    }
+                    gutted_proto::DrawCommand::CopyRect {
+                        src_x,
+                        src_y,
+                        dst_x,
+                        dst_y,
+                        w,
+                        h,
+                    } => {
+                        let copy_w = (w as u32)
+                            .min(bw.saturating_sub(src_x as u32))
+                            .min(bw.saturating_sub(dst_x as u32));
+                        let copy_h = (h as u32)
+                            .min(content_h.saturating_sub(src_y as u32))
+                            .min(content_h.saturating_sub(dst_y as u32));
+                        if copy_w > 0 && copy_h > 0 {
+                            let cw = copy_w as usize;
+                            let ch = copy_h as usize;
+                            let bw_u = bw as usize;
+                            let base_y = chrome_h as usize;
+                            let sx = src_x as usize;
+                            let sy = src_y as usize;
+                            let dx = dst_x as usize;
+                            let dy = dst_y as usize;
+                            if dy <= sy {
+                                for row in 0..ch {
+                                    let src_off = (base_y + sy + row) * bw_u + sx;
+                                    let dst_off = (base_y + dy + row) * bw_u + dx;
+                                    buffer.copy_within(src_off..src_off + cw, dst_off);
+                                }
+                            } else {
+                                for row in (0..ch).rev() {
+                                    let src_off = (base_y + sy + row) * bw_u + sx;
+                                    let dst_off = (base_y + dy + row) * bw_u + dx;
+                                    buffer.copy_within(src_off..src_off + cw, dst_off);
+                                }
+                            }
+                            damage.push(DamageRect {
+                                x: dst_x as u32,
+                                y: chrome_h + dst_y as u32,
+                                w: copy_w,
+                                h: copy_h,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
             self.pending_damage.clear();
         }
 
@@ -4784,5 +4935,36 @@ mod tests {
             !dbg_vault.contains("session=abc123"),
             "cookie value leaked in Debug: {dbg_vault}"
         );
+
+        // Verify DrawCommands (FillRect, StrokeRect, DrawText, CopyRect) execution in BrowserCore
+        let mut draw_wire = Vec::new();
+        Message::encode_frame_epoch(&mut draw_wire, 1, 1, 1, 101, vp_w, vp_h);
+        Message::DrawCommands {
+            ts_us: 4000,
+            layer_id: 0,
+            commands: vec![
+                gutted_proto::DrawCommand::FillRect {
+                    x: 10,
+                    y: 10,
+                    w: 30,
+                    h: 20,
+                    rgba: 0xFF123456,
+                },
+                gutted_proto::DrawCommand::CopyRect {
+                    src_x: 10,
+                    src_y: 10,
+                    dst_x: 50,
+                    dst_y: 10,
+                    w: 30,
+                    h: 20,
+                },
+            ],
+        }
+        .encode(&mut draw_wire);
+        core.ingest_wire_chunk(&draw_wire).unwrap();
+        let draw_damage = core.render_into(&mut fb);
+        assert!(!draw_damage.is_empty());
+        assert_eq!(fb[(CHROME_H as usize + 15) * 640 + 20], 0x00123456);
+        assert_eq!(fb[(CHROME_H as usize + 15) * 640 + 60], 0x00123456);
     }
 }
