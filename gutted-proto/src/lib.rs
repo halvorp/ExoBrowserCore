@@ -61,6 +61,12 @@ pub mod tag {
     pub const TILE_REF:       u32 = 0x43;
     /// Host → client: copy a rectangle within the client's local framebuffer (scroll / pan).
     pub const COPY_RECT:      u32 = 0x44;
+    /// Host → client: announce CBP 1.0 epoch provenance `(view_id, nav_id, resize_id, generation)`
+    /// and active viewport geometry `(width, height)` for subsequent frames/subframes.
+    pub const FRAME_EPOCH:    u32 = 0x45;
+    /// Client → host: CBP 1.0 `ReleaseFrame` / 2-buffer lease acknowledgment
+    /// (`DISPOSITION_COPIED = 1`, `DISPOSITION_DISCARDED = 2`).
+    pub const RELEASE_FRAME:  u32 = 0x46;
     /// Host → client: Opus / PCM audio frame.
     pub const AUDIO_FRAME:    u32 = 0x48;
     /// Host → client: Encoded H.264 / AV1 video track chunk.
@@ -400,6 +406,25 @@ pub enum Message {
         w: u16,
         h: u16,
     },
+    /// Host → client: CBP 1.0 epoch provenance stamp `(view_id, nav_id, resize_id, generation)`
+    /// and authoritative viewport `(width, height)` for the frames/subframes that follow.
+    FrameEpoch {
+        view_id: u32,
+        nav_id: u64,
+        resize_id: u64,
+        generation: u64,
+        width: u16,
+        height: u16,
+    },
+    /// Client → host: CBP 1.0 `ReleaseFrame` 2-buffer lease return & flow-control acknowledgment.
+    /// `disposition`: `1` = `DISPOSITION_COPIED` (presented), `2` = `DISPOSITION_DISCARDED` (stale/dropped).
+    ReleaseFrame {
+        view_id: u32,
+        nav_id: u64,
+        resize_id: u64,
+        generation: u64,
+        disposition: u8,
+    },
     /// Host → client: register immutable asset by SHA256 hash.
     AssetRegister {
         hash: [u8; 32],
@@ -720,6 +745,27 @@ impl Message {
         });
     }
 
+    /// Encode a `FrameEpoch` message directly without allocating an owned `Message`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_frame_epoch(
+        out: &mut Vec<u8>,
+        view_id: u32,
+        nav_id: u64,
+        resize_id: u64,
+        generation: u64,
+        width: u16,
+        height: u16,
+    ) {
+        Self::encode_with_tag_and_payload(out, tag::FRAME_EPOCH, |out| {
+            write_u32(out, view_id);
+            write_u64(out, nav_id);
+            write_u64(out, resize_id);
+            write_u64(out, generation);
+            write_u16(out, width);
+            write_u16(out, height);
+        });
+    }
+
     #[inline]
     fn encode_with_tag_and_payload<F: FnOnce(&mut Vec<u8>)>(
         out: &mut Vec<u8>,
@@ -785,6 +831,8 @@ impl Message {
             Message::TileData { .. }     => tag::TILE_DATA,
             Message::TileRef { .. }      => tag::TILE_REF,
             Message::CopyRect { .. }     => tag::COPY_RECT,
+            Message::FrameEpoch { .. }   => tag::FRAME_EPOCH,
+            Message::ReleaseFrame { .. } => tag::RELEASE_FRAME,
             Message::AssetRegister { .. } => tag::ASSET_REGISTER,
             Message::DrawCommands { .. } => tag::DRAW_COMMANDS,
             Message::AudioFrame { .. }   => tag::AUDIO_FRAME,
@@ -949,6 +997,21 @@ impl Message {
                 write_u16(out, *dst_y);
                 write_u16(out, *w);
                 write_u16(out, *h);
+            }
+            Message::FrameEpoch { view_id, nav_id, resize_id, generation, width, height } => {
+                write_u32(out, *view_id);
+                write_u64(out, *nav_id);
+                write_u64(out, *resize_id);
+                write_u64(out, *generation);
+                write_u16(out, *width);
+                write_u16(out, *height);
+            }
+            Message::ReleaseFrame { view_id, nav_id, resize_id, generation, disposition } => {
+                write_u32(out, *view_id);
+                write_u64(out, *nav_id);
+                write_u64(out, *resize_id);
+                write_u64(out, *generation);
+                write_u8_(out, *disposition);
             }
             Message::AssetRegister { hash, kind, data } => {
                 out.extend_from_slice(hash);
@@ -1237,6 +1300,23 @@ impl Message {
                 let w     = read_u16(p)?;
                 let h     = read_u16(p)?;
                 Message::CopyRect { ts_us, src_x, src_y, dst_x, dst_y, w, h }
+            }
+            tag::FRAME_EPOCH => {
+                let view_id    = read_u32(p)?;
+                let nav_id     = read_u64(p)?;
+                let resize_id  = read_u64(p)?;
+                let generation = read_u64(p)?;
+                let width      = read_u16(p)?;
+                let height     = read_u16(p)?;
+                Message::FrameEpoch { view_id, nav_id, resize_id, generation, width, height }
+            }
+            tag::RELEASE_FRAME => {
+                let view_id     = read_u32(p)?;
+                let nav_id      = read_u64(p)?;
+                let resize_id   = read_u64(p)?;
+                let generation  = read_u64(p)?;
+                let disposition = read_u8_(p)?;
+                Message::ReleaseFrame { view_id, nav_id, resize_id, generation, disposition }
             }
             tag::ASSET_REGISTER => {
                 let bytes = p.get(..32).ok_or(Error::UnexpectedEof)?;
@@ -3023,5 +3103,34 @@ mod tests {
             origin: "https://github.com".into(),
             cookies: "user_session=xyz; logged_in=yes".into(),
         });
+        roundtrip(Message::FrameEpoch {
+            view_id: 1,
+            nav_id: 7,
+            resize_id: 3,
+            generation: 42,
+            width: 1280,
+            height: 648,
+        });
+        roundtrip(Message::ReleaseFrame {
+            view_id: 1,
+            nav_id: 7,
+            resize_id: 3,
+            generation: 42,
+            disposition: 1,
+        });
+        let mut epoch_wire = Vec::new();
+        Message::encode_frame_epoch(&mut epoch_wire, 1, 7, 3, 42, 1280, 648);
+        let mut s = epoch_wire.as_slice();
+        assert_eq!(
+            Message::decode(&mut s).unwrap().unwrap(),
+            Message::FrameEpoch {
+                view_id: 1,
+                nav_id: 7,
+                resize_id: 3,
+                generation: 42,
+                width: 1280,
+                height: 648,
+            }
+        );
     }
 }

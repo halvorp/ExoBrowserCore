@@ -474,7 +474,8 @@
         NAV_ACTION: 0x06, STOP: 0x07,
         INPUT_POINTER: 0x10, INPUT_KEY: 0x11, INPUT_SCROLL: 0x12, INPUT_BUTTON: 0x13, SET_ZOOM: 0x14,
         CURSOR_STATE: 0x30, LOAD_STATE: 0x31, TITLE: 0x32, URL_CHANGED: 0x33,
-        RAW_FRAME: 0x40, SUBFRAME: 0x41, TILE_DATA: 0x42, TILE_REF: 0x43, COPY_RECT: 0x44, AUDIO_FRAME: 0x48,
+        RAW_FRAME: 0x40, SUBFRAME: 0x41, TILE_DATA: 0x42, TILE_REF: 0x43, COPY_RECT: 0x44,
+        FRAME_EPOCH: 0x45, RELEASE_FRAME: 0x46, AUDIO_FRAME: 0x48,
         CREATE_TAB: 0x70, CLOSE_TAB: 0x71, SWITCH_TAB: 0x72,
         TAB_CREATED: 0x73, TAB_CLOSED: 0x74, TAB_ACTIVATED: 0x75, TAB_TITLE: 0x76, TAB_URL: 0x77,
         CLEAR_DATA: 0x80, CLIPBOARD: 0x81, FILE_CHOOSER_PROMPT: 0x82, FILE_UPLOAD: 0x83, FILE_DOWNLOAD: 0x84
@@ -914,6 +915,15 @@
             const h = dv.getUint16(18, true);
             ctx.drawImage(canvas, srcX, srcY, w, h, dstX, dstY, w, h);
             updateFps();
+            break;
+          }
+          case TAG.FRAME_EPOCH: {
+            if (p.byteLength >= 32) {
+              const ack = new Uint8Array(29);
+              ack.set(p.subarray(0, 28), 0);
+              ack[28] = 1; // DISPOSITION_COPIED
+              sendMsg(TAG.RELEASE_FRAME, ack);
+            }
             break;
           }
           case TAG.AUDIO_FRAME: {

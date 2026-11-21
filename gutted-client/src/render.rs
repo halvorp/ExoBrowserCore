@@ -143,6 +143,14 @@ pub enum RenderEvent {
         origin: String,
         cookies: String,
     },
+    FrameEpoch {
+        view_id: u32,
+        nav_id: u64,
+        resize_id: u64,
+        generation: u64,
+        width: u16,
+        height: u16,
+    },
     Quit,
 }
 
@@ -260,6 +268,21 @@ impl RenderEvent {
                 password,
             }),
             Message::CookieSync { origin, cookies } => Some(Self::CookieSync { origin, cookies }),
+            Message::FrameEpoch {
+                view_id,
+                nav_id,
+                resize_id,
+                generation,
+                width,
+                height,
+            } => Some(Self::FrameEpoch {
+                view_id,
+                nav_id,
+                resize_id,
+                generation,
+                width,
+                height,
+            }),
             _ => None,
         }
     }
@@ -338,6 +361,13 @@ pub enum InputEvent {
         origin: String,
         cookies: String,
     },
+    ReleaseFrame {
+        view_id: u32,
+        nav_id: u64,
+        resize_id: u64,
+        generation: u64,
+        disposition: u8,
+    },
 }
 
 impl InputEvent {
@@ -398,6 +428,19 @@ impl InputEvent {
                 password,
             },
             Self::CookieSync { origin, cookies } => Message::CookieSync { origin, cookies },
+            Self::ReleaseFrame {
+                view_id,
+                nav_id,
+                resize_id,
+                generation,
+                disposition,
+            } => Message::ReleaseFrame {
+                view_id,
+                nav_id,
+                resize_id,
+                generation,
+                disposition,
+            },
             Self::Motion { x, y, mods } => Message::InputPointer {
                 ts_us,
                 x,
@@ -1705,6 +1748,12 @@ pub struct BrowserCore {
     pub capture_after_frames: u64,
     pub frames_seen: u64,
     pub synth_cursor: Option<(i32, i32)>,
+    pub epoch_view_id: u32,
+    pub epoch_nav_id: u64,
+    pub epoch_resize_id: u64,
+    pub epoch_generation: u64,
+    pub epoch_geom: (u32, u32),
+    pub epoch_stale: bool,
 }
 
 impl BrowserCore {
@@ -1765,6 +1814,12 @@ impl BrowserCore {
             capture_after_frames: 2,
             frames_seen: 0,
             synth_cursor: None,
+            epoch_view_id: 1,
+            epoch_nav_id: 1,
+            epoch_resize_id: 1,
+            epoch_generation: 0,
+            epoch_geom: (width, height.saturating_sub(CHROME_H)),
+            epoch_stale: false,
         }
     }
 
@@ -2062,7 +2117,35 @@ impl BrowserCore {
     pub fn handle_render_event(&mut self, ev: RenderEvent) -> bool {
         match ev {
             RenderEvent::Quit => return false,
+            RenderEvent::FrameEpoch {
+                view_id,
+                nav_id,
+                resize_id,
+                generation,
+                width,
+                height,
+            } => {
+                self.epoch_view_id = view_id;
+                self.epoch_nav_id = nav_id;
+                self.epoch_resize_id = resize_id;
+                self.epoch_generation = generation;
+                self.epoch_geom = (width as u32, height as u32);
+                let exp_w = self.win_size.0;
+                let exp_h = self.win_size.1.saturating_sub(self.chrome_h());
+                let stale = view_id != self.active_tab_id
+                    || (width as u32).abs_diff(exp_w) > 2
+                    || (height as u32).abs_diff(exp_h) > 2;
+                self.epoch_stale = stale;
+                self.emit_input(InputEvent::ReleaseFrame {
+                    view_id,
+                    nav_id,
+                    resize_id,
+                    generation,
+                    disposition: if stale { 2 } else { 1 },
+                });
+            }
             RenderEvent::Frame(f) => {
+                self.epoch_stale = false;
                 if f.width == 0 || f.height == 0 {
                     return true;
                 }
@@ -2080,7 +2163,11 @@ impl BrowserCore {
                 self.frames_seen += 1;
             }
             RenderEvent::CopyRect(cr) => {
-                if cr.w == 0 || cr.h == 0 || (cr.src_x == cr.dst_x && cr.src_y == cr.dst_y) {
+                if self.epoch_stale
+                    || cr.w == 0
+                    || cr.h == 0
+                    || (cr.src_x == cr.dst_x && cr.src_y == cr.dst_y)
+                {
                     return true;
                 }
                 let pre_subs = core::mem::take(&mut self.pending_subframes);
@@ -2094,7 +2181,7 @@ impl BrowserCore {
                 self.frames_seen += 1;
             }
             RenderEvent::Subframe(s) => {
-                if s.w == 0 || s.h == 0 {
+                if self.epoch_stale || s.w == 0 || s.h == 0 {
                     return true;
                 }
                 let expected = (s.stride as usize) * (s.h as usize);
@@ -4262,5 +4349,46 @@ mod tests {
             }
         }
         assert!(saw_fill);
+
+        // Verify CBP 1.0 FrameEpoch provenance gate refuses stale-geometry subframes and emits ReleaseFrame(DISPOSITION_DISCARDED = 2)
+        let vp_w = core.win_size.0 as u16;
+        let vp_h = core.win_size.1.saturating_sub(core.chrome_h()).max(1) as u16;
+        let mut stale_epoch_wire = Vec::new();
+        Message::encode_frame_epoch(&mut stale_epoch_wire, 1, 1, 1, 100, vp_w + 64, vp_h);
+        Message::Subframe {
+            ts_us: 3000,
+            x: 0,
+            y: 0,
+            w: 16,
+            h: 16,
+            stride: 64,
+            format: 0,
+            compression: gutted_proto::compression::RAW,
+            pixels: [0xFFu8, 0x00, 0x00, 0xFF].repeat(16 * 16),
+        }
+        .encode(&mut stale_epoch_wire);
+        let before_pixel = fb[(CHROME_H as usize + 2) * 640 + 2];
+        core.ingest_wire_chunk(&stale_epoch_wire).unwrap();
+        let _ = core.render_into(&mut fb);
+        // Stale-epoch subframe must be discarded without mutating the framebuffer
+        assert_eq!(fb[(CHROME_H as usize + 2) * 640 + 2], before_pixel);
+
+        let mut ack_out = Vec::new();
+        core.encode_outbound_messages(9500, &mut ack_out);
+        let mut cur = ack_out.as_slice();
+        let mut saw_discard_release = false;
+        while let Some(m) = Message::decode(&mut cur).unwrap() {
+            if let Message::ReleaseFrame {
+                generation,
+                disposition,
+                ..
+            } = m
+            {
+                assert_eq!(generation, 100);
+                assert_eq!(disposition, 2); // DISPOSITION_DISCARDED
+                saw_discard_release = true;
+            }
+        }
+        assert!(saw_discard_release);
     }
 }

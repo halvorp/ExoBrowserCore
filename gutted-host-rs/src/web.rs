@@ -331,6 +331,9 @@ async fn handle_client_msg(
         Message::CookieSync { origin, cookies } => {
             host_state.sync_cookies(&origin, &cookies);
         }
+        Message::ReleaseFrame { generation, .. } => {
+            host_state.release_frame(generation);
+        }
         _ => {}
     }
 }

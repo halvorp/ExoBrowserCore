@@ -176,6 +176,27 @@ impl FrameBus {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn publish_frame_epoch(
+        &self,
+        view_id: u32,
+        nav_id: u64,
+        resize_id: u64,
+        generation: u64,
+        width: u16,
+        height: u16,
+    ) {
+        if self.tx.receiver_count() == 0 {
+            return;
+        }
+        let mut buf = Vec::with_capacity(40);
+        Message::encode_frame_epoch(&mut buf, view_id, nav_id, resize_id, generation, width, height);
+        let _ = self.tx.send(BusItem {
+            meta: BusMeta::Other,
+            wire_quic: Bytes::from(buf),
+        });
+    }
+
     #[inline]
     pub fn has_subscribers(&self) -> bool {
         self.tx.receiver_count() > 0
@@ -371,6 +392,10 @@ struct HostState {
     viewport_w: Arc<AtomicU32>,
     viewport_h: Arc<AtomicU32>,
     last_scroll_ms: Arc<AtomicU64>,
+    nav_id: Arc<AtomicU64>,
+    resize_id: Arc<AtomicU64>,
+    generation: Arc<AtomicU64>,
+    acked_generation: Arc<AtomicU64>,
 }
 
 impl HostState {
@@ -412,6 +437,10 @@ impl HostState {
         let viewport_w = Arc::new(AtomicU32::new(1280));
         let viewport_h = Arc::new(AtomicU32::new(648));
         let last_scroll_ms = Arc::new(AtomicU64::new(0));
+        let nav_id = Arc::new(AtomicU64::new(1));
+        let resize_id = Arc::new(AtomicU64::new(1));
+        let generation = Arc::new(AtomicU64::new(0));
+        let acked_generation = Arc::new(AtomicU64::new(0));
         let bus = FrameBus::new(last_frames.clone(), active_tab_id.clone());
         spawn_audio_capture(bus.clone());
 
@@ -420,6 +449,12 @@ impl HostState {
         let tabs_ref = tabs.clone();
         let last_frames_ref = last_frames.clone();
         let scroll_ms_ref = last_scroll_ms.clone();
+        let vw_ref = viewport_w.clone();
+        let vh_ref = viewport_h.clone();
+        let nav_id_ref = nav_id.clone();
+        let resize_id_ref = resize_id.clone();
+        let gen_ref = generation.clone();
+        let acked_gen_ref = acked_generation.clone();
 
         tokio::spawn(async move {
             let mut force_full: HashSet<u32> = HashSet::new();
@@ -491,12 +526,37 @@ impl HostState {
                         for (this_tab_id, f) in batch {
                             let active = active_atomic.load(Ordering::Relaxed);
                             if active == this_tab_id && bus_clone.has_subscribers() {
+                                // CBP 1.0 Resize Epoch Gate: refuse WPE frames rendered at a stale viewport
+                                // size before the latest `wpe_view_backend_dispatch_set_size` took effect!
+                                let exp_w = vw_ref.load(Ordering::Relaxed) as i32;
+                                let exp_h = vh_ref.load(Ordering::Relaxed) as i32;
+                                if f.width != exp_w || f.height != exp_h {
+                                    continue;
+                                }
                                 let ts_us = SystemTime::now().duration_since(UNIX_EPOCH)
                                     .unwrap_or_default().as_micros() as u64;
                                 let must_full = force_full.remove(&this_tab_id);
                                 let prev = last_frames_ref.lock().ok().and_then(|g| g.get(&this_tab_id).cloned());
                                 let same_geom = !must_full && prev.as_ref().is_some_and(|l|
                                     l.width == f.width && l.height == f.height && l.stride == f.stride);
+
+                                // CBP 1.0 2-Buffer Lease Governor: if a client is actively sending ReleaseFrame
+                                // acknowledgments and more than 2 generations are in flight on a same-geometry
+                                // frame, coalesce into the next WPE frame instead of flooding the transport.
+                                let cur_gen = gen_ref.load(Ordering::Relaxed);
+                                let ack_gen = acked_gen_ref.load(Ordering::Relaxed);
+                                if same_geom && ack_gen > 0 && cur_gen.saturating_sub(ack_gen) >= 2 {
+                                    continue;
+                                }
+                                let next_gen = gen_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                                bus_clone.publish_frame_epoch(
+                                    this_tab_id,
+                                    nav_id_ref.load(Ordering::Relaxed),
+                                    resize_id_ref.load(Ordering::Relaxed),
+                                    next_gen,
+                                    f.width as u16,
+                                    f.height as u16,
+                                );
 
                                 if !same_geom {
                                     q2_dirty_bounds.remove(&this_tab_id);
@@ -697,7 +757,11 @@ impl HostState {
                     }
                     Some((this_tab_id, s)) = loads.recv() => {
                         let state = match s {
-                            wpe::LoadState::Started    => { force_full.insert(this_tab_id); 0u8 },
+                            wpe::LoadState::Started    => {
+                                nav_id_ref.fetch_add(1, Ordering::Relaxed);
+                                force_full.insert(this_tab_id);
+                                0u8
+                            },
                             wpe::LoadState::Redirected => 1u8,
                             wpe::LoadState::Committed  => { force_full.insert(this_tab_id); 2u8 },
                             wpe::LoadState::Finished   => 3u8,
@@ -799,6 +863,10 @@ impl HostState {
             viewport_w,
             viewport_h,
             last_scroll_ms,
+            nav_id,
+            resize_id,
+            generation,
+            acked_generation,
         }
     }
 
@@ -831,6 +899,17 @@ impl HostState {
         if let Some(tab) = tabs.get(&tab_id) {
             if let Some(f) = self.last_frames.lock().ok().and_then(|g| g.get(&tab_id).cloned()) {
                 let ts_us = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
+                let frame_gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+                let cur_nav = self.nav_id.load(Ordering::Relaxed);
+                let cur_res = self.resize_id.load(Ordering::Relaxed);
+                self.bus.publish_frame_epoch(
+                    tab_id,
+                    cur_nav,
+                    cur_res,
+                    frame_gen,
+                    f.width as u16,
+                    f.height as u16,
+                );
                 self.bus.publish_raw_frame(
                     ts_us,
                     f.width as u16,
@@ -860,6 +939,7 @@ impl HostState {
     }
 
     async fn load_uri(&self, url: &str) {
+        self.nav_id.fetch_add(1, Ordering::Relaxed);
         let active = self.active_tab_id.load(Ordering::Relaxed);
         self.runner.load_uri(active, url);
     }
@@ -870,8 +950,14 @@ impl HostState {
         let old_w = self.viewport_w.swap(w, Ordering::Relaxed);
         let old_h = self.viewport_h.swap(h, Ordering::Relaxed);
         if old_w != w || old_h != h {
+            self.resize_id.fetch_add(1, Ordering::Relaxed);
+            self.acked_generation.store(0, Ordering::Relaxed);
             self.runner.resize_all(w, h);
         }
+    }
+
+    pub fn release_frame(&self, generation: u64) {
+        let _ = self.acked_generation.fetch_max(generation, Ordering::Relaxed);
     }
 
     async fn inject_pointer_motion(&self, x: i32, y: i32, modifiers: u32) {
@@ -1100,6 +1186,9 @@ async fn handle_input_stream(mut recv: quinn::RecvStream, host_state: HostState)
                             Message::CookieSync { origin, cookies } => {
                                 host_state.sync_cookies(&origin, &cookies);
                             }
+                            Message::ReleaseFrame { generation, .. } => {
+                                host_state.release_frame(generation);
+                            }
                             other => warn!(?other, "unexpected input msg"),
                         }
                     }
@@ -1327,6 +1416,9 @@ async fn handle_ctrl_stream(
             }
             Message::CookieSync { origin, cookies } => {
                 host_state.sync_cookies(&origin, &cookies);
+            }
+            Message::ReleaseFrame { generation, .. } => {
+                host_state.release_frame(generation);
             }
             other => info!(?other, "ctrl msg (unhandled yet)"),
         }
@@ -1598,6 +1690,9 @@ async fn handle_tcp_connection(
             }
             Message::CookieSync { origin, cookies } => {
                 host_state.sync_cookies(&origin, &cookies);
+            }
+            Message::ReleaseFrame { generation, .. } => {
+                host_state.release_frame(generation);
             }
             _ => {}
         }
