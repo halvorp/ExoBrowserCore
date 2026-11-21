@@ -1604,14 +1604,25 @@ impl ClientVault {
 
     #[cfg(feature = "std")]
     pub fn load_from_disk() -> Self {
+        let mut vault = if let Some(path) = Self::default_path() {
+            std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| Self::decode(&bytes))
+                .unwrap_or_else(Self::new)
+        } else {
+            Self::new()
+        };
         if let Some(path) = Self::default_path() {
-            if let Ok(bytes) = std::fs::read(&path) {
-                if let Some(v) = Self::decode(&bytes) {
-                    return v;
+            if let Some(dir) = path.parent() {
+                if let Ok(sexp) = std::fs::read_to_string(dir.join("Bookmarks.sexp")) {
+                    let _ = vault.load_bookmarks_sexp(&sexp);
+                }
+                if let Ok(sexp) = std::fs::read_to_string(dir.join("cookies.sexp")) {
+                    let _ = vault.load_cookies_sexp(&sexp);
                 }
             }
         }
-        Self::new()
+        vault
     }
 
     #[cfg(feature = "std")]
@@ -1619,6 +1630,8 @@ impl ClientVault {
         if let Some(path) = Self::default_path() {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
+                let _ = std::fs::write(parent.join("Bookmarks.sexp"), self.to_bookmarks_sexp());
+                let _ = std::fs::write(parent.join("cookies.sexp"), self.to_cookies_sexp());
             }
             let mut buf = Vec::with_capacity(512);
             self.encode(&mut buf);
