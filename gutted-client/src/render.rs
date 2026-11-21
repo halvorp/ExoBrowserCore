@@ -981,6 +981,103 @@ pub struct HistoryEntry {
     pub title: String,
 }
 
+/// CoralOS `SiteData` row (`coral-browser-chrome::site_data::SiteRow`):
+/// one site holding cookies in [`ClientVault`], reporting its host, cookie-pair count,
+/// and total byte footprint without ever exposing raw cookie values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SiteRow {
+    pub host: String,
+    pub cookies: u8,
+    pub bytes: u16,
+}
+
+fn sexp_write_str(out: &mut String, s: &str) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn sexp_skip_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
+            b';' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    i
+}
+
+fn sexp_read_symbol(src: &str, mut i: usize) -> Option<(&str, usize)> {
+    let bytes = src.as_bytes();
+    i = sexp_skip_ws(bytes, i);
+    let start = i;
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\t' | b'\r' | b'\n' | b'(' | b')' | b'"' | b';' => break,
+            _ => i += 1,
+        }
+    }
+    if i > start {
+        Some((&src[start..i], i))
+    } else {
+        None
+    }
+}
+
+fn sexp_read_string(src: &str, mut i: usize) -> Option<(String, usize)> {
+    let bytes = src.as_bytes();
+    i = sexp_skip_ws(bytes, i);
+    if i >= bytes.len() || bytes[i] != b'"' {
+        return None;
+    }
+    i += 1;
+    let mut out = String::new();
+    let mut chars = src[i..].char_indices();
+    while let Some((off, ch)) = chars.next() {
+        if ch == '"' {
+            return Some((out, i + off + 1));
+        }
+        if ch == '\\' {
+            let (_, esc) = chars.next()?;
+            match esc {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                other => out.push(other),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    None
+}
+
+fn extract_host_from_origin(origin_or_host: &str) -> String {
+    let s = origin_or_host.trim();
+    let after_scheme = s.split_once("://").map_or(s, |(_, r)| r);
+    after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme)
+        .to_ascii_lowercase()
+}
+
 /// Client-side state vault holding all passwords, cookies, browsing history, and user bookmarks.
 ///
 /// Allows the remote `gutted-host` backend to remain 100% stateless/ephemeral (rendering-only)
@@ -1174,6 +1271,211 @@ impl ClientVault {
             self.bookmarks.push((label, url));
             true
         }
+    }
+
+    /// CoralOS `ENVARC:Browser/Bookmarks.sexp` serializer (`(bookmarks (bookmark "title" "url") ...)`).
+    pub fn to_bookmarks_sexp(&self) -> String {
+        let mut out = String::from("(bookmarks");
+        for (title, url) in &self.bookmarks {
+            out.push_str("\n  (bookmark ");
+            sexp_write_str(&mut out, title);
+            out.push(' ');
+            sexp_write_str(&mut out, url);
+            out.push(')');
+        }
+        out.push(')');
+        out
+    }
+
+    /// CoralOS `ENVARC:Browser/Bookmarks.sexp` parser (`(bookmarks (bookmark "title" "url") ...)`).
+    ///
+    /// Matches CoralOS `coral-browser-chrome::bookmarks::from_forms` doctrine:
+    /// an empty document yields an empty list, and any malformed form refuses the whole document
+    /// with the exact CoralOS refusal string so a half-read list never overwrites user state.
+    pub fn from_bookmarks_sexp(
+        src: &str,
+    ) -> core::result::Result<Vec<(String, String)>, &'static str> {
+        const BAD: &str = "the bookmarks file is not (bookmarks (bookmark \"title\" \"url\") ...)";
+        if src.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let bytes = src.as_bytes();
+        let mut i = sexp_skip_ws(bytes, 0);
+        if i >= bytes.len() || bytes[i] != b'(' {
+            return Err(BAD);
+        }
+        i += 1;
+        let (head, next_i) = sexp_read_symbol(src, i).ok_or(BAD)?;
+        if head != "bookmarks" {
+            return Err(BAD);
+        }
+        i = next_i;
+        let mut marks = Vec::new();
+        loop {
+            i = sexp_skip_ws(bytes, i);
+            if i >= bytes.len() {
+                return Err(BAD);
+            }
+            if bytes[i] == b')' {
+                i += 1;
+                break;
+            }
+            if bytes[i] != b'(' {
+                return Err(BAD);
+            }
+            i += 1;
+            let (item_head, after_head) = sexp_read_symbol(src, i).ok_or(BAD)?;
+            if item_head != "bookmark" {
+                return Err(BAD);
+            }
+            let (title, after_title) = sexp_read_string(src, after_head).ok_or(BAD)?;
+            let (url, after_url) = sexp_read_string(src, after_title).ok_or(BAD)?;
+            if url.is_empty() {
+                return Err(BAD);
+            }
+            i = sexp_skip_ws(bytes, after_url);
+            if i >= bytes.len() || bytes[i] != b')' {
+                return Err(BAD);
+            }
+            i += 1;
+            marks.push((title, url));
+        }
+        i = sexp_skip_ws(bytes, i);
+        if i != bytes.len() {
+            return Err(BAD);
+        }
+        Ok(marks)
+    }
+
+    /// Parse and replace `self.bookmarks` from a CoralOS `Bookmarks.sexp` document.
+    pub fn load_bookmarks_sexp(&mut self, src: &str) -> core::result::Result<(), &'static str> {
+        let marks = Self::from_bookmarks_sexp(src)?;
+        self.bookmarks = marks;
+        Ok(())
+    }
+
+    /// CoralOS `CoralOS:Prefs/Ferrum/cookies` S-expression serializer (`(cookies (site "origin" "cookies") ...)`).
+    pub fn to_cookies_sexp(&self) -> String {
+        let mut out = String::from("(cookies");
+        for (origin, cookie_str) in &self.cookies {
+            out.push_str("\n  (site ");
+            sexp_write_str(&mut out, origin);
+            out.push(' ');
+            sexp_write_str(&mut out, cookie_str);
+            out.push(')');
+        }
+        out.push(')');
+        out
+    }
+
+    /// CoralOS `CoralOS:Prefs/Ferrum/cookies` S-expression parser (`(cookies (site "origin" "cookies") ...)`).
+    /// Refuses malformed documents whole without mutating `self.cookies`.
+    pub fn load_cookies_sexp(&mut self, src: &str) -> core::result::Result<(), &'static str> {
+        const BAD: &str = "the cookies file is not (cookies (site \"origin\" \"cookies\") ...)";
+        if src.trim().is_empty() {
+            self.cookies.clear();
+            return Ok(());
+        }
+        let bytes = src.as_bytes();
+        let mut i = sexp_skip_ws(bytes, 0);
+        if i >= bytes.len() || bytes[i] != b'(' {
+            return Err(BAD);
+        }
+        i += 1;
+        let (head, next_i) = sexp_read_symbol(src, i).ok_or(BAD)?;
+        if head != "cookies" {
+            return Err(BAD);
+        }
+        i = next_i;
+        let mut parsed = BTreeMap::new();
+        loop {
+            i = sexp_skip_ws(bytes, i);
+            if i >= bytes.len() {
+                return Err(BAD);
+            }
+            if bytes[i] == b')' {
+                i += 1;
+                break;
+            }
+            if bytes[i] != b'(' {
+                return Err(BAD);
+            }
+            i += 1;
+            let (item_head, after_head) = sexp_read_symbol(src, i).ok_or(BAD)?;
+            if item_head != "site" {
+                return Err(BAD);
+            }
+            let (origin, after_origin) = sexp_read_string(src, after_head).ok_or(BAD)?;
+            let (cookie_str, after_cookie) = sexp_read_string(src, after_origin).ok_or(BAD)?;
+            if origin.is_empty() {
+                return Err(BAD);
+            }
+            i = sexp_skip_ws(bytes, after_cookie);
+            if i >= bytes.len() || bytes[i] != b')' {
+                return Err(BAD);
+            }
+            i += 1;
+            if !cookie_str.is_empty() {
+                parsed.insert(origin, cookie_str);
+            }
+        }
+        i = sexp_skip_ws(bytes, i);
+        if i != bytes.len() {
+            return Err(BAD);
+        }
+        self.cookies = parsed;
+        Ok(())
+    }
+
+    /// CoralOS `SiteData::list` (`coral-browser-chrome::site_data::SiteData`):
+    /// lists all sites holding cookies in the vault with their cookie-pair count and byte size,
+    /// never exposing any cookie value.
+    pub fn site_data_list(&self) -> Vec<SiteRow> {
+        let mut by_host: BTreeMap<String, (u16, u32)> = BTreeMap::new();
+        for (origin, cookie_str) in &self.cookies {
+            let trimmed = cookie_str.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let host = extract_host_from_origin(origin);
+            let pair_count = trimmed
+                .split(';')
+                .filter(|part| !part.trim().is_empty())
+                .count()
+                .max(1) as u16;
+            let byte_len = trimmed.len() as u32;
+            let entry = by_host.entry(host).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(pair_count);
+            entry.1 = entry.1.saturating_add(byte_len);
+        }
+        by_host
+            .into_iter()
+            .map(|(host, (cookies, bytes))| SiteRow {
+                host,
+                cookies: cookies.min(u8::MAX as u16) as u8,
+                bytes: bytes.min(u16::MAX as u32) as u16,
+            })
+            .collect()
+    }
+
+    /// CoralOS `SiteData::forget`: remove all cookies matching `host` (or origin).
+    /// Returns `true` if at least one site entry was removed.
+    pub fn site_data_forget(&mut self, host: &str) -> bool {
+        let target_host = extract_host_from_origin(host);
+        if target_host.is_empty() {
+            return false;
+        }
+        let before = self.cookies.len();
+        self.cookies
+            .retain(|origin, _| extract_host_from_origin(origin) != target_host);
+        self.cookies.len() < before
+    }
+
+    /// CoralOS `SiteData::clear`: forget all cookies across all sites and return the number of sites cleared.
+    pub fn site_data_clear(&mut self) -> u8 {
+        let count = self.site_data_list().len().min(u8::MAX as usize) as u8;
+        self.cookies.clear();
+        count
     }
 
     /// Serialize the vault into a compact, obfuscated binary format (`#![no_std]` + `alloc`).
@@ -4390,5 +4692,57 @@ mod tests {
             }
         }
         assert!(saw_discard_release);
+
+        // Verify CoralOS S-expression Bookmarks.sexp & cookies + SiteData operations
+        let sexp_bookmarks = core.vault.to_bookmarks_sexp();
+        assert!(sexp_bookmarks.starts_with("(bookmarks"));
+        let parsed_bm = ClientVault::from_bookmarks_sexp(&sexp_bookmarks).unwrap();
+        assert_eq!(parsed_bm, core.vault.bookmarks);
+
+        // Quoted/escaped titles round-trip and malformed documents are refused whole
+        let custom_sexp = "(bookmarks\n  (bookmark \"CoralOS \\\"Ferrum\\\"\" \"https://coralos.org\")\n  (bookmark \"GitHub\" \"https://github.com\"))";
+        core.vault.load_bookmarks_sexp(custom_sexp).unwrap();
+        assert_eq!(core.vault.bookmarks.len(), 2);
+        assert_eq!(core.vault.bookmarks[0].0, "CoralOS \"Ferrum\"");
+        assert_eq!(core.vault.bookmarks[0].1, "https://coralos.org");
+
+        // Whole-document refusal on malformed S-expression preserves existing bookmarks
+        assert_eq!(
+            ClientVault::from_bookmarks_sexp("(bookmarks (bookmark \" broken\" \"\"))"),
+            Err("the bookmarks file is not (bookmarks (bookmark \"title\" \"url\") ...)")
+        );
+        assert!(core.vault.load_bookmarks_sexp("(not-bookmarks)").is_err());
+        assert_eq!(core.vault.bookmarks.len(), 2);
+
+        // CoralOS SiteData (list, forget, clear) + cookies S-expression roundtrip
+        core.vault.set_cookies(
+            "https://coralos.org".into(),
+            "c_session=1; theme=sandstone".into(),
+        );
+        let cookies_sexp = core.vault.to_cookies_sexp();
+        let mut vault2 = ClientVault::new();
+        vault2.load_cookies_sexp(&cookies_sexp).unwrap();
+        let rows = vault2.site_data_list();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            SiteRow {
+                host: "coralos.org".into(),
+                cookies: 2,
+                bytes: "c_session=1; theme=sandstone".len() as u16,
+            }
+        );
+        assert_eq!(
+            rows[1],
+            SiteRow {
+                host: "github.com".into(),
+                cookies: 1,
+                bytes: "session=abc123".len() as u16,
+            }
+        );
+        assert!(vault2.site_data_forget("https://github.com"));
+        assert_eq!(vault2.site_data_list().len(), 1);
+        assert_eq!(vault2.site_data_clear(), 1);
+        assert!(vault2.site_data_list().is_empty());
     }
 }

@@ -31,7 +31,7 @@ pub use gutted_proto::FrameDecoder;
 pub use render::{
     canonicalize_url, extract_origin, urls_equivalent, AVClock, AudioChunk, BrowserCore,
     ClientVault, CredentialEntry, DamageRect, FontRenderer, GfxCopyRect, GfxFrame, GfxSubframe,
-    HistoryEntry, InputEvent, PcmConcealer, RenderEvent, TabBuffer, TabInfo, BOOKMARKS,
+    HistoryEntry, InputEvent, PcmConcealer, RenderEvent, SiteRow, TabBuffer, TabInfo, BOOKMARKS,
     BOOKMARK_BAR_H, CHROME_H, NAV_BAR_H, TAB_BAR_H,
 };
 
