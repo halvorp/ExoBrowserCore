@@ -1590,8 +1590,7 @@ pub fn downsample_and_delta_2x2_bgra(src: &[u8], w: usize, h: usize, out: &mut V
             let p10 = u32::from_le_bytes(row0[x1]);
             let p01 = u32::from_le_bytes(row1[x0]);
             let p11 = u32::from_le_bytes(row1[x1]);
-            let avg = (avg_bgra_u32(avg_bgra_u32(p00, p10), avg_bgra_u32(p01, p11)) & 0xFFFC_FCFC)
-                | 0xFF00_0000;
+            let avg = avg_bgra_u32(avg_bgra_u32(p00, p10), avg_bgra_u32(p01, p11)) | 0xFF00_0000;
             let curr = avg.to_le_bytes();
             *dst = [
                 curr[0].wrapping_sub(prev[0]),
@@ -1604,8 +1603,8 @@ pub fn downsample_and_delta_2x2_bgra(src: &[u8], w: usize, h: usize, out: &mut V
     }
 }
 
-/// Fused single-pass 4x4 SWAR box-downsampling + 6-bit noise quantization + horizontal spatial-delta filtering.
-/// Used for large (>600k px, e.g. 1440p/4K) video subframes to cut pixel volume by 16x.
+/// Fused single-pass 4x4 SWAR box-downsampling + horizontal spatial-delta filtering.
+/// Used for huge (>1.2M px, e.g. 4K) video subframes to cut pixel volume by 16x.
 pub fn downsample_and_delta_4x4_bgra(src: &[u8], w: usize, h: usize, out: &mut Vec<u8>) {
     let qw = w.div_ceil(4);
     let qh = h.div_ceil(4);
@@ -1630,8 +1629,7 @@ pub fn downsample_and_delta_4x4_bgra(src: &[u8], w: usize, h: usize, out: &mut V
             let p10 = u32::from_le_bytes(row0[x1]);
             let p01 = u32::from_le_bytes(row1[x0]);
             let p11 = u32::from_le_bytes(row1[x1]);
-            let avg = (avg_bgra_u32(avg_bgra_u32(p00, p10), avg_bgra_u32(p01, p11)) & 0xFFF8_F8F8)
-                | 0xFF00_0000;
+            let avg = avg_bgra_u32(avg_bgra_u32(p00, p10), avg_bgra_u32(p01, p11)) | 0xFF00_0000;
             let curr = avg.to_le_bytes();
             *dst = [
                 curr[0].wrapping_sub(prev[0]),

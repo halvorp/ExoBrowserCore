@@ -980,6 +980,10 @@ static gboolean idle_resize(gpointer p) {
 void gutted_wpe_resize(gutted_wpe_handle h, uint32_t tab_id, uint32_t w, uint32_t h_px) {
     instance_t *inst = (instance_t *)h;
     if (!inst || w == 0 || h_px == 0) return;
+    w &= ~1U;
+    h_px &= ~1U;
+    if (w < 64) w = 64;
+    if (h_px < 64) h_px = 64;
     idle_resize_t *r = g_new0(idle_resize_t, 1);
     r->inst = inst; r->tab_id = tab_id; r->w = w; r->h = h_px; r->all = false;
     g_main_context_invoke(inst->ctx, idle_resize, r);
@@ -988,6 +992,10 @@ void gutted_wpe_resize(gutted_wpe_handle h, uint32_t tab_id, uint32_t w, uint32_
 void gutted_wpe_resize_all(gutted_wpe_handle h, uint32_t w, uint32_t h_px) {
     instance_t *inst = (instance_t *)h;
     if (!inst || w == 0 || h_px == 0) return;
+    w &= ~1U;
+    h_px &= ~1U;
+    if (w < 64) w = 64;
+    if (h_px < 64) h_px = 64;
     idle_resize_t *r = g_new0(idle_resize_t, 1);
     r->inst = inst; r->w = w; r->h = h_px; r->all = true;
     g_main_context_invoke(inst->ctx, idle_resize, r);

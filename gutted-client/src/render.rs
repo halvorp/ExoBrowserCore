@@ -1985,14 +1985,13 @@ impl BrowserCore {
 
     pub fn on_resize(&mut self, w: u32, h: u32) {
         let chrome_h = self.chrome_h();
-        let w = w.max(64);
-        let h = h.max(chrome_h + 64);
+        let w = (w & !1).max(64);
+        let h = (h & !1).max(chrome_h + 64);
         if self.win_size != (w, h) {
             self.win_size = (w, h);
             self.toast_underlay = None;
             self.chrome_dirty = true;
-            self.full_content_dirty = true;
-            let content_h = h.saturating_sub(chrome_h).max(1);
+            let content_h = (h.saturating_sub(chrome_h) & !1).max(2);
             self.emit_input(InputEvent::Resize {
                 w: w.min(u16::MAX as u32) as u16,
                 h: content_h.min(u16::MAX as u32) as u16,
@@ -2102,34 +2101,19 @@ impl BrowserCore {
                 if s.pixels.len() < expected {
                     return true;
                 }
-                // Drop any older queued subframes completely covered by this newer subframe,
-                // or superseded video subframes with >=90% bounding-box overlap (IoU).
+                // Drop any older queued subframes completely covered by this newer subframe.
                 let sx1 = s.x.saturating_add(s.w);
                 let sy1 = s.y.saturating_add(s.h);
                 self.pending_subframes.retain(|old| {
                     let ox1 = old.x.saturating_add(old.w);
                     let oy1 = old.y.saturating_add(old.h);
-                    let covered = old.x >= s.x && old.y >= s.y && ox1 <= sx1 && oy1 <= sy1;
-                    if covered {
-                        return false;
-                    }
-                    if old.w >= 128 && old.h >= 128 && s.w >= 128 && s.h >= 128 {
-                        let ix0 = old.x.max(s.x) as u64;
-                        let iy0 = old.y.max(s.y) as u64;
-                        let ix1 = ox1.min(sx1) as u64;
-                        let iy1 = oy1.min(sy1) as u64;
-                        if ix1 > ix0 && iy1 > iy0 {
-                            let inter = (ix1 - ix0) * (iy1 - iy0);
-                            let union = (old.w as u64) * (old.h as u64)
-                                + (s.w as u64) * (s.h as u64)
-                                - inter;
-                            if union > 0 && (inter * 100) / union >= 90 {
-                                return false;
-                            }
-                        }
-                    }
-                    true
+                    !(old.x >= s.x && old.y >= s.y && ox1 <= sx1 && oy1 <= sy1)
                 });
+                // Clear stale full_content_dirty if we already applied the base frame so we
+                // don't overwrite the framebuffer with a stale tab snapshot before blitting subframes!
+                if self.pending_frames.is_empty() && self.active_buf.is_none() {
+                    self.full_content_dirty = false;
+                }
                 self.pending_damage.push(DamageRect {
                     x: s.x,
                     y: s.y,
@@ -3642,11 +3626,25 @@ fn run_x11_loop(
                     dirty_from_x11 = true;
                 }
                 Event::ConfigureNotify(cfg) => {
-                    let nw = cfg.width as u32;
-                    let nh = cfg.height as u32;
-                    if (nw, nh) != core.win_size && nw > 0 && nh > 0 {
+                    let nw = (cfg.width as u32) & !1;
+                    let nh = (cfg.height as u32) & !1;
+                    let dw = nw.abs_diff(core.win_size.0);
+                    let dh = nh.abs_diff(core.win_size.1);
+                    if (dw >= 4 || dh >= 4) && nw >= 64 && nh > CHROME_H + 64 {
+                        let old_w = core.win_size.0 as usize;
+                        let old_h = core.win_size.1 as usize;
+                        let old_fb = core::mem::take(&mut framebuffer);
                         core.on_resize(nw, nh);
-                        framebuffer.resize((core.win_size.0 * core.win_size.1) as usize, 0x0F0F12);
+                        let new_w = core.win_size.0 as usize;
+                        let new_h = core.win_size.1 as usize;
+                        framebuffer = vec![0x0F0F12u32; new_w * new_h];
+                        let copy_w = old_w.min(new_w);
+                        let copy_h = old_h.min(new_h);
+                        for row in 0..copy_h {
+                            framebuffer[row * new_w..row * new_w + copy_w]
+                                .copy_from_slice(&old_fb[row * old_w..row * old_w + copy_w]);
+                        }
+                        expose_full = true;
                         dirty_from_x11 = true;
                     }
                 }

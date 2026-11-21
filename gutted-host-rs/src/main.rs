@@ -262,12 +262,7 @@ pub fn coalesce_bus_batch(
                             let ox1 = ox0 + (w1 as u32);
                             let oy1 = oy0 + (h1 as u32);
                             let covered = nx0 <= ox0 && ny0 <= oy0 && nx1 >= ox1 && ny1 >= oy1;
-                            let same_video_box = w1 >= 128
-                                && h1 >= 128
-                                && w2 >= 128
-                                && h2 >= 128
-                                && rect_iou_pct((x1, y1, w1, h1), (x2, y2, w2, h2)) >= 90;
-                            !(covered || same_video_box)
+                            !covered
                         }
                         _ => true,
                     }
@@ -439,9 +434,9 @@ impl HostState {
                     _ = refine_tick.tick(), if !q2_dirty_bounds.is_empty() => {
                         let active = active_atomic.load(Ordering::Relaxed);
                         if let Some(&(since, rx, ry, rw, rh)) = q2_dirty_bounds.get(&active) {
-                            // Wait 450ms of quiet settle time before sending lossless ZSTD refinement
-                            // so continuous 24/30fps video playback never gets interrupted by a full ZSTD frame!
-                            if since.elapsed() >= std::time::Duration::from_millis(450) {
+                            // Wait 180ms of quiet settle time before sending lossless ZSTD refinement
+                            // so paused frames, thumbnails, and UI animations snap to 1:1 crispness immediately.
+                            if since.elapsed() >= std::time::Duration::from_millis(180) {
                                 q2_dirty_bounds.remove(&active);
                                 if bus_clone.has_subscribers() {
                                     if let Some(f) = last_frames_ref.lock().ok().and_then(|g| g.get(&active).cloned()) {
@@ -584,11 +579,7 @@ impl HostState {
                                                     this_tab_id,
                                                     (std::time::Instant::now(), 0, 0, f.width as u16, f.height as u16),
                                                 );
-                                                if full_px >= 1_200_000 {
-                                                    gutted_proto::compression::LZ4_DELTA_Q4
-                                                } else {
-                                                    gutted_proto::compression::LZ4_DELTA_Q2
-                                                }
+                                                gutted_proto::compression::LZ4_DELTA_Q2
                                             } else {
                                                 q2_dirty_bounds.remove(&this_tab_id);
                                                 gutted_proto::compression::ZSTD
@@ -650,12 +641,9 @@ impl HostState {
 
                                                 let area = (w as usize) * (h as usize);
                                                 let is_video_sub = !did_copy_rect
-                                                    && area >= 16_000
+                                                    && area >= 36_000
                                                     && video_tracker.record_and_is_video(this_tab_id, (x, y, w, h), now);
-                                                let comp = if !did_copy_rect && area >= 500_000 {
-                                                    merge_q2_dirty_bounds(&mut q2_dirty_bounds, this_tab_id, now, x, y, w, h);
-                                                    gutted_proto::compression::LZ4_DELTA_Q4
-                                                } else if !did_copy_rect && (area >= 64_000 || is_video_sub) {
+                                                let comp = if !did_copy_rect && (area >= 90_000 || is_video_sub) {
                                                     merge_q2_dirty_bounds(&mut q2_dirty_bounds, this_tab_id, now, x, y, w, h);
                                                     gutted_proto::compression::LZ4_DELTA_Q2
                                                 } else if area >= 32_000 {
@@ -877,9 +865,13 @@ impl HostState {
     }
 
     async fn resize_all(&self, w: u32, h: u32) {
-        self.viewport_w.store(w, Ordering::Relaxed);
-        self.viewport_h.store(h, Ordering::Relaxed);
-        self.runner.resize_all(w, h);
+        let w = (w & !1).max(64);
+        let h = (h & !1).max(64);
+        let old_w = self.viewport_w.swap(w, Ordering::Relaxed);
+        let old_h = self.viewport_h.swap(h, Ordering::Relaxed);
+        if old_w != w || old_h != h {
+            self.runner.resize_all(w, h);
+        }
     }
 
     async fn inject_pointer_motion(&self, x: i32, y: i32, modifiers: u32) {
@@ -2071,14 +2063,13 @@ fn diff_regions_inner(
         if right >= left {
             let raw_w = right - left + 1;
             let raw_h = bot - top + 1;
-            // Snap medium/large video & UI regions (>= 64x64 px) to an 8-pixel macroblock grid
-            // so bounding boxes do not jitter by 1-2 pixels across video frames (preventing
-            // odd/even 2x2 downsample phase shimmer and ensuring backpressure frame coalescing).
+            // Align medium/large regions to a 2-pixel even boundary so 2x2 downsampling
+            // never shifts odd/even pixel phase across consecutive video frames.
             if scroll.is_none() && raw_w * raw_h >= 4096 {
-                let x0 = left & !7;
-                let y0 = top & !7;
-                let x1 = ((right + 1 + 7) & !7).min(w);
-                let y1 = ((bot + 1 + 7) & !7).min(h);
+                let x0 = left & !1;
+                let y0 = top & !1;
+                let x1 = ((right + 1 + 1) & !1).min(w);
+                let y1 = ((bot + 1 + 1) & !1).min(h);
                 out.push((x0 as u16, y0 as u16, (x1 - x0) as u16, (y1 - y0) as u16));
             } else {
                 out.push((left as u16, top as u16, raw_w as u16, raw_h as u16));
