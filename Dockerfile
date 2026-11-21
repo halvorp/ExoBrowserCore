@@ -32,6 +32,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglx-mesa0 \
     libgbm1 \
     libdrm2 \
+    libva2 \
+    libva-drm2 \
+    mesa-va-drivers \
     glib-networking \
     gstreamer1.0-plugins-base \
     gstreamer1.0-plugins-good \
@@ -39,6 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gstreamer1.0-plugins-ugly \
     gstreamer1.0-gl \
     gstreamer1.0-libav \
+    gstreamer1.0-vaapi \
     gstreamer1.0-pulseaudio \
     pulseaudio \
     pulseaudio-utils \
@@ -51,12 +55,9 @@ COPY --from=builder /app/target/release/gutted-host /usr/local/bin/gutted-host
 
 ENV GBROWSER_LISTEN=0.0.0.0:4433
 ENV GBROWSER_WEB_LISTEN=0.0.0.0:8080
-ENV LIBGL_ALWAYS_SOFTWARE=1
-ENV LP_NUM_THREADS=4
 ENV PULSE_LATENCY_MSEC=15
 ENV WEBKIT_GST_DMABUF_SINK_ENABLED=0
 ENV WEBKIT_GST_MAX_AVC1_RESOLUTION=720P
-ENV GST_PLUGIN_FEATURE_RANK=vah264dec:NONE,vaav1dec:NONE,vavp9dec:NONE,nvdec:NONE,openh264dec:NONE,avdec_h264:MAX
 ENV XDG_RUNTIME_DIR=/tmp/xdg-runtime
 
 RUN mkdir -p /tmp/xdg-runtime && chmod 0700 /tmp/xdg-runtime

@@ -11,14 +11,17 @@ type WpeHandle = usize;
 
 #[repr(C)]
 struct GuttedWpeCallbacks {
-    on_frame:        unsafe extern "C" fn(*mut c_void, u32, *const u8, i32, i32, i32, u32),
-    on_load:         unsafe extern "C" fn(*mut c_void, u32, i32),
-    on_cursor:       unsafe extern "C" fn(*mut c_void, u32, i32),
-    on_ready:        unsafe extern "C" fn(*mut c_void, *mut c_void),
-    on_title:        unsafe extern "C" fn(*mut c_void, u32, *const c_char),
-    on_url:          unsafe extern "C" fn(*mut c_void, u32, *const c_char),
-    on_file_chooser: unsafe extern "C" fn(*mut c_void, u32, bool, *const c_char),
-    on_download:     unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char),
+    on_frame:         unsafe extern "C" fn(*mut c_void, u32, *const u8, i32, i32, i32, u32),
+    on_load:          unsafe extern "C" fn(*mut c_void, u32, i32),
+    on_cursor:        unsafe extern "C" fn(*mut c_void, u32, i32),
+    on_ready:         unsafe extern "C" fn(*mut c_void, *mut c_void),
+    on_title:         unsafe extern "C" fn(*mut c_void, u32, *const c_char),
+    on_url:           unsafe extern "C" fn(*mut c_void, u32, *const c_char),
+    on_file_chooser:  unsafe extern "C" fn(*mut c_void, u32, bool, *const c_char),
+    on_download:      unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char),
+    on_cred_prompt:   unsafe extern "C" fn(*mut c_void, u32, *const c_char),
+    on_cred_captured: unsafe extern "C" fn(*mut c_void, u32, *const c_char, *const c_char, *const c_char),
+    on_cookie_sync:   unsafe extern "C" fn(*mut c_void, u32, *const c_char, *const c_char),
 }
 
 extern "C" {
@@ -55,6 +58,9 @@ extern "C" {
         b64_data: *const c_char,
     );
     fn gutted_wpe_paste_text(h: *mut c_void, tab_id: u32, text: *const c_char);
+    fn gutted_wpe_find_in_page(h: *mut c_void, tab_id: u32, query: *const c_char, forward: bool, case_sensitive: bool);
+    fn gutted_wpe_fill_credentials(h: *mut c_void, tab_id: u32, origin: *const c_char, username: *const c_char, password: *const c_char);
+    fn gutted_wpe_sync_cookies(h: *mut c_void, tab_id: u32, origin: *const c_char, cookies: *const c_char);
 }
 
 /// A frame from WPE: BGRA (ARGB8888 in wl_shm terms).
@@ -89,6 +95,9 @@ struct CallbackBridge {
     urls:             mpsc::UnboundedSender<(u32, String)>,
     file_choosers:    mpsc::UnboundedSender<(u32, bool, String)>,
     downloads:        mpsc::UnboundedSender<(String, String)>,
+    cred_prompts:     mpsc::UnboundedSender<(u32, String)>,
+    cred_captures:    mpsc::UnboundedSender<(u32, String, String, String)>,
+    cookie_syncs:     mpsc::UnboundedSender<(u32, String, String)>,
     handle:           Arc<Mutex<Option<WpeHandle>>>,
     active_tab_id:    Arc<AtomicU32>,
     last_bg_frame_ms: AtomicU64,
@@ -190,6 +199,45 @@ unsafe extern "C" fn download_trampoline(
     let _ = bridge.downloads.send((fname, fpath));
 }
 
+unsafe extern "C" fn cred_prompt_trampoline(
+    ud: *mut c_void,
+    tab_id: u32,
+    origin: *const c_char,
+) {
+    if ud.is_null() || origin.is_null() { return; }
+    let bridge = &*(ud as *const CallbackBridge);
+    let orig = std::ffi::CStr::from_ptr(origin).to_string_lossy().into_owned();
+    let _ = bridge.cred_prompts.send((tab_id, orig));
+}
+
+unsafe extern "C" fn cred_captured_trampoline(
+    ud: *mut c_void,
+    tab_id: u32,
+    origin: *const c_char,
+    username: *const c_char,
+    password: *const c_char,
+) {
+    if ud.is_null() || origin.is_null() || username.is_null() || password.is_null() { return; }
+    let bridge = &*(ud as *const CallbackBridge);
+    let orig = std::ffi::CStr::from_ptr(origin).to_string_lossy().into_owned();
+    let user = std::ffi::CStr::from_ptr(username).to_string_lossy().into_owned();
+    let pass = std::ffi::CStr::from_ptr(password).to_string_lossy().into_owned();
+    let _ = bridge.cred_captures.send((tab_id, orig, user, pass));
+}
+
+unsafe extern "C" fn cookie_sync_trampoline(
+    ud: *mut c_void,
+    tab_id: u32,
+    origin: *const c_char,
+    cookies: *const c_char,
+) {
+    if ud.is_null() || origin.is_null() || cookies.is_null() { return; }
+    let bridge = &*(ud as *const CallbackBridge);
+    let orig = std::ffi::CStr::from_ptr(origin).to_string_lossy().into_owned();
+    let ck = std::ffi::CStr::from_ptr(cookies).to_string_lossy().into_owned();
+    let _ = bridge.cookie_syncs.send((tab_id, orig, ck));
+}
+
 pub struct WpeRunner {
     _bridge: Box<CallbackBridge>,
     thread:  Option<std::thread::JoinHandle<c_int>>,
@@ -205,6 +253,9 @@ pub struct WpeChannels {
     pub urls:          mpsc::UnboundedReceiver<(u32, String)>,
     pub file_choosers: mpsc::UnboundedReceiver<(u32, bool, String)>,
     pub downloads:     mpsc::UnboundedReceiver<(String, String)>,
+    pub cred_prompts:  mpsc::UnboundedReceiver<(u32, String)>,
+    pub cred_captures: mpsc::UnboundedReceiver<(u32, String, String, String)>,
+    pub cookie_syncs:  mpsc::UnboundedReceiver<(u32, String, String)>,
 }
 
 impl WpeRunner {
@@ -221,6 +272,9 @@ impl WpeRunner {
         let (utx, urx) = mpsc::unbounded_channel();
         let (fctx, fcrx) = mpsc::unbounded_channel();
         let (dltx, dlrx) = mpsc::unbounded_channel();
+        let (cptx, cprx) = mpsc::unbounded_channel();
+        let (cctx, ccrx) = mpsc::unbounded_channel();
+        let (cktx, ckrx) = mpsc::unbounded_channel();
         let handle = Arc::new(Mutex::new(None));
         let bridge = Box::new(CallbackBridge {
             frames: ftx,
@@ -230,6 +284,9 @@ impl WpeRunner {
             urls: utx,
             file_choosers: fctx,
             downloads: dltx,
+            cred_prompts: cptx,
+            cred_captures: cctx,
+            cookie_syncs: cktx,
             handle: handle.clone(),
             active_tab_id,
             last_bg_frame_ms: AtomicU64::new(0),
@@ -241,14 +298,17 @@ impl WpeRunner {
             .name("gutted-wpe".into())
             .spawn(move || {
                 let cbs = GuttedWpeCallbacks {
-                    on_frame:        frame_trampoline,
-                    on_load:         load_trampoline,
-                    on_cursor:       cursor_trampoline,
-                    on_ready:        ready_trampoline,
-                    on_title:        title_trampoline,
-                    on_url:          url_trampoline,
-                    on_file_chooser: file_chooser_trampoline,
-                    on_download:     download_trampoline,
+                    on_frame:         frame_trampoline,
+                    on_load:          load_trampoline,
+                    on_cursor:        cursor_trampoline,
+                    on_ready:         ready_trampoline,
+                    on_title:         title_trampoline,
+                    on_url:           url_trampoline,
+                    on_file_chooser:  file_chooser_trampoline,
+                    on_download:      download_trampoline,
+                    on_cred_prompt:   cred_prompt_trampoline,
+                    on_cred_captured: cred_captured_trampoline,
+                    on_cookie_sync:   cookie_sync_trampoline,
                 };
                 unsafe {
                     gutted_wpe_run(
@@ -276,6 +336,9 @@ impl WpeRunner {
                 urls: urx,
                 file_choosers: fcrx,
                 downloads: dlrx,
+                cred_prompts: cprx,
+                cred_captures: ccrx,
+                cookie_syncs: ckrx,
             },
         )
     }
@@ -421,6 +484,39 @@ impl WpeRunner {
     pub fn paste_text(&self, tab_id: u32, text: &str) {
         if let (Some(h), Ok(c)) = (self.h(), CString::new(text)) {
             unsafe { gutted_wpe_paste_text(h as *mut c_void, tab_id, c.as_ptr()) };
+        }
+    }
+
+    pub fn find_in_page(&self, tab_id: u32, query: &str, forward: bool, case_sensitive: bool) {
+        if let (Some(h), Ok(q)) = (self.h(), CString::new(query)) {
+            unsafe {
+                gutted_wpe_find_in_page(h as *mut c_void, tab_id, q.as_ptr(), forward, case_sensitive);
+            }
+        }
+    }
+
+    pub fn fill_credentials(&self, tab_id: u32, origin: &str, username: &str, password: &str) {
+        if let (Some(h), Ok(o), Ok(u), Ok(p)) = (
+            self.h(),
+            CString::new(origin),
+            CString::new(username),
+            CString::new(password),
+        ) {
+            unsafe {
+                gutted_wpe_fill_credentials(h as *mut c_void, tab_id, o.as_ptr(), u.as_ptr(), p.as_ptr());
+            }
+        }
+    }
+
+    pub fn sync_cookies(&self, tab_id: u32, origin: &str, cookies: &str) {
+        if let (Some(h), Ok(o), Ok(ck)) = (
+            self.h(),
+            CString::new(origin),
+            CString::new(cookies),
+        ) {
+            unsafe {
+                gutted_wpe_sync_cookies(h as *mut c_void, tab_id, o.as_ptr(), ck.as_ptr());
+            }
         }
     }
 }

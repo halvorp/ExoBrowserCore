@@ -29,9 +29,10 @@ pub mod render;
 
 pub use gutted_proto::FrameDecoder;
 pub use render::{
-    canonicalize_url, urls_equivalent, AVClock, AudioChunk, BrowserCore, DamageRect, FontRenderer,
-    GfxCopyRect, GfxFrame, GfxSubframe, InputEvent, PcmConcealer, RenderEvent, TabBuffer, TabInfo,
-    BOOKMARKS, BOOKMARK_BAR_H, CHROME_H, NAV_BAR_H, TAB_BAR_H,
+    canonicalize_url, extract_origin, urls_equivalent, AVClock, AudioChunk, BrowserCore,
+    ClientVault, CredentialEntry, DamageRect, FontRenderer, GfxCopyRect, GfxFrame, GfxSubframe,
+    HistoryEntry, InputEvent, PcmConcealer, RenderEvent, TabBuffer, TabInfo, BOOKMARKS,
+    BOOKMARK_BAR_H, CHROME_H, NAV_BAR_H, TAB_BAR_H,
 };
 
 #[cfg(feature = "std")]

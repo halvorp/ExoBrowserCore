@@ -36,6 +36,7 @@ typedef struct instance_t {
     void *userdata;
     GMainContext *ctx;
     GMainLoop *loop;
+    WebKitWebContext *web_ctx;
     GHashTable *tabs; // uint32_t tab_id -> tab_t*
     int32_t def_w, def_h;
     GMutex motion_lock;
@@ -49,14 +50,27 @@ static gsize g_wpe_init_once = 0;
 static gboolean g_wpe_init_ok = FALSE;
 static gboolean wpe_process_init(void) {
     if (g_once_init_enter(&g_wpe_init_once)) {
-        setenv("LIBGL_ALWAYS_SOFTWARE", "1", 0);
-        setenv("LP_NUM_THREADS", "4", 0);
+        bool has_gpu = (access("/dev/dri/renderD128", R_OK | W_OK) == 0)
+                    && (getenv("GBROWSER_FORCE_SW_GL") == NULL);
+        if (has_gpu) {
+            // Hardware GPU + VA-API acceleration enabled when /dev/dri/renderD128 is available
+            setenv("GST_PLUGIN_FEATURE_RANK", "vah264dec:MAX,vaav1dec:MAX,vavp9dec:MAX,avdec_h264:PRIMARY", 0);
+        } else {
+            setenv("LIBGL_ALWAYS_SOFTWARE", "1", 0);
+            long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+            if (ncpu > 0) {
+                char threads_buf[16];
+                snprintf(threads_buf, sizeof(threads_buf), "%ld", ncpu > 16 ? 16 : ncpu);
+                setenv("LP_NUM_THREADS", threads_buf, 0);
+            } else {
+                setenv("LP_NUM_THREADS", "12", 0);
+            }
+            setenv("GST_PLUGIN_FEATURE_RANK", "vah264dec:NONE,vaav1dec:NONE,vavp9dec:NONE,nvdec:NONE,openh264dec:NONE,avdec_h264:MAX", 0);
+        }
         setenv("PULSE_LATENCY_MSEC", "15", 0);
-        setenv("WEBKIT_SKIA_ENABLE_CPU_RENDERING", "1", 0);
         setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "0", 0);
         setenv("WEBKIT_GST_DMABUF_SINK_ENABLED", "0", 0);
         setenv("WEBKIT_GST_MAX_AVC1_RESOLUTION", "720P", 0);
-        setenv("GST_PLUGIN_FEATURE_RANK", "vah264dec:NONE,vaav1dec:NONE,vavp9dec:NONE,nvdec:NONE,openh264dec:NONE,avdec_h264:MAX", 0);
         wpe_loader_init("libWPEBackend-fdo-1.0.so");
         g_wpe_init_ok = wpe_fdo_initialize_shm() ? TRUE : FALSE;
         g_once_init_leave(&g_wpe_init_once, 1);
@@ -103,7 +117,7 @@ static const char *k_media_lifecycle_script =
     "        if (root && !document.getElementById('__gt_perf_css')) {\n"
     "          var s = document.createElement('style');\n"
     "          s.id = '__gt_perf_css';\n"
-    "          s.textContent = '* { scroll-behavior: auto !important; backdrop-filter: none !important; -webkit-backdrop-filter: none !important; will-change: auto !important; }';\n"
+    "          s.textContent = '* { scroll-behavior: auto !important; backdrop-filter: none !important; -webkit-backdrop-filter: none !important; }';\n"
     "          root.appendChild(s);\n"
     "        }\n"
     "      };\n"
@@ -190,6 +204,54 @@ static const char *k_media_lifecycle_script =
     "  document.addEventListener('click', resumeAC, { capture: true, passive: true });\n"
     "  document.addEventListener('keydown', resumeAC, { capture: true, passive: true });\n"
     "  document.addEventListener('touchstart', resumeAC, { capture: true, passive: true });\n"
+    "  try {\n"
+    "    var postVault = function(msg) {\n"
+    "      try {\n"
+    "        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.gtVault) {\n"
+    "          window.webkit.messageHandlers.gtVault.postMessage(msg);\n"
+    "        }\n"
+    "      } catch(e) {}\n"
+    "    };\n"
+    "    var checkPasswordPrompt = function() {\n"
+    "      if (window.__gt_vault_prompted) return;\n"
+    "      var pw = document.querySelector('input[type=\"password\"]');\n"
+    "      if (pw && location.origin && location.origin !== 'null') {\n"
+    "        window.__gt_vault_prompted = true;\n"
+    "        postVault('PROMPT|' + location.origin);\n"
+    "      }\n"
+    "    };\n"
+    "    document.addEventListener('DOMContentLoaded', function() {\n"
+    "      checkPasswordPrompt();\n"
+    "      if (document.cookie && location.origin && location.origin !== 'null') {\n"
+    "        postVault('COOKIE|' + location.origin + '|' + document.cookie);\n"
+    "      }\n"
+    "    });\n"
+    "    document.addEventListener('focusin', function(ev) {\n"
+    "      if (ev && ev.target && ev.target.type === 'password') checkPasswordPrompt();\n"
+    "    }, true);\n"
+    "    var captureCreds = function(root) {\n"
+    "      try {\n"
+    "        var scope = root || document;\n"
+    "        var pw = scope.querySelector('input[type=\"password\"]');\n"
+    "        if (!pw || !pw.value || !location.origin || location.origin === 'null') return;\n"
+    "        var inputs = (pw.form || document).querySelectorAll('input:not([type=\"hidden\"]):not([type=\"submit\"]):not([type=\"button\"]):not([type=\"checkbox\"]):not([type=\"radio\"])');\n"
+    "        var user = '';\n"
+    "        for (var i = 0; i < inputs.length; i++) {\n"
+    "          if (inputs[i] === pw) break;\n"
+    "          if (inputs[i].value) user = inputs[i].value;\n"
+    "        }\n"
+    "        if (user && pw.value) {\n"
+    "          postVault('CAPTURE|' + location.origin + '|' + user + '\\t' + pw.value);\n"
+    "        }\n"
+    "      } catch(e) {}\n"
+    "    };\n"
+    "    document.addEventListener('submit', function(ev) { captureCreds(ev ? ev.target : document); }, true);\n"
+    "    document.addEventListener('keydown', function(ev) {\n"
+    "      if (ev && ev.key === 'Enter' && document.activeElement && document.activeElement.type === 'password') {\n"
+    "        captureCreds(document.activeElement.form || document);\n"
+    "      }\n"
+    "    }, true);\n"
+    "  } catch(e) {}\n"
     "})();\n";
 
 static void on_shm_buffer(void *data, struct wpe_fdo_shm_exported_buffer *buf) {
@@ -483,6 +545,49 @@ static void on_download_started(WebKitWebContext *ctx, WebKitDownload *download,
     g_signal_connect(download, "finished", G_CALLBACK(on_download_finished), user_data);
 }
 
+static void on_vault_script_message(WebKitUserContentManager *ucm, WebKitJavascriptResult *res, gpointer user_data) {
+    (void)ucm;
+    tab_t *tab = (tab_t *)user_data;
+    if (!tab || !tab->inst || !res) return;
+    JSCValue *val = webkit_javascript_result_get_js_value(res);
+    if (!val || !jsc_value_is_string(val)) return;
+    gchar *msg = jsc_value_to_string(val);
+    if (!msg) return;
+    if (g_str_has_prefix(msg, "PROMPT|")) {
+        const char *origin = msg + 7;
+        if (tab->inst->cb.on_cred_prompt && origin[0]) {
+            tab->inst->cb.on_cred_prompt(tab->inst->userdata, tab->tab_id, origin);
+        }
+    } else if (g_str_has_prefix(msg, "CAPTURE|")) {
+        gchar *rest = msg + 8;
+        gchar *bar = strchr(rest, '|');
+        if (bar) {
+            *bar = '\0';
+            gchar *creds = bar + 1;
+            gchar *tab_sep = strchr(creds, '\t');
+            if (tab_sep) {
+                *tab_sep = '\0';
+                const char *user = creds;
+                const char *pass = tab_sep + 1;
+                if (tab->inst->cb.on_cred_captured && rest[0] && user[0] && pass[0]) {
+                    tab->inst->cb.on_cred_captured(tab->inst->userdata, tab->tab_id, rest, user, pass);
+                }
+            }
+        }
+    } else if (g_str_has_prefix(msg, "COOKIE|")) {
+        gchar *rest = msg + 7;
+        gchar *bar = strchr(rest, '|');
+        if (bar) {
+            *bar = '\0';
+            const char *cookies = bar + 1;
+            if (tab->inst->cb.on_cookie_sync && rest[0] && cookies[0]) {
+                tab->inst->cb.on_cookie_sync(tab->inst->userdata, tab->tab_id, rest, cookies);
+            }
+        }
+    }
+    g_free(msg);
+}
+
 static tab_t *create_tab_internal(instance_t *inst, uint32_t tab_id, const char *url) {
     if (!inst) return NULL;
     tab_t *tab = g_new0(tab_t, 1);
@@ -513,7 +618,7 @@ static tab_t *create_tab_internal(instance_t *inst, uint32_t tab_id, const char 
     webkit_settings_set_enable_smooth_scrolling(settings, FALSE);
     webkit_settings_set_enable_developer_extras(settings, getenv("GBROWSER_DEVTOOLS") != NULL);
     webkit_settings_set_enable_resizable_text_areas(settings, TRUE);
-    webkit_settings_set_enable_page_cache(settings, TRUE);
+    webkit_settings_set_enable_page_cache(settings, FALSE);
     webkit_settings_set_enable_site_specific_quirks(settings, TRUE);
     webkit_settings_set_enable_media(settings, TRUE);
     webkit_settings_set_enable_media_stream(settings, TRUE);
@@ -531,6 +636,8 @@ static tab_t *create_tab_internal(instance_t *inst, uint32_t tab_id, const char 
         NULL);
 
     WebKitUserContentManager *ucm = webkit_user_content_manager_new();
+    g_signal_connect(ucm, "script-message-received::gtVault", G_CALLBACK(on_vault_script_message), tab);
+    webkit_user_content_manager_register_script_message_handler(ucm, "gtVault");
     WebKitUserScript *us = webkit_user_script_new(
         k_media_lifecycle_script,
         WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
@@ -544,6 +651,7 @@ static tab_t *create_tab_internal(instance_t *inst, uint32_t tab_id, const char 
         NULL, NULL);
     tab->view = WEBKIT_WEB_VIEW(g_object_new(
         WEBKIT_TYPE_WEB_VIEW,
+        "web-context", inst->web_ctx ? inst->web_ctx : webkit_web_context_get_default(),
         "backend", vb,
         "settings", settings,
         "website-policies", policies,
@@ -633,23 +741,45 @@ int gutted_wpe_run(
 
     static gsize web_ctx_init = 0;
     if (g_once_init_enter(&web_ctx_init)) {
+        guint mem_limit_mb = 768;
+        const char *env_mem = getenv("GBROWSER_MEM_LIMIT_MB");
+        if (env_mem && atoi(env_mem) >= 128) {
+            mem_limit_mb = (guint)atoi(env_mem);
+        } else {
+            FILE *cg = fopen("/sys/fs/cgroup/memory.max", "r");
+            if (cg) {
+                unsigned long long cg_bytes = 0;
+                if (fscanf(cg, "%llu", &cg_bytes) == 1 && cg_bytes > (128ULL << 20) && cg_bytes < (64ULL << 30)) {
+                    guint cg_mb = (guint)((cg_bytes >> 20) * 65 / 100);
+                    if (cg_mb >= 256 && cg_mb <= 2048) mem_limit_mb = cg_mb;
+                }
+                fclose(cg);
+            }
+        }
         WebKitMemoryPressureSettings *mp = webkit_memory_pressure_settings_new();
         if (mp) {
-            webkit_memory_pressure_settings_set_memory_limit(mp, 768);
-            webkit_memory_pressure_settings_set_conservative_threshold(mp, 0.50);
-            webkit_memory_pressure_settings_set_strict_threshold(mp, 0.75);
+            webkit_memory_pressure_settings_set_memory_limit(mp, mem_limit_mb);
             webkit_memory_pressure_settings_set_kill_threshold(mp, 0.95);
+            webkit_memory_pressure_settings_set_strict_threshold(mp, 0.75);
+            webkit_memory_pressure_settings_set_conservative_threshold(mp, 0.50);
             webkit_memory_pressure_settings_set_poll_interval(mp, 5.0);
             webkit_website_data_manager_set_memory_pressure_settings(mp);
             webkit_memory_pressure_settings_free(mp);
         }
+        g_once_init_leave(&web_ctx_init, 1);
+    }
 
-        WebKitWebContext *web_ctx = webkit_web_context_get_default();
-        webkit_web_context_set_sandbox_enabled(web_ctx, FALSE);
-        webkit_web_context_set_cache_model(web_ctx, WEBKIT_CACHE_MODEL_WEB_BROWSER);
-        WebKitCookieManager *cm = webkit_web_context_get_cookie_manager(web_ctx);
-        webkit_cookie_manager_set_accept_policy(cm, WEBKIT_COOKIE_POLICY_ACCEPT_ALWAYS);
+    bool persist_host = (getenv("GBROWSER_HOST_PERSIST") != NULL);
+    WebKitWebContext *web_ctx = persist_host
+        ? g_object_ref(webkit_web_context_get_default())
+        : webkit_web_context_new_ephemeral();
+    inst->web_ctx = web_ctx;
+    webkit_web_context_set_sandbox_enabled(web_ctx, FALSE);
+    webkit_web_context_set_cache_model(web_ctx, WEBKIT_CACHE_MODEL_WEB_BROWSER);
+    WebKitCookieManager *cm = webkit_web_context_get_cookie_manager(web_ctx);
+    webkit_cookie_manager_set_accept_policy(cm, WEBKIT_COOKIE_POLICY_ACCEPT_ALWAYS);
 
+    if (persist_host) {
         const char *home = g_get_home_dir();
         if (home) {
             gchar *cookie_dir = g_build_filename(home, ".local", "share", "gutted-browser", NULL);
@@ -659,9 +789,8 @@ int gutted_wpe_run(
             g_free(cookie_dir);
             g_free(cookie_db);
         }
-        g_once_init_leave(&web_ctx_init, 1);
     }
-    g_signal_connect(webkit_web_context_get_default(), "download-started", G_CALLBACK(on_download_started), inst);
+    g_signal_connect(web_ctx, "download-started", G_CALLBACK(on_download_started), inst);
 
     // Create initial tab (tab_id = 1)
     create_tab_internal(inst, 1, initial_url ? initial_url : "https://duckduckgo.com");
@@ -671,6 +800,7 @@ int gutted_wpe_run(
     g_main_loop_run(inst->loop);
 
     g_hash_table_destroy(inst->tabs);
+    if (inst->web_ctx) g_object_unref(inst->web_ctx);
     g_main_loop_unref(inst->loop);
     g_mutex_clear(&inst->motion_lock);
     g_free(inst);
@@ -753,11 +883,14 @@ static gboolean idle_set_active_tab(gpointer p) {
                     wpe_view_activity_state_visible
                     | wpe_view_activity_state_focused
                     | wpe_view_activity_state_in_window);
+                if (tab->view) webkit_web_view_set_is_muted(tab->view, FALSE);
             } else {
                 wpe_view_backend_remove_activity_state(
                     vb,
                     wpe_view_activity_state_visible
-                    | wpe_view_activity_state_focused);
+                    | wpe_view_activity_state_focused
+                    | wpe_view_activity_state_in_window);
+                if (tab->view) webkit_web_view_set_is_muted(tab->view, TRUE);
             }
         }
     }
@@ -1060,7 +1193,7 @@ void gutted_wpe_stop_loading(gutted_wpe_handle h, uint32_t tab_id) {
 typedef struct { instance_t *inst; bool cookies, cache, storage; } idle_clear_t;
 static gboolean idle_clear(gpointer p) {
     idle_clear_t *c = p;
-    WebKitWebContext *web_ctx = webkit_web_context_get_default();
+    WebKitWebContext *web_ctx = (c->inst && c->inst->web_ctx) ? c->inst->web_ctx : webkit_web_context_get_default();
     WebKitWebsiteDataManager *dm = webkit_web_context_get_website_data_manager(web_ctx);
     WebKitWebsiteDataTypes types = 0;
     if (c->cookies) types |= WEBKIT_WEBSITE_DATA_COOKIES;
@@ -1215,4 +1348,143 @@ void gutted_wpe_paste_text(gutted_wpe_handle h, uint32_t tab_id, const char *tex
     ps->tab_id = tab_id;
     ps->text = g_strdup(text);
     g_main_context_invoke(inst->ctx, idle_paste, ps);
+}
+
+typedef struct {
+    instance_t *inst;
+    uint32_t tab_id;
+    char *query;
+    bool forward;
+    bool case_sensitive;
+} idle_find_t;
+
+static gboolean idle_find(gpointer p) {
+    idle_find_t *f = p;
+    if (f->inst) {
+        tab_t *tab = g_hash_table_lookup(f->inst->tabs, GUINT_TO_POINTER(f->tab_id));
+        if (tab && tab->view) {
+            WebKitFindController *fc = webkit_web_view_get_find_controller(tab->view);
+            if (fc) {
+                if (!f->query || !f->query[0]) {
+                    webkit_find_controller_search_finish(fc);
+                } else {
+                    guint32 opts = WEBKIT_FIND_OPTIONS_WRAP_AROUND;
+                    if (!f->case_sensitive) opts |= WEBKIT_FIND_OPTIONS_CASE_INSENSITIVE;
+                    if (!f->forward) opts |= WEBKIT_FIND_OPTIONS_BACKWARDS;
+                    webkit_find_controller_search(fc, f->query, opts, G_MAXUINT);
+                }
+            }
+        }
+    }
+    g_free(f->query);
+    g_free(f);
+    return G_SOURCE_REMOVE;
+}
+
+void gutted_wpe_find_in_page(gutted_wpe_handle h, uint32_t tab_id, const char *query, bool forward, bool case_sensitive) {
+    instance_t *inst = (instance_t *)h;
+    if (!inst) return;
+    idle_find_t *f = g_new0(idle_find_t, 1);
+    f->inst = inst;
+    f->tab_id = tab_id;
+    f->query = g_strdup(query ? query : "");
+    f->forward = forward;
+    f->case_sensitive = case_sensitive;
+    g_main_context_invoke(inst->ctx, idle_find, f);
+}
+
+typedef struct {
+    instance_t *inst;
+    uint32_t tab_id;
+    char *origin;
+    char *username;
+    char *password;
+    char *cookies;
+    bool is_cookies;
+} idle_vault_op_t;
+
+static gboolean idle_vault_op(gpointer p) {
+    idle_vault_op_t *v = p;
+    if (v->inst) {
+        tab_t *tab = g_hash_table_lookup(v->inst->tabs, GUINT_TO_POINTER(v->tab_id));
+        if (tab && tab->view) {
+            if (v->is_cookies && v->cookies && v->cookies[0]) {
+                gchar *esc_cookies = g_strescape(v->cookies, NULL);
+                gchar *js = g_strdup_printf(
+                    "(function(){\n"
+                    "  try {\n"
+                    "    var parts = \"%s\".split(';');\n"
+                    "    for (var i = 0; i < parts.length; i++) {\n"
+                    "      var kv = parts[i].trim();\n"
+                    "      if (kv) document.cookie = kv + '; path=/';\n"
+                    "    }\n"
+                    "  } catch(e) {}\n"
+                    "})();",
+                    esc_cookies);
+                webkit_web_view_run_javascript(tab->view, js, NULL, NULL, NULL);
+                g_free(js);
+                g_free(esc_cookies);
+            } else if (!v->is_cookies && v->username && v->password) {
+                gchar *esc_user = g_strescape(v->username, NULL);
+                gchar *esc_pass = g_strescape(v->password, NULL);
+                gchar *js = g_strdup_printf(
+                    "(function(){\n"
+                    "  try {\n"
+                    "    var u = \"%s\", p = \"%s\";\n"
+                    "    var pw = document.querySelector('input[type=\"password\"]');\n"
+                    "    if (!pw) return;\n"
+                    "    var setNative = function(el, val) {\n"
+                    "      var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');\n"
+                    "      if (setter && setter.set) setter.set.call(el, val); else el.value = val;\n"
+                    "      el.dispatchEvent(new Event('input', { bubbles: true }));\n"
+                    "      el.dispatchEvent(new Event('change', { bubbles: true }));\n"
+                    "    };\n"
+                    "    var scope = pw.form || document;\n"
+                    "    var inputs = scope.querySelectorAll('input:not([type=\"hidden\"]):not([type=\"submit\"]):not([type=\"button\"]):not([type=\"checkbox\"]):not([type=\"radio\"])');\n"
+                    "    for (var i = 0; i < inputs.length; i++) {\n"
+                    "      if (inputs[i] === pw) break;\n"
+                    "      setNative(inputs[i], u);\n"
+                    "    }\n"
+                    "    setNative(pw, p);\n"
+                    "  } catch(e) {}\n"
+                    "})();",
+                    esc_user, esc_pass);
+                webkit_web_view_run_javascript(tab->view, js, NULL, NULL, NULL);
+                g_free(js);
+                g_free(esc_user);
+                g_free(esc_pass);
+            }
+        }
+    }
+    g_free(v->origin);
+    g_free(v->username);
+    g_free(v->password);
+    g_free(v->cookies);
+    g_free(v);
+    return G_SOURCE_REMOVE;
+}
+
+void gutted_wpe_fill_credentials(gutted_wpe_handle h, uint32_t tab_id, const char *origin, const char *username, const char *password) {
+    instance_t *inst = (instance_t *)h;
+    if (!inst || !username || !password) return;
+    idle_vault_op_t *v = g_new0(idle_vault_op_t, 1);
+    v->inst = inst;
+    v->tab_id = tab_id;
+    v->origin = origin ? g_strdup(origin) : NULL;
+    v->username = g_strdup(username);
+    v->password = g_strdup(password);
+    v->is_cookies = false;
+    g_main_context_invoke(inst->ctx, idle_vault_op, v);
+}
+
+void gutted_wpe_sync_cookies(gutted_wpe_handle h, uint32_t tab_id, const char *origin, const char *cookies) {
+    instance_t *inst = (instance_t *)h;
+    if (!inst || !cookies) return;
+    idle_vault_op_t *v = g_new0(idle_vault_op_t, 1);
+    v->inst = inst;
+    v->tab_id = tab_id;
+    v->origin = origin ? g_strdup(origin) : NULL;
+    v->cookies = g_strdup(cookies);
+    v->is_cookies = true;
+    g_main_context_invoke(inst->ctx, idle_vault_op, v);
 }

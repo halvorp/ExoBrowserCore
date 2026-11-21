@@ -18,7 +18,7 @@ use bytes::Bytes;
 use gutted_proto::{caps, Message, PROTO_VERSION};
 use quinn::{Endpoint, ServerConfig};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -261,7 +261,13 @@ pub fn coalesce_bus_batch(
                             let oy0 = y1 as u32;
                             let ox1 = ox0 + (w1 as u32);
                             let oy1 = oy0 + (h1 as u32);
-                            !(nx0 <= ox0 && ny0 <= oy0 && nx1 >= ox1 && ny1 >= oy1)
+                            let covered = nx0 <= ox0 && ny0 <= oy0 && nx1 >= ox1 && ny1 >= oy1;
+                            let same_video_box = w1 >= 128
+                                && h1 >= 128
+                                && w2 >= 128
+                                && h2 >= 128
+                                && rect_iou_pct((x1, y1, w1, h1), (x2, y2, w2, h2)) >= 90;
+                            !(covered || same_video_box)
                         }
                         _ => true,
                     }
@@ -369,6 +375,7 @@ struct HostState {
     active_tab_id: Arc<AtomicU32>,
     viewport_w: Arc<AtomicU32>,
     viewport_h: Arc<AtomicU32>,
+    last_scroll_ms: Arc<AtomicU64>,
 }
 
 impl HostState {
@@ -385,6 +392,9 @@ impl HostState {
                 mut urls,
                 mut file_choosers,
                 mut downloads,
+                mut cred_prompts,
+                mut cred_captures,
+                mut cookie_syncs,
             },
         ) = wpe::WpeRunner::start(initial_url, 1280, 648, active_tab_id.clone());
         let runner = Arc::new(runner);
@@ -406,6 +416,7 @@ impl HostState {
         let last_frames = Arc::new(StdMutex::new(HashMap::new()));
         let viewport_w = Arc::new(AtomicU32::new(1280));
         let viewport_h = Arc::new(AtomicU32::new(648));
+        let last_scroll_ms = Arc::new(AtomicU64::new(0));
         let bus = FrameBus::new(last_frames.clone(), active_tab_id.clone());
         spawn_audio_capture(bus.clone());
 
@@ -413,21 +424,24 @@ impl HostState {
         let active_atomic = active_tab_id.clone();
         let tabs_ref = tabs.clone();
         let last_frames_ref = last_frames.clone();
+        let scroll_ms_ref = last_scroll_ms.clone();
 
         tokio::spawn(async move {
             let mut force_full: HashSet<u32> = HashSet::new();
-            // Per-tab union bounding box `(last_updated, x, y, w, h)` of unrefined lossy Q2 regions
+            // Per-tab union bounding box `(last_updated, x, y, w, h)` of unrefined lossy Q2/Q4 regions
             let mut q2_dirty_bounds: HashMap<u32, (std::time::Instant, u16, u16, u16, u16)> = HashMap::new();
             let mut video_tracker = VideoSubregionTracker::new();
             let mut tile_tracker = TileCacheTracker::new();
-            let mut refine_tick = tokio::time::interval(std::time::Duration::from_millis(60));
+            let mut refine_tick = tokio::time::interval(std::time::Duration::from_millis(100));
             refine_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = refine_tick.tick(), if !q2_dirty_bounds.is_empty() => {
                         let active = active_atomic.load(Ordering::Relaxed);
                         if let Some(&(since, rx, ry, rw, rh)) = q2_dirty_bounds.get(&active) {
-                            if since.elapsed() >= std::time::Duration::from_millis(140) {
+                            // Wait 450ms of quiet settle time before sending lossless ZSTD refinement
+                            // so continuous 24/30fps video playback never gets interrupted by a full ZSTD frame!
+                            if since.elapsed() >= std::time::Duration::from_millis(450) {
                                 q2_dirty_bounds.remove(&active);
                                 if bus_clone.has_subscribers() {
                                     if let Some(f) = last_frames_ref.lock().ok().and_then(|g| g.get(&active).cloned()) {
@@ -510,15 +524,15 @@ impl HostState {
                                         let mut total_px: u64 = regions.iter().map(|(_, _, w, h)| (*w as u64) * (*h as u64)).sum();
                                         let full_px = (f.width as u64) * (f.height as u64);
 
-                                        // Scroll CopyRect fast-path: if >= 45% of pixels changed,
-                                        // test whether the frame shifted vertically. If so, emit a
-                                        // 22-byte CopyRect and only transmit lossless subframes for
-                                        // the newly exposed strip + any fixed headers/scrollbars!
-                                        // If the tab had pending Q2 lossy pixels, shift & reset the 140ms
-                                        // refinement bounds so the shifted region still gets its lossless
-                                        // ZSTD pass once scrolling stops.
+                                        // Scroll CopyRect fast-path: only run scanline scroll detection
+                                        // within 500ms of an actual scroll/key input event so passive
+                                        // YouTube video playback spends 0% CPU on scroll hashing!
+                                        let now_ms = ts_us / 1000;
+                                        let recent_scroll = now_ms
+                                            .saturating_sub(scroll_ms_ref.load(Ordering::Relaxed))
+                                            <= 500;
                                         let mut did_copy_rect = false;
-                                        if total_px * 20 >= full_px * 9 {
+                                        if recent_scroll && total_px * 20 >= full_px * 9 {
                                             if let Some((src_y, dst_y, copy_h)) = detect_vertical_scroll(
                                                 &prev_f.pixels,
                                                 &f.pixels,
@@ -570,7 +584,11 @@ impl HostState {
                                                     this_tab_id,
                                                     (std::time::Instant::now(), 0, 0, f.width as u16, f.height as u16),
                                                 );
-                                                gutted_proto::compression::LZ4_DELTA_Q2
+                                                if full_px >= 1_200_000 {
+                                                    gutted_proto::compression::LZ4_DELTA_Q4
+                                                } else {
+                                                    gutted_proto::compression::LZ4_DELTA_Q2
+                                                }
                                             } else {
                                                 q2_dirty_bounds.remove(&this_tab_id);
                                                 gutted_proto::compression::ZSTD
@@ -634,7 +652,10 @@ impl HostState {
                                                 let is_video_sub = !did_copy_rect
                                                     && area >= 16_000
                                                     && video_tracker.record_and_is_video(this_tab_id, (x, y, w, h), now);
-                                                let comp = if !did_copy_rect && (area >= 96_000 || is_video_sub) {
+                                                let comp = if !did_copy_rect && area >= 500_000 {
+                                                    merge_q2_dirty_bounds(&mut q2_dirty_bounds, this_tab_id, now, x, y, w, h);
+                                                    gutted_proto::compression::LZ4_DELTA_Q4
+                                                } else if !did_copy_rect && (area >= 64_000 || is_video_sub) {
                                                     merge_q2_dirty_bounds(&mut q2_dirty_bounds, this_tab_id, now, x, y, w, h);
                                                     gutted_proto::compression::LZ4_DELTA_Q2
                                                 } else if area >= 32_000 {
@@ -754,6 +775,28 @@ impl HostState {
                             }
                         }
                     }
+                    Some((this_tab_id, origin)) = cred_prompts.recv() => {
+                        info!(tab_id = this_tab_id, %origin, "WPE password field prompt");
+                        bus_clone.publish(Arc::new(Message::CredentialPrompt {
+                            tab_id: this_tab_id,
+                            origin,
+                        }));
+                    }
+                    Some((this_tab_id, origin, username, password)) = cred_captures.recv() => {
+                        info!(tab_id = this_tab_id, %origin, %username, "WPE captured login credentials for client vault");
+                        bus_clone.publish(Arc::new(Message::CredentialCaptured {
+                            tab_id: this_tab_id,
+                            origin,
+                            username,
+                            password,
+                        }));
+                    }
+                    Some((_this_tab_id, origin, cookies)) = cookie_syncs.recv() => {
+                        bus_clone.publish(Arc::new(Message::CookieSync {
+                            origin,
+                            cookies,
+                        }));
+                    }
                     else => break,
                 }
             }
@@ -767,6 +810,7 @@ impl HostState {
             active_tab_id,
             viewport_w,
             viewport_h,
+            last_scroll_ms,
         }
     }
 
@@ -849,11 +893,28 @@ impl HostState {
     }
 
     async fn inject_key(&self, keycode: u32, mods: u32, down: bool) {
+        if down
+            && matches!(
+                keycode,
+                0xff52 | 0xff54 | 0xff55 | 0xff56 | 0xff50 | 0xff57 | 0x0020
+            )
+        {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            self.last_scroll_ms.store(now_ms, Ordering::Relaxed);
+        }
         let active = self.active_tab_id.load(Ordering::Relaxed);
         self.runner.inject_key(active, keycode, mods, down);
     }
 
     async fn inject_axis(&self, x: i32, y: i32, dx: f64, dy: f64, modifiers: u32) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.last_scroll_ms.store(now_ms, Ordering::Relaxed);
         let active = self.active_tab_id.load(Ordering::Relaxed);
         self.runner.inject_axis(active, x, y, dx, dy, modifiers);
     }
@@ -887,9 +948,28 @@ impl HostState {
         self.runner.clear_data(cookies, cache, storage);
     }
 
-    fn paste_text(&self, text: &str) {
+    pub fn paste_text(&self, text: &str) {
         let active = self.active_tab_id.load(Ordering::Relaxed);
         self.runner.paste_text(active, text);
+    }
+
+    pub fn find_in_page(&self, query: &str, forward: bool, case_sensitive: bool) {
+        let active = self.active_tab_id.load(Ordering::Relaxed);
+        self.runner.find_in_page(active, query, forward, case_sensitive);
+    }
+
+    pub fn fill_credentials(&self, tab_id: u32, origin: &str, username: &str, password: &str) {
+        let target = if tab_id == 0 {
+            self.active_tab_id.load(Ordering::Relaxed)
+        } else {
+            tab_id
+        };
+        self.runner.fill_credentials(target, origin, username, password);
+    }
+
+    pub fn sync_cookies(&self, origin: &str, cookies: &str) {
+        let active = self.active_tab_id.load(Ordering::Relaxed);
+        self.runner.sync_cookies(active, origin, cookies);
     }
 
     fn handle_file_upload(&self, tab_id: u32, filename: &str, mime_type: &str, data: &[u8]) {
@@ -1018,6 +1098,15 @@ async fn handle_input_stream(mut recv: quinn::RecvStream, host_state: HostState)
                             }
                             Message::FileUpload { tab_id, filename, mime_type, data } => {
                                 host_state.handle_file_upload(tab_id, &filename, &mime_type, &data);
+                            }
+                            Message::FindInPage { query, forward, case_sensitive } => {
+                                host_state.find_in_page(&query, forward, case_sensitive);
+                            }
+                            Message::CredentialFill { tab_id, origin, username, password } => {
+                                host_state.fill_credentials(tab_id, &origin, &username, &password);
+                            }
+                            Message::CookieSync { origin, cookies } => {
+                                host_state.sync_cookies(&origin, &cookies);
                             }
                             other => warn!(?other, "unexpected input msg"),
                         }
@@ -1237,6 +1326,15 @@ async fn handle_ctrl_stream(
             }
             Message::FileUpload { tab_id, filename, mime_type, data } => {
                 host_state.handle_file_upload(tab_id, &filename, &mime_type, &data);
+            }
+            Message::FindInPage { query, forward, case_sensitive } => {
+                host_state.find_in_page(&query, forward, case_sensitive);
+            }
+            Message::CredentialFill { tab_id, origin, username, password } => {
+                host_state.fill_credentials(tab_id, &origin, &username, &password);
+            }
+            Message::CookieSync { origin, cookies } => {
+                host_state.sync_cookies(&origin, &cookies);
             }
             other => info!(?other, "ctrl msg (unhandled yet)"),
         }
@@ -1499,6 +1597,15 @@ async fn handle_tcp_connection(
             }
             Message::FileUpload { tab_id, filename, mime_type, data } => {
                 host_state.handle_file_upload(tab_id, &filename, &mime_type, &data);
+            }
+            Message::FindInPage { query, forward, case_sensitive } => {
+                host_state.find_in_page(&query, forward, case_sensitive);
+            }
+            Message::CredentialFill { tab_id, origin, username, password } => {
+                host_state.fill_credentials(tab_id, &origin, &username, &password);
+            }
+            Message::CookieSync { origin, cookies } => {
+                host_state.sync_cookies(&origin, &cookies);
             }
             _ => {}
         }
@@ -1924,9 +2031,10 @@ fn diff_regions_inner(
         runs.push((start, end));
     }
 
-    // Fast-path: if >50% of screen rows changed or >8 disjoint runs,
-    // compute a single tight horizontal bounding box across all dirty rows.
-    if (scroll.is_none() && dirty_count * 2 >= h) || runs.len() > 8 {
+    // Fast-path: only collapse into a single bounding box if >8 disjoint runs.
+    // Keeping <=8 runs separate prevents a small blinking UI indicator at the top
+    // of the page from merging with a 760px-tall video player below it!
+    if runs.len() > 8 {
         let mut min_left = w;
         let mut max_right = 0usize;
         for (yy, &is_d) in dirty.iter().enumerate().take(last_dirty + 1).skip(first_dirty) {
@@ -1961,8 +2069,20 @@ fn diff_regions_inner(
             }
         }
         if right >= left {
-            out.push((left as u16, top as u16,
-                      (right - left + 1) as u16, (bot - top + 1) as u16));
+            let raw_w = right - left + 1;
+            let raw_h = bot - top + 1;
+            // Snap medium/large video & UI regions (>= 64x64 px) to an 8-pixel macroblock grid
+            // so bounding boxes do not jitter by 1-2 pixels across video frames (preventing
+            // odd/even 2x2 downsample phase shimmer and ensuring backpressure frame coalescing).
+            if scroll.is_none() && raw_w * raw_h >= 4096 {
+                let x0 = left & !7;
+                let y0 = top & !7;
+                let x1 = ((right + 1 + 7) & !7).min(w);
+                let y1 = ((bot + 1 + 7) & !7).min(h);
+                out.push((x0 as u16, y0 as u16, (x1 - x0) as u16, (y1 - y0) as u16));
+            } else {
+                out.push((left as u16, top as u16, raw_w as u16, raw_h as u16));
+            }
         }
     }
     out

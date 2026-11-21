@@ -129,6 +129,20 @@ pub enum RenderEvent {
         filename: String,
         data: Vec<u8>,
     },
+    CredentialPrompt {
+        tab_id: u32,
+        origin: String,
+    },
+    CredentialCaptured {
+        tab_id: u32,
+        origin: String,
+        username: String,
+        password: String,
+    },
+    CookieSync {
+        origin: String,
+        cookies: String,
+    },
     Quit,
 }
 
@@ -231,6 +245,21 @@ impl RenderEvent {
                 accept_mimes,
             }),
             Message::FileDownload { filename, data } => Some(Self::FileDownload { filename, data }),
+            Message::CredentialPrompt { tab_id, origin } => {
+                Some(Self::CredentialPrompt { tab_id, origin })
+            }
+            Message::CredentialCaptured {
+                tab_id,
+                origin,
+                username,
+                password,
+            } => Some(Self::CredentialCaptured {
+                tab_id,
+                origin,
+                username,
+                password,
+            }),
+            Message::CookieSync { origin, cookies } => Some(Self::CookieSync { origin, cookies }),
             _ => None,
         }
     }
@@ -294,6 +323,21 @@ pub enum InputEvent {
         mime_type: String,
         data: Vec<u8>,
     },
+    FindInPage {
+        query: String,
+        forward: bool,
+        case_sensitive: bool,
+    },
+    CredentialFill {
+        tab_id: u32,
+        origin: String,
+        username: String,
+        password: String,
+    },
+    CookieSync {
+        origin: String,
+        cookies: String,
+    },
 }
 
 impl InputEvent {
@@ -333,6 +377,27 @@ impl InputEvent {
                 mime_type,
                 data,
             },
+            Self::FindInPage {
+                query,
+                forward,
+                case_sensitive,
+            } => Message::FindInPage {
+                query,
+                forward,
+                case_sensitive,
+            },
+            Self::CredentialFill {
+                tab_id,
+                origin,
+                username,
+                password,
+            } => Message::CredentialFill {
+                tab_id,
+                origin,
+                username,
+                password,
+            },
+            Self::CookieSync { origin, cookies } => Message::CookieSync { origin, cookies },
             Self::Motion { x, y, mods } => Message::InputPointer {
                 ts_us,
                 x,
@@ -858,6 +923,365 @@ pub struct DamageRect {
     pub h: u32,
 }
 
+/// A saved login credential in the client-side [`ClientVault`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CredentialEntry {
+    pub origin: String,
+    pub username: String,
+    pub password: String,
+}
+
+/// A saved browsing history entry in the client-side [`ClientVault`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub url: String,
+    pub title: String,
+}
+
+/// Client-side state vault holding all passwords, cookies, browsing history, and user bookmarks.
+///
+/// Allows the remote `gutted-host` backend to remain 100% stateless/ephemeral (rendering-only)
+/// while all sensitive user credentials and session cookies live exclusively on the client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientVault {
+    pub credentials: Vec<CredentialEntry>,
+    pub cookies: BTreeMap<String, String>,
+    pub history: Vec<HistoryEntry>,
+    pub bookmarks: Vec<(String, String)>,
+}
+
+impl Default for ClientVault {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Extract the scheme + authority origin (e.g. `"https://github.com"`) from a URL.
+pub fn extract_origin(url: &str) -> String {
+    let s = url.trim();
+    if let Some(scheme_end) = s.find("://") {
+        let after_scheme = &s[scheme_end + 3..];
+        let host_end = after_scheme
+            .find(['/', '?', '#'])
+            .unwrap_or(after_scheme.len());
+        if host_end > 0 {
+            return s[..scheme_end + 3 + host_end].to_ascii_lowercase();
+        }
+    }
+    String::new()
+}
+
+fn vault_xor_transform(data: &mut [u8]) {
+    let mut state: u64 = 0x4558_4F56_4155_4C54; // "EXOVAULT"
+    for b in data.iter_mut() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *b ^= (state & 0xFF) as u8;
+    }
+}
+
+fn vault_put_str(out: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    let len = bytes.len().min(u32::MAX as usize) as u32;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&bytes[..len as usize]);
+}
+
+fn vault_get_str(cur: &mut &[u8]) -> Option<String> {
+    if cur.len() < 4 {
+        return None;
+    }
+    let len = u32::from_le_bytes([cur[0], cur[1], cur[2], cur[3]]) as usize;
+    *cur = &cur[4..];
+    if cur.len() < len {
+        return None;
+    }
+    let s = core::str::from_utf8(&cur[..len]).ok()?;
+    *cur = &cur[len..];
+    Some(String::from(s))
+}
+
+impl ClientVault {
+    pub fn new() -> Self {
+        let mut bookmarks = Vec::with_capacity(BOOKMARKS.len());
+        for &(label, url) in BOOKMARKS {
+            bookmarks.push((String::from(label), String::from(url)));
+        }
+        Self {
+            credentials: Vec::new(),
+            cookies: BTreeMap::new(),
+            history: Vec::new(),
+            bookmarks,
+        }
+    }
+
+    /// Look up saved credentials for `origin` (or a URL whose origin matches).
+    pub fn get_credential(&self, origin_or_url: &str) -> Option<&CredentialEntry> {
+        let target = if origin_or_url.contains("://") {
+            let o = extract_origin(origin_or_url);
+            if o.is_empty() {
+                origin_or_url.to_ascii_lowercase()
+            } else {
+                o
+            }
+        } else {
+            origin_or_url.to_ascii_lowercase()
+        };
+        self.credentials
+            .iter()
+            .find(|c| c.origin.eq_ignore_ascii_case(&target))
+    }
+
+    /// Insert or update a saved credential for `origin`.
+    pub fn set_credential(&mut self, origin: String, username: String, password: String) {
+        let norm = if origin.contains("://") {
+            let o = extract_origin(&origin);
+            if o.is_empty() { origin } else { o }
+        } else {
+            origin
+        };
+        if let Some(existing) = self
+            .credentials
+            .iter_mut()
+            .find(|c| c.origin.eq_ignore_ascii_case(&norm))
+        {
+            existing.username = username;
+            existing.password = password;
+        } else {
+            self.credentials.push(CredentialEntry {
+                origin: norm,
+                username,
+                password,
+            });
+        }
+    }
+
+    /// Save or merge cookies for `origin`.
+    pub fn set_cookies(&mut self, origin: String, cookies: String) {
+        if origin.is_empty() || cookies.is_empty() {
+            return;
+        }
+        let norm = if origin.contains("://") {
+            let o = extract_origin(&origin);
+            if o.is_empty() { origin } else { o }
+        } else {
+            origin
+        };
+        self.cookies.insert(norm, cookies);
+    }
+
+    /// Get saved cookies for `origin_or_url`.
+    pub fn get_cookies(&self, origin_or_url: &str) -> Option<&str> {
+        let norm = if origin_or_url.contains("://") {
+            let o = extract_origin(origin_or_url);
+            if o.is_empty() {
+                origin_or_url.to_ascii_lowercase()
+            } else {
+                o
+            }
+        } else {
+            origin_or_url.to_ascii_lowercase()
+        };
+        self.cookies.get(&norm).map(|s| s.as_str())
+    }
+
+    /// Record a page visit in the client-side history ring (capped at 256 entries).
+    pub fn record_history(&mut self, url: String, title: String) {
+        if url.is_empty() || url == "about:blank" {
+            return;
+        }
+        if let Some(last) = self.history.last_mut() {
+            if urls_equivalent(&last.url, &url) {
+                if !title.is_empty() {
+                    last.title = title;
+                }
+                return;
+            }
+        }
+        if self.history.len() >= 256 {
+            self.history.remove(0);
+        }
+        self.history.push(HistoryEntry { url, title });
+    }
+
+    /// Toggle a bookmark for `(title, url)`. Returns `true` if added, `false` if removed.
+    pub fn toggle_bookmark(&mut self, title: String, url: String) -> bool {
+        if let Some(pos) = self
+            .bookmarks
+            .iter()
+            .position(|(_, u)| urls_equivalent(u, &url))
+        {
+            self.bookmarks.remove(pos);
+            false
+        } else {
+            let label = if title.trim().is_empty() {
+                url.trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .trim_start_matches("www.")
+                    .split('/')
+                    .next()
+                    .unwrap_or("Bookmark")
+                    .chars()
+                    .take(14)
+                    .collect()
+            } else {
+                title.trim().chars().take(14).collect()
+            };
+            self.bookmarks.push((label, url));
+            true
+        }
+    }
+
+    /// Serialize the vault into a compact, obfuscated binary format (`#![no_std]` + `alloc`).
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        let mut payload = Vec::with_capacity(256);
+        payload.extend_from_slice(&(self.credentials.len() as u32).to_le_bytes());
+        for c in &self.credentials {
+            vault_put_str(&mut payload, &c.origin);
+            vault_put_str(&mut payload, &c.username);
+            vault_put_str(&mut payload, &c.password);
+        }
+        payload.extend_from_slice(&(self.cookies.len() as u32).to_le_bytes());
+        for (k, v) in &self.cookies {
+            vault_put_str(&mut payload, k);
+            vault_put_str(&mut payload, v);
+        }
+        payload.extend_from_slice(&(self.history.len() as u32).to_le_bytes());
+        for h in &self.history {
+            vault_put_str(&mut payload, &h.url);
+            vault_put_str(&mut payload, &h.title);
+        }
+        payload.extend_from_slice(&(self.bookmarks.len() as u32).to_le_bytes());
+        for (label, url) in &self.bookmarks {
+            vault_put_str(&mut payload, label);
+            vault_put_str(&mut payload, url);
+        }
+        vault_xor_transform(&mut payload);
+        out.extend_from_slice(b"EXOV1");
+        out.extend_from_slice(&payload);
+    }
+
+    /// Deserialize a [`ClientVault`] from bytes produced by [`ClientVault::encode`].
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 5 || &bytes[..5] != b"EXOV1" {
+            return None;
+        }
+        let mut payload = bytes[5..].to_vec();
+        vault_xor_transform(&mut payload);
+        let mut cur = payload.as_slice();
+
+        if cur.len() < 4 {
+            return None;
+        }
+        let n_creds = u32::from_le_bytes([cur[0], cur[1], cur[2], cur[3]]) as usize;
+        cur = &cur[4..];
+        if n_creds > 4096 {
+            return None;
+        }
+        let mut credentials = Vec::with_capacity(n_creds.min(64));
+        for _ in 0..n_creds {
+            credentials.push(CredentialEntry {
+                origin: vault_get_str(&mut cur)?,
+                username: vault_get_str(&mut cur)?,
+                password: vault_get_str(&mut cur)?,
+            });
+        }
+
+        if cur.len() < 4 {
+            return None;
+        }
+        let n_cookies = u32::from_le_bytes([cur[0], cur[1], cur[2], cur[3]]) as usize;
+        cur = &cur[4..];
+        if n_cookies > 4096 {
+            return None;
+        }
+        let mut cookies = BTreeMap::new();
+        for _ in 0..n_cookies {
+            let k = vault_get_str(&mut cur)?;
+            let v = vault_get_str(&mut cur)?;
+            cookies.insert(k, v);
+        }
+
+        if cur.len() < 4 {
+            return None;
+        }
+        let n_hist = u32::from_le_bytes([cur[0], cur[1], cur[2], cur[3]]) as usize;
+        cur = &cur[4..];
+        if n_hist > 4096 {
+            return None;
+        }
+        let mut history = Vec::with_capacity(n_hist.min(64));
+        for _ in 0..n_hist {
+            history.push(HistoryEntry {
+                url: vault_get_str(&mut cur)?,
+                title: vault_get_str(&mut cur)?,
+            });
+        }
+
+        if cur.len() < 4 {
+            return None;
+        }
+        let n_bm = u32::from_le_bytes([cur[0], cur[1], cur[2], cur[3]]) as usize;
+        cur = &cur[4..];
+        if n_bm > 4096 {
+            return None;
+        }
+        let mut bookmarks = Vec::with_capacity(n_bm.min(32));
+        for _ in 0..n_bm {
+            bookmarks.push((vault_get_str(&mut cur)?, vault_get_str(&mut cur)?));
+        }
+
+        Some(Self {
+            credentials,
+            cookies,
+            history,
+            bookmarks,
+        })
+    }
+
+    #[cfg(feature = "std")]
+    pub fn default_path() -> Option<std::path::PathBuf> {
+        if let Ok(p) = std::env::var("GBROWSER_VAULT_PATH") {
+            if !p.is_empty() {
+                return Some(std::path::PathBuf::from(p));
+            }
+        }
+        let home = std::env::var("HOME").ok()?;
+        Some(
+            std::path::Path::new(&home)
+                .join(".local")
+                .join("share")
+                .join("gutted-browser")
+                .join("client_vault.bin"),
+        )
+    }
+
+    #[cfg(feature = "std")]
+    pub fn load_from_disk() -> Self {
+        if let Some(path) = Self::default_path() {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Some(v) = Self::decode(&bytes) {
+                    return v;
+                }
+            }
+        }
+        Self::new()
+    }
+
+    #[cfg(feature = "std")]
+    pub fn save_to_disk(&self) {
+        if let Some(path) = Self::default_path() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let mut buf = Vec::with_capacity(512);
+            self.encode(&mut buf);
+            let _ = std::fs::write(&path, &buf);
+        }
+    }
+}
+
 /// Built-in 760-byte 8x8 ASCII bitmap font (`0x20..=0x7E`) for zero-dependency `#![no_std]` rendering.
 /// Each byte encodes one row (`bit 0` = leftmost pixel, `bit 7` = rightmost pixel).
 const ASCII_8X8: [[u8; 8]; 95] = [
@@ -1250,6 +1674,8 @@ pub struct BrowserCore {
     pub mods: u32,
     pub url_buf: String,
     pub clipboard: String,
+    pub vault: ClientVault,
+    pub find_query: String,
     pub downloaded_files: Vec<(String, Vec<u8>)>,
     pub editing: bool,
     pub is_loading: bool,
@@ -1311,6 +1737,8 @@ impl BrowserCore {
             mods: 0,
             url_buf: initial_url,
             clipboard: String::new(),
+            vault: ClientVault::new(),
+            find_query: String::new(),
             downloaded_files: Vec::new(),
             editing,
             is_loading: false,
@@ -1374,6 +1802,7 @@ impl BrowserCore {
     ) -> Self {
         let mut core = Self::new_no_std(width, height, initial_url, editing);
         core.input_tx = Some(input_tx);
+        core.vault = ClientVault::load_from_disk();
         core.capture_to = std::env::var("GBROWSER_SCREENSHOT")
             .ok()
             .map(std::path::PathBuf::from);
@@ -1572,6 +2001,27 @@ impl BrowserCore {
     }
 
     pub fn submit_omnibox(&mut self) {
+        if let Some(find_rest) = self.url_buf.trim().strip_prefix("find:") {
+            let query = find_rest.trim().to_string();
+            self.find_query = query.clone();
+            self.editing = false;
+            if let Some(t) = self.tabs.iter().find(|t| t.id == self.active_tab_id) {
+                self.url_buf = t.url.clone();
+            }
+            self.emit_input(InputEvent::FindInPage {
+                query: query.clone(),
+                forward: true,
+                case_sensitive: false,
+            });
+            self.status_toast_text = if query.is_empty() {
+                Some("Cleared find highlight".into())
+            } else {
+                Some(format!("Find in page: \"{}\"", query))
+            };
+            self.status_toast_frames_left = 75;
+            self.chrome_dirty = true;
+            return;
+        }
         if let Some(_rest) = self.url_buf.trim().strip_prefix("upload:") {
             #[cfg(feature = "std")]
             let path_str = _rest.trim().to_string();
@@ -1595,6 +2045,15 @@ impl BrowserCore {
             t.url = url.clone();
             t.is_secure = url.starts_with("https://");
             t.is_loading = true;
+        }
+        if let Some(cookies) = self.vault.get_cookies(&url) {
+            let origin = extract_origin(&url);
+            if !origin.is_empty() {
+                self.emit_input(InputEvent::CookieSync {
+                    origin,
+                    cookies: String::from(cookies),
+                });
+            }
         }
         self.emit_input(InputEvent::Navigate(url));
         self.chrome_dirty = true;
@@ -1643,14 +2102,33 @@ impl BrowserCore {
                 if s.pixels.len() < expected {
                     return true;
                 }
-                // Drop any older queued subframes completely covered by this newer subframe
+                // Drop any older queued subframes completely covered by this newer subframe,
+                // or superseded video subframes with >=90% bounding-box overlap (IoU).
                 let sx1 = s.x.saturating_add(s.w);
                 let sy1 = s.y.saturating_add(s.h);
                 self.pending_subframes.retain(|old| {
-                    !(old.x >= s.x
-                        && old.y >= s.y
-                        && old.x.saturating_add(old.w) <= sx1
-                        && old.y.saturating_add(old.h) <= sy1)
+                    let ox1 = old.x.saturating_add(old.w);
+                    let oy1 = old.y.saturating_add(old.h);
+                    let covered = old.x >= s.x && old.y >= s.y && ox1 <= sx1 && oy1 <= sy1;
+                    if covered {
+                        return false;
+                    }
+                    if old.w >= 128 && old.h >= 128 && s.w >= 128 && s.h >= 128 {
+                        let ix0 = old.x.max(s.x) as u64;
+                        let iy0 = old.y.max(s.y) as u64;
+                        let ix1 = ox1.min(sx1) as u64;
+                        let iy1 = oy1.min(sy1) as u64;
+                        if ix1 > ix0 && iy1 > iy0 {
+                            let inter = (ix1 - ix0) * (iy1 - iy0);
+                            let union = (old.w as u64) * (old.h as u64)
+                                + (s.w as u64) * (s.h as u64)
+                                - inter;
+                            if union > 0 && (inter * 100) / union >= 90 {
+                                return false;
+                            }
+                        }
+                    }
+                    true
                 });
                 self.pending_damage.push(DamageRect {
                     x: s.x,
@@ -1727,15 +2205,32 @@ impl BrowserCore {
                 if !self.editing {
                     self.url_buf = u.clone();
                 }
+                let mut cur_title = String::new();
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == self.active_tab_id) {
                     t.url = u.clone();
                     t.is_secure = u.starts_with("https://");
+                    cur_title = t.title.clone();
+                }
+                self.vault.record_history(u.clone(), cur_title);
+                if let Some(cookies) = self.vault.get_cookies(&u) {
+                    let origin = extract_origin(&u);
+                    if !origin.is_empty() {
+                        self.emit_input(InputEvent::CookieSync {
+                            origin,
+                            cookies: String::from(cookies),
+                        });
+                    }
                 }
                 self.chrome_dirty = true;
             }
             RenderEvent::Title(title) => {
+                let mut cur_url = String::new();
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == self.active_tab_id) {
                     t.title = title.clone();
+                    cur_url = t.url.clone();
+                }
+                if !cur_url.is_empty() {
+                    self.vault.record_history(cur_url, title.clone());
                 }
                 self.window_title = if title.is_empty() {
                     "ExoBrowser".into()
@@ -1847,6 +2342,49 @@ impl BrowserCore {
                 self.status_toast_frames_left = 90;
                 self.downloaded_files.push((safe_name, data));
                 self.chrome_dirty = true;
+            }
+            RenderEvent::CredentialPrompt { tab_id, origin } => {
+                if let Some(cred) = self.vault.get_credential(&origin).cloned() {
+                    let target = if tab_id == 0 {
+                        self.active_tab_id
+                    } else {
+                        tab_id
+                    };
+                    self.emit_input(InputEvent::CredentialFill {
+                        tab_id: target,
+                        origin: cred.origin.clone(),
+                        username: cred.username.clone(),
+                        password: cred.password,
+                    });
+                    self.status_toast_text = Some(format!(
+                        "Autofilled login for {} ({}) from client vault",
+                        origin, cred.username
+                    ));
+                    self.status_toast_frames_left = 90;
+                    self.chrome_dirty = true;
+                }
+            }
+            RenderEvent::CredentialCaptured {
+                tab_id: _tab_id,
+                origin,
+                username,
+                password,
+            } => {
+                self.vault
+                    .set_credential(origin.clone(), username.clone(), password);
+                #[cfg(feature = "std")]
+                self.vault.save_to_disk();
+                self.status_toast_text = Some(format!(
+                    "Saved login for {} ({}) in local client vault",
+                    origin, username
+                ));
+                self.status_toast_frames_left = 90;
+                self.chrome_dirty = true;
+            }
+            RenderEvent::CookieSync { origin, cookies } => {
+                self.vault.set_cookies(origin, cookies);
+                #[cfg(feature = "std")]
+                self.vault.save_to_disk();
             }
         }
         true
@@ -2015,7 +2553,7 @@ impl BrowserCore {
             0x181820,
         );
         let mut bkx = 8i32;
-        for (idx, (label, _)) in BOOKMARKS.iter().enumerate() {
+        for (idx, (label, _)) in self.vault.bookmarks.iter().enumerate() {
             let chip_w = (label.len() as i32 * 7) + 20;
             if bkx + chip_w > bw as i32 - 8 {
                 break;
@@ -2106,11 +2644,76 @@ impl BrowserCore {
                 return false;
             }
             if ctrl {
+                let shift = (self.mods & MOD_SHIFT) != 0;
                 match keysym {
                     0x006c | 0x004c => {
+                        if shift {
+                            // Ctrl+Shift+L: manually autofill credentials for current tab origin from ClientVault
+                            let cur_url = self
+                                .tabs
+                                .iter()
+                                .find(|t| t.id == self.active_tab_id)
+                                .map(|t| t.url.clone())
+                                .unwrap_or_else(|| self.url_buf.clone());
+                            if let Some(cred) = self.vault.get_credential(&cur_url).cloned() {
+                                self.emit_input(InputEvent::CredentialFill {
+                                    tab_id: self.active_tab_id,
+                                    origin: cred.origin.clone(),
+                                    username: cred.username.clone(),
+                                    password: cred.password,
+                                });
+                                self.status_toast_text = Some(format!(
+                                    "Autofilled login for {} ({})",
+                                    cred.origin, cred.username
+                                ));
+                            } else {
+                                self.status_toast_text =
+                                    Some("No saved login in client vault for this site".into());
+                            }
+                            self.status_toast_frames_left = 75;
+                            self.chrome_dirty = true;
+                            return false;
+                        }
                         self.editing = true;
                         self.url_buf.clear();
                         self.chrome_dirty = true;
+                        return false;
+                    }
+                    0x0066 | 0x0046 => {
+                        // Ctrl+F: Find in page
+                        self.editing = true;
+                        self.url_buf = "find:".into();
+                        self.status_toast_text =
+                            Some("Find in page: type query after find: and press Enter".into());
+                        self.status_toast_frames_left = 75;
+                        self.chrome_dirty = true;
+                        return false;
+                    }
+                    0x0067 | 0x0047 => {
+                        // Ctrl+G / Ctrl+Shift+G: Find next / previous
+                        if !self.find_query.is_empty() {
+                            self.emit_input(InputEvent::FindInPage {
+                                query: self.find_query.clone(),
+                                forward: !shift,
+                                case_sensitive: false,
+                            });
+                        }
+                        return false;
+                    }
+                    0x0064 | 0x0044 => {
+                        // Ctrl+D: Toggle bookmark for active tab in ClientVault
+                        if let Some(t) = self.tabs.iter().find(|t| t.id == self.active_tab_id) {
+                            let added = self.vault.toggle_bookmark(t.title.clone(), t.url.clone());
+                            #[cfg(feature = "std")]
+                            self.vault.save_to_disk();
+                            self.status_toast_text = Some(if added {
+                                format!("Bookmarked {} in local vault", t.url)
+                            } else {
+                                format!("Removed bookmark for {}", t.url)
+                            });
+                            self.status_toast_frames_left = 75;
+                            self.chrome_dirty = true;
+                        }
                         return false;
                     }
                     0x0074 | 0x0054 => {
@@ -2468,18 +3071,28 @@ impl BrowserCore {
 
         // Bookmarks Bar
         let mut bkx = 8i32;
-        for (label, url) in BOOKMARKS {
+        let bookmarks_snapshot = self.vault.bookmarks.clone();
+        for (label, url) in &bookmarks_snapshot {
             let chip_w = (label.len() as i32 * 7) + 20;
             if x >= bkx && x < bkx + chip_w {
-                self.url_buf = (*url).to_string();
+                self.url_buf = url.clone();
                 self.editing = false;
                 self.is_loading = true;
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == self.active_tab_id) {
-                    t.url = (*url).to_string();
+                    t.url = url.clone();
                     t.is_secure = url.starts_with("https://");
                     t.is_loading = true;
                 }
-                self.emit_input(InputEvent::Navigate((*url).to_string()));
+                if let Some(cookies) = self.vault.get_cookies(url) {
+                    let origin = extract_origin(url);
+                    if !origin.is_empty() {
+                        self.emit_input(InputEvent::CookieSync {
+                            origin,
+                            cookies: String::from(cookies),
+                        });
+                    }
+                }
+                self.emit_input(InputEvent::Navigate(url.clone()));
                 self.chrome_dirty = true;
                 return;
             }
@@ -3190,20 +3803,36 @@ fn present_x11_damage<C: x11rb::connection::Connection>(
             continue;
         }
         let row_bytes = (d.w as usize) * 4;
-        let max_rows_per_chunk = (48 * 1024 / row_bytes.max(4)).max(1) as u32;
+        let max_rows_per_chunk = (240 * 1024 / row_bytes.max(4)).max(1) as u32;
         let mut ry = 0u32;
         while ry < d.h {
             let chunk_h = (d.h - ry).min(max_rows_per_chunk);
             scratch_bytes.resize(row_bytes * chunk_h as usize, 0);
-            let (dst_pixels, _) = scratch_bytes.as_chunks_mut::<4>();
             let dw = d.w as usize;
-            for r in 0..chunk_h as usize {
-                let py = (d.y + ry) as usize + r;
-                let row_start = py * bw as usize + d.x as usize;
-                let row_slice = &framebuffer[row_start..row_start + dw];
-                let dst_row = &mut dst_pixels[r * dw..(r + 1) * dw];
-                for (dst, &px) in dst_row.iter_mut().zip(row_slice) {
-                    *dst = px.to_le_bytes();
+            #[cfg(target_endian = "little")]
+            {
+                for r in 0..chunk_h as usize {
+                    let py = (d.y + ry) as usize + r;
+                    let row_start = py * bw as usize + d.x as usize;
+                    let row_slice = &framebuffer[row_start..row_start + dw];
+                    let src_bytes = unsafe {
+                        core::slice::from_raw_parts(row_slice.as_ptr() as *const u8, row_bytes)
+                    };
+                    let dst_off = r * row_bytes;
+                    scratch_bytes[dst_off..dst_off + row_bytes].copy_from_slice(src_bytes);
+                }
+            }
+            #[cfg(not(target_endian = "little"))]
+            {
+                let (dst_pixels, _) = scratch_bytes.as_chunks_mut::<4>();
+                for r in 0..chunk_h as usize {
+                    let py = (d.y + ry) as usize + r;
+                    let row_start = py * bw as usize + d.x as usize;
+                    let row_slice = &framebuffer[row_start..row_start + dw];
+                    let dst_row = &mut dst_pixels[r * dw..(r + 1) * dw];
+                    for (dst, &px) in dst_row.iter_mut().zip(row_slice) {
+                        *dst = px.to_le_bytes();
+                    }
                 }
             }
             conn.put_image(
@@ -3582,5 +4211,58 @@ mod tests {
         assert_eq!(fb[(CHROME_H as usize + 10) * 640 + 5], 0x00112233);
         // Newly exposed strip at y=40 has the post-CopyRect QOI subframe
         assert_eq!(fb[(CHROME_H as usize + 40) * 640 + 5], 0x00445566);
+
+        // Verify ClientVault binary serialization, credential capture, autofill, cookie sync, and find-in-page
+        let mut vault_wire = Vec::new();
+        Message::CredentialCaptured {
+            tab_id: 1,
+            origin: "https://github.com".into(),
+            username: "peter".into(),
+            password: "vault_password_123".into(),
+        }
+        .encode(&mut vault_wire);
+        Message::CookieSync {
+            origin: "https://github.com".into(),
+            cookies: "session=abc123".into(),
+        }
+        .encode(&mut vault_wire);
+        Message::CredentialPrompt {
+            tab_id: 1,
+            origin: "https://github.com".into(),
+        }
+        .encode(&mut vault_wire);
+        core.ingest_wire_chunk(&vault_wire).unwrap();
+
+        let cred = core.vault.get_credential("https://github.com/login").unwrap();
+        assert_eq!(cred.username, "peter");
+        assert_eq!(cred.password, "vault_password_123");
+        assert_eq!(core.vault.get_cookies("https://github.com"), Some("session=abc123"));
+
+        // Verify binary roundtrip of ClientVault in #![no_std]
+        let mut encoded_vault = Vec::new();
+        core.vault.encode(&mut encoded_vault);
+        let decoded_vault = ClientVault::decode(&encoded_vault).unwrap();
+        assert_eq!(decoded_vault, core.vault);
+
+        // Verify CredentialPrompt automatically queued an outbound CredentialFill message
+        let mut autofill_out = Vec::new();
+        core.encode_outbound_messages(9000, &mut autofill_out);
+        let mut cur = autofill_out.as_slice();
+        let mut saw_fill = false;
+        while let Some(m) = Message::decode(&mut cur).unwrap() {
+            if let Message::CredentialFill {
+                origin,
+                username,
+                password,
+                ..
+            } = m
+            {
+                assert_eq!(origin, "https://github.com");
+                assert_eq!(username, "peter");
+                assert_eq!(password, "vault_password_123");
+                saw_fill = true;
+            }
+        }
+        assert!(saw_fill);
     }
 }

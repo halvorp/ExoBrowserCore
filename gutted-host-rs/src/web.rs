@@ -322,6 +322,15 @@ async fn handle_client_msg(
         Message::FileUpload { tab_id, filename, mime_type, data } => {
             host_state.handle_file_upload(tab_id, &filename, &mime_type, &data);
         }
+        Message::FindInPage { query, forward, case_sensitive } => {
+            host_state.find_in_page(&query, forward, case_sensitive);
+        }
+        Message::CredentialFill { tab_id, origin, username, password } => {
+            host_state.fill_credentials(tab_id, &origin, &username, &password);
+        }
+        Message::CookieSync { origin, cookies } => {
+            host_state.sync_cookies(&origin, &cookies);
+        }
         _ => {}
     }
 }

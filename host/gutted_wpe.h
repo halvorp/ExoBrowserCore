@@ -29,16 +29,22 @@ typedef void (*gutted_wpe_url_cb)(void *userdata, uint32_t tab_id, const char *u
 typedef void (*gutted_wpe_ready_cb)(void *userdata, gutted_wpe_handle handle);
 typedef void (*gutted_wpe_file_chooser_cb)(void *userdata, uint32_t tab_id, bool multiple, const char *accept_mimes);
 typedef void (*gutted_wpe_download_cb)(void *userdata, const char *filename, const char *local_path);
+typedef void (*gutted_wpe_cred_prompt_cb)(void *userdata, uint32_t tab_id, const char *origin);
+typedef void (*gutted_wpe_cred_captured_cb)(void *userdata, uint32_t tab_id, const char *origin, const char *username, const char *password);
+typedef void (*gutted_wpe_cookie_sync_cb)(void *userdata, uint32_t tab_id, const char *origin, const char *cookies);
 
 typedef struct {
-    gutted_wpe_frame_cb        on_frame;
-    gutted_wpe_load_cb         on_load;
-    gutted_wpe_cursor_cb       on_cursor;
-    gutted_wpe_ready_cb        on_ready;
-    gutted_wpe_title_cb        on_title;
-    gutted_wpe_url_cb          on_url;
-    gutted_wpe_file_chooser_cb on_file_chooser;
-    gutted_wpe_download_cb     on_download;
+    gutted_wpe_frame_cb         on_frame;
+    gutted_wpe_load_cb          on_load;
+    gutted_wpe_cursor_cb        on_cursor;
+    gutted_wpe_ready_cb         on_ready;
+    gutted_wpe_title_cb         on_title;
+    gutted_wpe_url_cb           on_url;
+    gutted_wpe_file_chooser_cb  on_file_chooser;
+    gutted_wpe_download_cb      on_download;
+    gutted_wpe_cred_prompt_cb   on_cred_prompt;
+    gutted_wpe_cred_captured_cb on_cred_captured;
+    gutted_wpe_cookie_sync_cb   on_cookie_sync;
 } gutted_wpe_callbacks;
 
 int gutted_wpe_run(
@@ -76,6 +82,9 @@ void gutted_wpe_complete_file_chooser(
     const char *mime_type,
     const char *b64_data);
 void gutted_wpe_paste_text(gutted_wpe_handle h, uint32_t tab_id, const char *text);
+void gutted_wpe_find_in_page(gutted_wpe_handle h, uint32_t tab_id, const char *query, bool forward, bool case_sensitive);
+void gutted_wpe_fill_credentials(gutted_wpe_handle h, uint32_t tab_id, const char *origin, const char *username, const char *password);
+void gutted_wpe_sync_cookies(gutted_wpe_handle h, uint32_t tab_id, const char *origin, const char *cookies);
 
 #ifdef __cplusplus
 }
