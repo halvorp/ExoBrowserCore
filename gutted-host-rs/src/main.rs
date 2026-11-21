@@ -342,15 +342,51 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Optional CoralCloud Unix domain socket listener (`/run/coralcloud/browser/browser.sock`)
+    // so `coral-cloudd` ingress can forward authenticated device connections over a local socket
+    // with zero exposed container TCP ports (matching `/run/coralcloud/update/update.sock`).
+    #[cfg(unix)]
+    if let Ok(unix_path) = std::env::var("GBROWSER_LISTEN_UNIX")
+        .or_else(|_| std::env::var("CLOUDD_BROWSER_SOCKET"))
+    {
+        if !unix_path.is_empty() {
+            let path = std::path::Path::new(&unix_path);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::remove_file(path);
+            let unix_listener = tokio::net::UnixListener::bind(path)
+                .with_context(|| format!("bind unix socket {unix_path}"))?;
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
+            }
+            info!(socket = %unix_path, "gutted-host CoralCloud Unix socket listener ready (mode 0660)");
+            let host_state_unix = host_state.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = unix_listener.accept().await {
+                    let hs = host_state_unix.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_stream_connection(stream, "unix:coralcloud".into(), hs).await {
+                            warn!(error = %e, "unix socket connection ended with error");
+                        }
+                    });
+                }
+            });
+        }
+    }
+
     // Spawn C-free Pure-Rust Framed TCP listener on the same port (TCP :4433 alongside UDP :4433 QUIC)
     info!(listen = %addr, "gutted-host TCP stream listener ready (Redox/relibc & C-free clients)");
     let host_state_tcp = host_state.clone();
     tokio::spawn(async move {
         while let Ok((stream, peer)) = tcp_listener.accept().await {
+            let _ = stream.set_nodelay(true);
             let hs = host_state_tcp.clone();
+            let peer_label = peer.to_string();
             tokio::spawn(async move {
-                if let Err(e) = handle_tcp_connection(stream, peer, hs).await {
-                    warn!(%peer, error = %e, "tcp connection ended with error");
+                if let Err(e) = handle_stream_connection(stream, peer_label.clone(), hs).await {
+                    warn!(peer = %peer_label, error = %e, "tcp connection ended with error");
                 }
             });
         }
@@ -835,7 +871,7 @@ impl HostState {
                         }));
                     }
                     Some((this_tab_id, origin, username, password)) = cred_captures.recv() => {
-                        info!(tab_id = this_tab_id, %origin, %username, "WPE captured login credentials for client vault");
+                        info!(tab_id = this_tab_id, %origin, user_len = username.len(), "WPE captured login credentials for client vault");
                         bus_clone.publish(Arc::new(Message::CredentialCaptured {
                             tab_id: this_tab_id,
                             origin,
@@ -1189,7 +1225,7 @@ async fn handle_input_stream(mut recv: quinn::RecvStream, host_state: HostState)
                             Message::ReleaseFrame { generation, .. } => {
                                 host_state.release_frame(generation);
                             }
-                            other => warn!(?other, "unexpected input msg"),
+                            _ => warn!(tag = "unexpected_input", "unexpected input msg"),
                         }
                     }
                     Ok(None) => break,
@@ -1420,7 +1456,7 @@ async fn handle_ctrl_stream(
             Message::ReleaseFrame { generation, .. } => {
                 host_state.release_frame(generation);
             }
-            other => info!(?other, "ctrl msg (unhandled yet)"),
+            _ => info!("ctrl msg (unhandled yet)"),
         }
     }
     info!("ctrl stream closed");
@@ -1461,8 +1497,8 @@ async fn read_next(
     }
 }
 
-async fn read_next_tcp(
-    recv: &mut tokio::net::tcp::OwnedReadHalf,
+async fn read_next_stream<R: tokio::io::AsyncRead + Unpin>(
+    recv: &mut R,
     inbuf: &mut Vec<u8>,
     chunk: &mut [u8],
 ) -> Result<Option<Message>> {
@@ -1485,7 +1521,7 @@ async fn read_next_tcp(
                 return if inbuf.is_empty() {
                     Ok(None)
                 } else {
-                    Err(anyhow!("tcp stream ended mid-frame ({} bytes)", inbuf.len()))
+                    Err(anyhow!("stream ended mid-frame ({} bytes)", inbuf.len()))
                 };
             }
             Ok(n) => inbuf.extend_from_slice(&chunk[..n]),
@@ -1497,22 +1533,24 @@ async fn read_next_tcp(
     }
 }
 
-async fn handle_tcp_connection(
-    stream: tokio::net::TcpStream,
-    peer: SocketAddr,
+async fn handle_stream_connection<S>(
+    stream: S,
+    peer: String,
     host_state: HostState,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     use tokio::io::AsyncWriteExt;
-    let _ = stream.set_nodelay(true);
-    info!(%peer, "TCP client connected");
+    info!(%peer, "stream client connected");
 
-    let (mut recv, mut send) = stream.into_split();
+    let (mut recv, mut send) = tokio::io::split(stream);
     let mut inbuf = Vec::with_capacity(4096);
     let mut chunk = vec![0u8; 8192];
 
-    let hello = read_next_tcp(&mut recv, &mut inbuf, &mut chunk)
+    let hello = read_next_stream(&mut recv, &mut inbuf, &mut chunk)
         .await?
-        .ok_or_else(|| anyhow!("tcp stream closed before HELLO"))?;
+        .ok_or_else(|| anyhow!("stream closed before HELLO"))?;
     let Message::Hello {
         proto_version,
         viewport_w,
@@ -1522,7 +1560,7 @@ async fn handle_tcp_connection(
         capabilities,
     } = hello
     else {
-        return Err(anyhow!("first tcp message was not HELLO: {:?}", hello));
+        return Err(anyhow!("first stream message was not HELLO"));
     };
     if proto_version != PROTO_VERSION {
         return Err(anyhow!(
@@ -1607,7 +1645,7 @@ async fn handle_tcp_connection(
     });
 
     let mut last_pointer: (i32, i32) = (0, 0);
-    while let Some(msg) = read_next_tcp(&mut recv, &mut inbuf, &mut chunk).await? {
+    while let Some(msg) = read_next_stream(&mut recv, &mut inbuf, &mut chunk).await? {
         match msg {
             Message::Heartbeat { ts_us } => {
                 let mut buf = Vec::with_capacity(16);

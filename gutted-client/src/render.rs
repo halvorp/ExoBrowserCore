@@ -967,11 +967,24 @@ pub struct DamageRect {
 }
 
 /// A saved login credential in the client-side [`ClientVault`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Implements a redacted [`core::fmt::Debug`] in compliance with CoralCloud's
+/// `CLOUD-NO-SECRET-IN-LOGS` doctrine (`password` length only, never its value).
+#[derive(Clone, PartialEq, Eq)]
 pub struct CredentialEntry {
     pub origin: String,
     pub username: String,
     pub password: String,
+}
+
+impl core::fmt::Debug for CredentialEntry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CredentialEntry")
+            .field("origin", &self.origin)
+            .field("username", &self.username)
+            .field("password_len", &self.password.len())
+            .finish()
+    }
 }
 
 /// A saved browsing history entry in the client-side [`ClientVault`].
@@ -1082,12 +1095,26 @@ fn extract_host_from_origin(origin_or_host: &str) -> String {
 ///
 /// Allows the remote `gutted-host` backend to remain 100% stateless/ephemeral (rendering-only)
 /// while all sensitive user credentials and session cookies live exclusively on the client.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Implements a redacted [`core::fmt::Debug`] in compliance with CoralCloud's
+/// `CLOUD-NO-SECRET-IN-LOGS` doctrine (never prints cookie values or password strings).
+#[derive(Clone, PartialEq, Eq)]
 pub struct ClientVault {
     pub credentials: Vec<CredentialEntry>,
     pub cookies: BTreeMap<String, String>,
     pub history: Vec<HistoryEntry>,
     pub bookmarks: Vec<(String, String)>,
+}
+
+impl core::fmt::Debug for ClientVault {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ClientVault")
+            .field("credentials", &self.credentials)
+            .field("cookie_sites", &self.site_data_list())
+            .field("history_len", &self.history.len())
+            .field("bookmarks", &self.bookmarks)
+            .finish()
+    }
 }
 
 impl Default for ClientVault {
@@ -4209,30 +4236,14 @@ fn present_x11_damage<C: x11rb::connection::Connection>(
             let chunk_h = (d.h - ry).min(max_rows_per_chunk);
             scratch_bytes.resize(row_bytes * chunk_h as usize, 0);
             let dw = d.w as usize;
-            #[cfg(target_endian = "little")]
-            {
-                for r in 0..chunk_h as usize {
-                    let py = (d.y + ry) as usize + r;
-                    let row_start = py * bw as usize + d.x as usize;
-                    let row_slice = &framebuffer[row_start..row_start + dw];
-                    let src_bytes = unsafe {
-                        core::slice::from_raw_parts(row_slice.as_ptr() as *const u8, row_bytes)
-                    };
-                    let dst_off = r * row_bytes;
-                    scratch_bytes[dst_off..dst_off + row_bytes].copy_from_slice(src_bytes);
-                }
-            }
-            #[cfg(not(target_endian = "little"))]
-            {
-                let (dst_pixels, _) = scratch_bytes.as_chunks_mut::<4>();
-                for r in 0..chunk_h as usize {
-                    let py = (d.y + ry) as usize + r;
-                    let row_start = py * bw as usize + d.x as usize;
-                    let row_slice = &framebuffer[row_start..row_start + dw];
-                    let dst_row = &mut dst_pixels[r * dw..(r + 1) * dw];
-                    for (dst, &px) in dst_row.iter_mut().zip(row_slice) {
-                        *dst = px.to_le_bytes();
-                    }
+            let (dst_pixels, _) = scratch_bytes.as_chunks_mut::<4>();
+            for r in 0..chunk_h as usize {
+                let py = (d.y + ry) as usize + r;
+                let row_start = py * bw as usize + d.x as usize;
+                let row_slice = &framebuffer[row_start..row_start + dw];
+                let dst_row = &mut dst_pixels[r * dw..(r + 1) * dw];
+                for (dst, &px) in dst_row.iter_mut().zip(row_slice) {
+                    *dst = px.to_le_bytes();
                 }
             }
             conn.put_image(
@@ -4757,5 +4768,21 @@ mod tests {
         assert_eq!(vault2.site_data_list().len(), 1);
         assert_eq!(vault2.site_data_clear(), 1);
         assert!(vault2.site_data_list().is_empty());
+
+        // CLOUD-NO-SECRET-IN-LOGS canary: Debug output of CredentialEntry and ClientVault
+        // must never contain the raw password or cookie values
+        let dbg_vault = format!("{:?}", core.vault);
+        assert!(
+            !dbg_vault.contains("vault_password_123"),
+            "password leaked in Debug: {dbg_vault}"
+        );
+        assert!(
+            !dbg_vault.contains("c_session=1"),
+            "cookie value leaked in Debug: {dbg_vault}"
+        );
+        assert!(
+            !dbg_vault.contains("session=abc123"),
+            "cookie value leaked in Debug: {dbg_vault}"
+        );
     }
 }
